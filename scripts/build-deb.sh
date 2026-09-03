@@ -18,7 +18,12 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+~.-][0-9A-Za-z.+~-]+)?$ ]]; then
   exit 1
 fi
 
-manifest_version=$(cargo pkgid --manifest-path "$repo_root/Cargo.toml" | sed 's/.*@//')
+manifest_package_id=$(cargo pkgid --manifest-path "$repo_root/Cargo.toml")
+if [[ "$manifest_package_id" == *"@"* ]]; then
+  manifest_version=${manifest_package_id##*@}
+else
+  manifest_version=${manifest_package_id##*#}
+fi
 if [[ "$manifest_version" != "$version" ]]; then
   echo "package version $version does not match Cargo.toml version $manifest_version" >&2
   exit 1
