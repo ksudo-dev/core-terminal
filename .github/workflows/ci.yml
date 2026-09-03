@@ -107,7 +107,7 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            appstream dbus-daemon desktop-file-utils flatpak flatpak-builder xauth xvfb
+            appstream dbus-daemon desktop-file-utils elfutils flatpak flatpak-builder xauth xvfb
           command -v desktop-file-validate
       - run: |
           flatpak remote-add --if-not-exists --user flathub \
