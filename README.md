@@ -2,22 +2,22 @@
 
 Core Terminal is a GTK4 terminal emulator for Linux. VTE provides the PTY,
 terminal protocol parsing, rendering, scrollback, selection, and clipboard
-integration. The application ID is `app.coreterminal.CoreTerminal`.
+integration. The application ID is `io.github.ksudo_dev.CoreTerminal`.
 
 The settings layout takes Terminal.app as a visual reference. Core Terminal is
 independent software. It does not ship Apple source, fonts, icons, profiles, or
 branding.
 
-## Build dependencies
+## Native build dependencies
 
-On Ubuntu or another Debian-based distribution, install the packages used to
-build and inspect the application:
+On Ubuntu 26.04, install the packages used to build and inspect the native
+application and Debian package:
 
 ```sh
 sudo apt install --no-install-recommends -y \
   cargo rustc rustfmt rust-clippy build-essential pkg-config \
   libgtk-4-dev libvte-2.91-gtk4-dev \
-  dpkg-dev fakeroot lintian desktop-file-utils
+  dpkg-dev fakeroot lintian desktop-file-utils appstream
 ```
 
 The GTK4 and VTE development packages must provide the APIs selected in
@@ -128,6 +128,42 @@ and the `core-terminal(1)` manual page. The build copies an explicit allowlist.
 `profiles-private/`, screenshots, `.terminal` files, and reference archives do
 not enter the package.
 
+The release `.deb` targets Ubuntu 26.04 on `amd64`. CI also installs and links
+the same artifact on Debian 13. Older Debian and Ubuntu releases may not have
+the required GTK, VTE, or `t64` GLib packages.
+
+## Flatpak
+
+The Flatpak bundle is the cross-distribution package. It uses the GNOME 50
+runtime for GTK and VTE, but it does not require the GNOME desktop or change
+desktop defaults. It can run under GNOME, KDE Plasma, Cinnamon, XFCE, and other
+Wayland or X11 desktops with Flatpak support.
+
+Install a release bundle and start it with:
+
+```sh
+flatpak install --user ./io.github.ksudo_dev.CoreTerminal.flatpak
+flatpak run io.github.ksudo_dev.CoreTerminal
+```
+
+To build the bundle locally, install `flatpak` and `flatpak-builder`, add the
+Flathub remote for the current user, and run:
+
+```sh
+flatpak remote-add --if-not-exists --user flathub \
+  https://flathub.org/repo/flathub.flatpakrepo
+scripts/check-flatpak-source.sh
+scripts/build-flatpak.sh
+```
+
+The build downloads the GNOME 50 SDK and runtime on first use. Cargo crates are
+resolved offline from checksummed entries generated from `Cargo.lock`.
+
+A terminal must start host programs rather than a limited runtime shell. The
+Flatpak therefore has home-directory access and permission to use
+`flatpak-spawn --host`. Commands started in its terminal have the same user
+privileges as commands from a native terminal.
+
 See [`docs/TESTING.md`](docs/TESTING.md) for the release checklist and
 [`docs/PARITY_MATRIX.md`](docs/PARITY_MATRIX.md) for control-by-control scope.
 
@@ -144,3 +180,5 @@ systems. Project defaults are read from
 Core Terminal is licensed under GPL-3.0-or-later. Dependency licenses and
 resolved Cargo versions are listed in
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Release downloads also include a CycloneDX dependency SBOM, SHA-256 checksums,
+and GitHub build-provenance attestations.

@@ -22,6 +22,15 @@ terminal program can read and modify files and processes available to that
 user. Core Terminal does not sandbox shell commands, imported profile values,
 or programs started by the shell.
 
+The Flatpak grants home-directory access and access to the Flatpak host-command
+interface. Core Terminal uses that interface only to start the configured host
+shell and its requested working directory. This permission is intentional: a
+sandbox-only shell could not run the user's installed commands. Programs
+started through the Flatpak have the same user privileges as native terminal
+programs. The bridge clears the sandbox environment before reconstructing a
+small host-oriented allowlist; Flatpak-specific XDG paths and unrelated
+application variables are not forwarded to the host command.
+
 JSON settings and profile documents are bounded to 4 MiB. `.terminal` imports
 are parsed as plist data; XML entity and unsupported document-type constructs
 are rejected. Imported values are mapped to profile fields and are never
@@ -48,7 +57,8 @@ Secure Keyboard Entry.
 ## Private inputs and package contents
 
 `profiles-private/`, supplied screenshots, `.terminal` files, and reference
-archives are not runtime inputs. The Debian build copies an explicit allowlist.
+archives are not runtime inputs. Package builds copy explicit source and file
+allowlists.
 `scripts/check-private-data.sh` checks publishable paths, package contents, and
 absolute developer home paths in package files. Run it before publication.
 

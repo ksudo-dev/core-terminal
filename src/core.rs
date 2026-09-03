@@ -402,13 +402,21 @@ where
         options.custom_command.as_deref(),
         options.run_command_inside_shell,
     );
-    let argv: Vec<&str> = command.iter().map(String::as_str).collect();
     let envv_owned = child_environment(&options.terminal_type, options.locale.as_deref());
+    let (command, working_directory) = if running_in_flatpak() {
+        (
+            flatpak_host_argv(&command, options.working_directory.as_deref(), &envv_owned),
+            None,
+        )
+    } else {
+        (command, options.working_directory.clone())
+    };
+    let argv: Vec<&str> = command.iter().map(String::as_str).collect();
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
     use vte4::prelude::TerminalExtManual;
     terminal.spawn_async(
         vte4::PtyFlags::DEFAULT,
-        options.working_directory.as_deref(),
+        working_directory.as_deref(),
         &argv,
         &envv,
         glib::SpawnFlags::DEFAULT,
@@ -417,6 +425,73 @@ where
         None::<&gio::Cancellable>,
         callback,
     );
+}
+
+fn running_in_flatpak() -> bool {
+    env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").is_file()
+}
+
+fn flatpak_host_argv(
+    command: &[String],
+    working_directory: Option<&str>,
+    environment: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
+        "flatpak-spawn".into(),
+        "--host".into(),
+        "--clear-env".into(),
+        "--watch-bus".into(),
+    ];
+    let host_home = environment
+        .iter()
+        .find_map(|entry| entry.strip_prefix("HOME="))
+        .filter(|value| value.starts_with('/') && !value.contains('\0'));
+    let directory = working_directory
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains('\0'))
+        .or(host_home)
+        .unwrap_or("/");
+    argv.push(format!("--directory={directory}"));
+
+    let host_path = host_home
+        .map(|home| {
+            format!(
+                "PATH={home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            )
+        })
+        .unwrap_or_else(|| {
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
+        });
+    argv.push(format!("--env={host_path}"));
+
+    const HOST_ENVIRONMENT: [&str; 15] = [
+        "COLORTERM",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "DISPLAY",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOGNAME",
+        "SHELL",
+        "SSH_AUTH_SOCK",
+        "TERM",
+        "TZ",
+        "USER",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+    ];
+    for entry in environment {
+        let Some((name, _)) = entry.split_once('=') else {
+            continue;
+        };
+        if HOST_ENVIRONMENT.contains(&name) || name.starts_with("LC_") {
+            argv.push(format!("--env={entry}"));
+        }
+    }
+    argv.push("--".into());
+    argv.extend(command.iter().cloned());
+    argv
 }
 
 /// Apply the profile's requested terminal grid size. VTE measures this in
@@ -691,6 +766,60 @@ mod tests {
             sanitize_terminal_type("xterm;echo unsafe"),
             "xterm-256color"
         );
+    }
+
+    #[test]
+    fn flatpak_host_command_preserves_arguments_directory_and_environment() {
+        let command = vec![
+            "/bin/bash".into(),
+            "-lc".into(),
+            "printf '%s' \"$HOME\"".into(),
+        ];
+        let environment = vec![
+            "HOME=/home/user".into(),
+            "TERM=xterm-256color".into(),
+            "LANG=C.UTF-8".into(),
+            "XDG_CONFIG_HOME=/home/user/.var/app/example/config".into(),
+            "PATH=/app/bin:/usr/bin".into(),
+            "EXAMPLE_SECRET=not-forwarded-on-the-command-line".into(),
+        ];
+        assert_eq!(
+            flatpak_host_argv(&command, Some("/home/user/Project Files"), &environment),
+            [
+                "flatpak-spawn",
+                "--host",
+                "--clear-env",
+                "--watch-bus",
+                "--directory=/home/user/Project Files",
+                "--env=PATH=/home/user/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "--env=HOME=/home/user",
+                "--env=TERM=xterm-256color",
+                "--env=LANG=C.UTF-8",
+                "--",
+                "/bin/bash",
+                "-lc",
+                "printf '%s' \"$HOME\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn flatpak_host_command_defaults_to_home_and_drops_sandbox_environment() {
+        let command = vec!["/bin/bash".into(), "-l".into()];
+        let environment = vec![
+            "HOME=/home/user".into(),
+            "FLATPAK_ID=io.github.example.App".into(),
+            "XDG_DATA_HOME=/home/user/.var/app/example/data".into(),
+            "PATH=/app/bin:/usr/bin".into(),
+        ];
+        let argv = flatpak_host_argv(&command, None, &environment);
+        assert!(argv.iter().any(|entry| entry == "--directory=/home/user"));
+        assert!(argv.iter().any(|entry| entry == "--clear-env"));
+        assert!(!argv.iter().any(|entry| entry.contains("FLATPAK_ID=")));
+        assert!(!argv.iter().any(|entry| entry.contains("XDG_DATA_HOME=")));
+        assert!(!argv
+            .iter()
+            .any(|entry| entry == "--env=PATH=/app/bin:/usr/bin"));
     }
 
     #[test]

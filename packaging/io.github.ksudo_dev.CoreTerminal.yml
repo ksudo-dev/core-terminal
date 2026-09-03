@@ -1,0 +1,54 @@
+app-id: io.github.ksudo_dev.CoreTerminal
+runtime: org.gnome.Platform
+runtime-version: "50"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: core-terminal
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=home
+  - --talk-name=org.freedesktop.Flatpak
+
+modules:
+  - name: core-terminal
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/core-terminal/cargo
+        CARGO_NET_OFFLINE: "true"
+    build-commands:
+      - install -Dm0644 cargo/config .cargo/config.toml
+      - cargo build --offline --locked --release
+      - install -Dm0755 target/release/core-terminal ${FLATPAK_DEST}/bin/core-terminal
+      - install -Dm0644 data/default-profiles.json ${FLATPAK_DEST}/share/core-terminal/default-profiles.json
+      - install -Dm0644 packaging/core-terminal.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      - install -Dm0644 packaging/${FLATPAK_ID}.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
+      - install -Dm0644 LICENSE ${FLATPAK_DEST}/share/doc/core-terminal/LICENSE
+      - install -Dm0644 THIRD_PARTY_NOTICES.md ${FLATPAK_DEST}/share/doc/core-terminal/THIRD_PARTY_NOTICES.md
+      - for size in 32 64 128 256 512; do install -Dm0644 data/icons/core-terminal-icon-${size}.png ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/${FLATPAK_ID}.png; done
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - target
+          - dist
+          - profiles-private
+          - references
+          - reference
+          - screenshots
+          - Screenshots
+          - ScreenShots
+          - "*.terminal"
+          - "*.plist"
+          - "*.tar*"
+          - "*.zip"
+          - "*Screenshot*.png"
+          - "*screenshot*.png"
+      - cargo-sources.json

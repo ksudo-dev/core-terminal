@@ -29,9 +29,12 @@ Released 2026-09-03.
   profile names, profile tabs, and action buttons.
 - Added explicit Debian packaging checks for desktop metadata, installed files,
   license notices, and private reference data.
+- Added an offline, checksummed Flatpak build using the GNOME 50 runtime and a
+  deliberate host-shell bridge for use on non-Debian distributions.
+- Adopted `io.github.ksudo_dev.CoreTerminal` as the application and Flatpak ID.
 - Documented VTE and Wayland behavior that cannot match macOS Terminal.
 
-The release binary passed 52 automated tests plus the opt-in private fixture
+The release binary passed 56 automated tests plus the opt-in private fixture
 test. Its native Wayland acceptance report recorded all settings pages present,
 profile persistence, applied VTE properties, non-modal settings, pointer
 autohide disabled, readable profile names, and unclipped profile navigation.

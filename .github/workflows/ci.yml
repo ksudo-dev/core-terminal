@@ -9,22 +9,26 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  PACKAGE_VERSION: 0.2.0
 
 jobs:
   fmt:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: 1.93.1
           components: rustfmt
       - run: cargo fmt --check
 
   check:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.93.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: |
           sudo apt-get update
@@ -34,9 +38,10 @@ jobs:
   clippy:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: 1.93.1
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: |
@@ -47,8 +52,10 @@ jobs:
   test:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.93.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: |
           sudo apt-get update
@@ -58,27 +65,84 @@ jobs:
   package:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.93.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential pkg-config libgtk-4-dev libvte-2.91-gtk4-dev \
-            dpkg-dev fakeroot lintian desktop-file-utils
-      - run: scripts/build-deb.sh 0.2.0
-      - run: scripts/check-deb.sh dist/core-terminal_0.2.0_$(dpkg --print-architecture).deb
-      - run: scripts/security-audit.sh dist/core-terminal_0.2.0_$(dpkg --print-architecture).deb
-      - run: lintian --pedantic dist/core-terminal_0.2.0_$(dpkg --print-architecture).deb
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+            appstream build-essential desktop-file-utils dpkg-dev fakeroot \
+            libgtk-4-dev libvte-2.91-gtk4-dev lintian pkg-config
+      - run: scripts/build-deb.sh "$PACKAGE_VERSION"
+      - run: scripts/check-deb.sh dist/core-terminal_${PACKAGE_VERSION}_$(dpkg --print-architecture).deb
+      - run: scripts/security-audit.sh dist/core-terminal_${PACKAGE_VERSION}_$(dpkg --print-architecture).deb
+      - run: lintian --pedantic dist/core-terminal_${PACKAGE_VERSION}_$(dpkg --print-architecture).deb
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: core-terminal-deb
-          path: dist/core-terminal_0.2.0_*.deb
+          path: dist/core-terminal_${{ env.PACKAGE_VERSION }}_*.deb
+
+  debian-13:
+    needs: package
+    runs-on: ubuntu-26.04
+    container: debian:13-slim
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: core-terminal-deb
+          path: package
+      - run: |
+          apt-get update
+          apt-get install --no-install-recommends -y ./package/core-terminal_${PACKAGE_VERSION}_amd64.deb
+          dpkg --audit
+          ldd /usr/bin/core-terminal
+          ! ldd /usr/bin/core-terminal | grep -F 'not found'
+
+  flatpak:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            appstream dbus-daemon desktop-file-utils flatpak flatpak-builder xauth xvfb
+          command -v desktop-file-validate
+      - run: |
+          flatpak remote-add --if-not-exists --user flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+          scripts/check-flatpak-source.sh
+          scripts/build-flatpak.sh
+      - run: |
+          flatpak install --user --noninteractive --or-update \
+            dist/io.github.ksudo_dev.CoreTerminal.flatpak
+          flatpak info --user io.github.ksudo_dev.CoreTerminal
+          flatpak run --user --command=sh \
+            io.github.ksudo_dev.CoreTerminal \
+            -c 'test -x /app/bin/core-terminal && test -r /app/share/core-terminal/default-profiles.json'
+          dbus-run-session -- flatpak run --user --command=flatpak-spawn \
+            io.github.ksudo_dev.CoreTerminal \
+            --host --clear-env --env=HOME="$HOME" --directory="$HOME" \
+            /bin/sh -c 'test "$PWD" = "$HOME"'
+          acceptance_root="$HOME/core-terminal-flatpak-acceptance"
+          install -d -m 0700 "$acceptance_root/config"
+          dbus-run-session -- xvfb-run -a flatpak run --user \
+            --env=GDK_BACKEND=x11 \
+            --env=XDG_CONFIG_HOME="$acceptance_root/config" \
+            --env=CORE_TERMINAL_ACCEPTANCE=1 \
+            --env=CORE_TERMINAL_ACCEPTANCE_REPORT="$acceptance_root/report.txt" \
+            io.github.ksudo_dev.CoreTerminal
+          grep -Fq 'status=PASS ' "$acceptance_root/report.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: core-terminal-flatpak
+          path: dist/io.github.ksudo_dev.CoreTerminal.flatpak
 
   private-data:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
           scripts/check-private-data.sh
           scripts/check-doc-style.sh
@@ -87,38 +151,73 @@ jobs:
   notices:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.93.1
       - run: scripts/generate-notices.sh /tmp/THIRD_PARTY_NOTICES.md
       - run: diff -u THIRD_PARTY_NOTICES.md /tmp/THIRD_PARTY_NOTICES.md
 
   cargo-audit:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.93.1
       - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: cargo-audit
       - run: cargo audit
 
-  release-build:
-    if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    needs:
+      - fmt
+      - check
+      - clippy
+      - test
+      - package
+      - debian-13
+      - flatpak
+      - private-data
+      - notices
+      - cargo-audit
+    if: github.ref == 'refs/tags/v0.2.0'
     runs-on: ubuntu-26.04
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            build-essential pkg-config libgtk-4-dev libvte-2.91-gtk4-dev \
-            dpkg-dev fakeroot lintian desktop-file-utils
-      - run: scripts/build-deb.sh 0.2.0
-      - run: scripts/check-deb.sh dist/core-terminal_0.2.0_$(dpkg --print-architecture).deb
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: core-terminal-release
-          path: |
-            target/release/core-terminal
-            dist/core-terminal_0.2.0_*.deb
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: core-terminal-*
+          path: release-assets
+          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.93.1
+      - run: |
+          set -euo pipefail
+          test "$GITHUB_REF_NAME" = "v$PACKAGE_VERSION"
+          grep -Fq "core-terminal ($PACKAGE_VERSION)" packaging/changelog
+          git archive --format=tar --prefix="core-terminal-$PACKAGE_VERSION/" "$GITHUB_SHA" \
+            | gzip -n > "release-assets/core-terminal-$PACKAGE_VERSION.tar.gz"
+          scripts/generate-sbom.py . "release-assets/core-terminal-$PACKAGE_VERSION.cdx.json"
+          cd release-assets
+          sha256sum *.deb *.flatpak *.tar.gz *.cdx.json > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: release-assets/*
+      - run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --verify-tag \
+            --title "Core Terminal $PACKAGE_VERSION" \
+            --notes-file packaging/release-notes-0.2.0.md
+        env:
+          GH_TOKEN: ${{ github.token }}

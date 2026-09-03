@@ -4,9 +4,19 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 version=${1:-0.2.0}
 arch=$(dpkg --print-architecture)
+app_id=io.github.ksudo_dev.CoreTerminal
 build_root="$repo_root/target/debian/core-terminal"
 deps_root="$repo_root/target/debian/shlibdeps"
 deb_path="$repo_root/dist/core-terminal_${version}_${arch}.deb"
+
+if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+  SOURCE_DATE_EPOCH=$(git -C "$repo_root" show -s --format=%ct HEAD 2>/dev/null || printf '0')
+fi
+if [[ ! "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]; then
+  echo "SOURCE_DATE_EPOCH must be a non-negative integer" >&2
+  exit 1
+fi
+export SOURCE_DATE_EPOCH
 
 if [[ ! -f "$repo_root/Cargo.toml" ]]; then
   echo "Cargo.toml is missing; run this from a complete Core Terminal checkout" >&2
@@ -31,6 +41,7 @@ fi
 
 for required in \
   "$repo_root/packaging/core-terminal.desktop" \
+  "$repo_root/packaging/io.github.ksudo_dev.CoreTerminal.metainfo.xml" \
   "$repo_root/packaging/core-terminal.1" \
   "$repo_root/packaging/changelog" \
   "$repo_root/packaging/lintian-overrides" \
@@ -64,6 +75,7 @@ rm -rf "$build_root" "$deps_root"
 install -d "$build_root/DEBIAN" \
   "$build_root/usr/bin" \
   "$build_root/usr/share/applications" \
+  "$build_root/usr/share/metainfo" \
   "$build_root/usr/share/core-terminal" \
   "$build_root/usr/share/doc/core-terminal" \
   "$build_root/usr/share/man/man1" \
@@ -71,7 +83,9 @@ install -d "$build_root/DEBIAN" \
   "$build_root/usr/share/icons/hicolor"
 install -m 0755 "$binary" "$build_root/usr/bin/core-terminal"
 install -m 0644 "$repo_root/packaging/core-terminal.desktop" \
-  "$build_root/usr/share/applications/core-terminal.desktop"
+  "$build_root/usr/share/applications/${app_id}.desktop"
+install -m 0644 "$repo_root/packaging/${app_id}.metainfo.xml" \
+  "$build_root/usr/share/metainfo/${app_id}.metainfo.xml"
 install -m 0644 "$repo_root/data/default-profiles.json" \
   "$build_root/usr/share/core-terminal/default-profiles.json"
 install -m 0644 "$repo_root/LICENSE" "$build_root/usr/share/doc/core-terminal/LICENSE"
@@ -105,7 +119,7 @@ fi
 for size in 32 64 128 256 512; do
   install -d "$build_root/usr/share/icons/hicolor/${size}x${size}/apps"
   install -m 0644 "$repo_root/data/icons/core-terminal-icon-${size}.png" \
-    "$build_root/usr/share/icons/hicolor/${size}x${size}/apps/core-terminal.png"
+    "$build_root/usr/share/icons/hicolor/${size}x${size}/apps/${app_id}.png"
 done
 
 sed -e "s/__VERSION__/$version/g" -e "s/__ARCH__/$arch/g" \

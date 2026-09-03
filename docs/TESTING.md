@@ -10,11 +10,14 @@ cargo test --locked --all-targets --no-fail-fast
 cargo audit
 bash -n scripts/*.sh
 desktop-file-validate packaging/core-terminal.desktop
+appstreamcli validate --no-net \
+  packaging/io.github.ksudo_dev.CoreTerminal.metainfo.xml
 scripts/generate-notices.sh /tmp/core-terminal-notices.md
 diff -u THIRD_PARTY_NOTICES.md /tmp/core-terminal-notices.md
 scripts/check-private-data.sh
 scripts/check-doc-style.sh
 scripts/security-audit.sh
+scripts/check-flatpak-source.sh
 ```
 
 ## Native Wayland acceptance
@@ -80,3 +83,30 @@ ldd "$package_root/usr/bin/core-terminal"
 
 Reject a package with `RPATH`, `RUNPATH`, a missing shared library, a developer
 home path, a screenshot, a `.terminal` file, or `profiles-private/` content.
+
+CI installs the generated `.deb` in a clean Debian 13 container and rejects an
+unresolved dependency or shared library. This is an installation check, not a
+claim that the package works on Debian 12 or every Debian-derived release.
+
+## Flatpak bundle
+
+Add the Flathub user remote once, then build the cross-distribution bundle:
+
+```sh
+flatpak remote-add --if-not-exists --user flathub \
+  https://flathub.org/repo/flathub.flatpakrepo
+scripts/check-flatpak-source.sh
+scripts/build-flatpak.sh
+flatpak install --user --or-update \
+  dist/io.github.ksudo_dev.CoreTerminal.flatpak
+flatpak info --user io.github.ksudo_dev.CoreTerminal
+flatpak run --user --command=flatpak-spawn \
+  io.github.ksudo_dev.CoreTerminal \
+  --host --clear-env --env=HOME="$HOME" --directory="$HOME" \
+  /bin/sh -c 'test "$PWD" = "$HOME"'
+```
+
+The last command checks the host-shell bridge without starting the graphical
+application. CI also launches the installed Flatpak under X11 and runs the
+real GTK/VTE acceptance harness. A native desktop acceptance run remains
+required for GTK, VTE, Wayland, tabs, settings, and pointer behavior.

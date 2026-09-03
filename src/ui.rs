@@ -14,6 +14,7 @@ use crate::{
     shortcuts::{
         decide_shortcut, decode_key_sequence, parse_key_chord, ShortcutAction, ShortcutInput,
     },
+    APPLICATION_ID,
 };
 use gtk::{gio, glib, prelude::*};
 use std::{
@@ -37,7 +38,7 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
-    use super::{settings_page_ids, PROFILE_PAGE_IDS};
+    use super::{settings_page_ids, APPLICATION_ID, PROFILE_PAGE_IDS};
 
     #[test]
     fn settings_window_has_all_top_level_pages() {
@@ -53,6 +54,11 @@ mod structural_tests {
         assert_eq!(PROFILE_PAGE_IDS[0], "text");
         assert_eq!(PROFILE_PAGE_IDS[2], "tab");
         assert_eq!(PROFILE_PAGE_IDS[5], "advanced");
+    }
+
+    #[test]
+    fn gtk_icon_name_matches_the_packaged_application_id() {
+        assert_eq!(APPLICATION_ID, "io.github.ksudo_dev.CoreTerminal");
     }
 }
 
@@ -2912,7 +2918,7 @@ fn build_window_with_directory(
     new_window: bool,
     pending_working_directory: Option<String>,
 ) {
-    gtk::Window::set_default_icon_name("core-terminal");
+    gtk::Window::set_default_icon_name(APPLICATION_ID);
     let mut profiles = load_user_profiles();
     let mut settings = Settings::load_user();
     let requested_profile = if new_window && settings.new_window_profile != "default" {
@@ -2933,7 +2939,7 @@ fn build_window_with_directory(
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title(display_name)
-        .icon_name("core-terminal")
+        .icon_name(APPLICATION_ID)
         .default_width(settings.window_width)
         .default_height(settings.window_height)
         .build();
@@ -3104,15 +3110,16 @@ fn build_window_with_directory(
 /// This is enabled only by the acceptance-test environment and lets the
 /// native GNOME Wayland session verify real VTE PTYs and widget behavior.
 fn project_icon() -> gtk::Image {
+    let installed_icon = format!("/usr/share/icons/hicolor/64x64/apps/{APPLICATION_ID}.png");
     for candidate in [
-        "data/icons/core-terminal-icon-64.png",
-        "/usr/share/icons/hicolor/64x64/apps/core-terminal.png",
+        Path::new("data/icons/core-terminal-icon-64.png"),
+        Path::new(&installed_icon),
     ] {
-        if Path::new(candidate).is_file() {
+        if candidate.is_file() {
             return gtk::Image::from_file(candidate);
         }
     }
-    gtk::Image::from_icon_name("core-terminal")
+    gtk::Image::from_icon_name(APPLICATION_ID)
 }
 
 /// Opt-in installed-binary acceptance run.  The harness is intentionally
@@ -3755,7 +3762,7 @@ fn show_about(parent: &gtk::ApplicationWindow) {
         .comments(
             "An independent GTK4/VTE terminal for Linux. Not affiliated with or endorsed by Apple.",
         )
-        .logo_icon_name("core-terminal")
+        .logo_icon_name(APPLICATION_ID)
         .build();
     enforce_non_modal(&dialog);
     dialog.present();

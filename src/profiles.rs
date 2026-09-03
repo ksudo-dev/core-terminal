@@ -769,13 +769,18 @@ impl ProfileStore {
     /// `data/` directory during development), falling back to the safe built-in
     /// set when neither file is present.
     pub fn load_project_defaults() -> Self {
-        let candidates = [
-            Some(Path::new("/usr/share/core-terminal/default-profiles.json").to_path_buf()),
-            Some(Path::new("data/default-profiles.json").to_path_buf()),
-        ];
+        let mut candidates = std::env::var_os("XDG_DATA_DIRS")
+            .map(|paths| {
+                std::env::split_paths(&paths)
+                    .filter(|path| path.is_absolute())
+                    .map(|path| path.join("core-terminal/default-profiles.json"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        candidates.push(Path::new("/usr/share/core-terminal/default-profiles.json").to_path_buf());
+        candidates.push(Path::new("data/default-profiles.json").to_path_buf());
         candidates
             .into_iter()
-            .flatten()
             .find_map(|path| Self::load_from_path_with_permissions(path, false).ok())
             .unwrap_or_else(Self::defaults)
     }
