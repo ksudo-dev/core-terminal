@@ -28,13 +28,13 @@ modules:
       - -Dvapi=false
     post-install:
       - install -d ${FLATPAK_DEST}/share/doc/core-terminal/vte
-      - install -m0644 COPYING.CC-BY-4-0 COPYING.GPL3 COPYING.LGPL3 COPYING.README COPYING.XTERM ${FLATPAK_DEST}/share/doc/core-terminal/vte/
-      - install -Dm0644 subprojects/fast_float/LICENSE-APACHE ${FLATPAK_DEST}/share/doc/core-terminal/vte/fast-float-LICENSE-APACHE
-      - install -Dm0644 subprojects/fast_float/LICENSE-BOOST ${FLATPAK_DEST}/share/doc/core-terminal/vte/fast-float-LICENSE-BOOST
-      - install -Dm0644 subprojects/fast_float/LICENSE-MIT ${FLATPAK_DEST}/share/doc/core-terminal/vte/fast-float-LICENSE-MIT
-      - install -Dm0644 subprojects/fmt/LICENSE ${FLATPAK_DEST}/share/doc/core-terminal/vte/fmt-LICENSE
-      - install -Dm0644 subprojects/simdutf/LICENSE-APACHE ${FLATPAK_DEST}/share/doc/core-terminal/vte/simdutf-LICENSE-APACHE
-      - install -Dm0644 subprojects/simdutf/LICENSE-MIT ${FLATPAK_DEST}/share/doc/core-terminal/vte/simdutf-LICENSE-MIT
+      - install -m0644 ../COPYING.CC-BY-4-0 ../COPYING.GPL3 ../COPYING.LGPL3 ../COPYING.README ../COPYING.XTERM ${FLATPAK_DEST}/share/doc/core-terminal/vte/
+      - install -Dm0644 ../subprojects/fast_float/LICENSE-APACHE ${FLATPAK_DEST}/share/doc/core-terminal/vte/fast-float-LICENSE-APACHE
+      - install -Dm0644 ../subprojects/fast_float/LICENSE-BOOST ${FLATPAK_DEST}/share/doc/core-terminal/vte/fast-float-LICENSE-BOOST
+      - install -Dm0644 ../subprojects/fast_float/LICENSE-MIT ${FLATPAK_DEST}/share/doc/core-terminal/vte/fast-float-LICENSE-MIT
+      - install -Dm0644 ../subprojects/fmt/LICENSE ${FLATPAK_DEST}/share/doc/core-terminal/vte/fmt-LICENSE
+      - install -Dm0644 ../subprojects/simdutf/LICENSE-APACHE ${FLATPAK_DEST}/share/doc/core-terminal/vte/simdutf-LICENSE-APACHE
+      - install -Dm0644 ../subprojects/simdutf/LICENSE-MIT ${FLATPAK_DEST}/share/doc/core-terminal/vte/simdutf-LICENSE-MIT
     sources:
       - type: archive
         url: https://download.gnome.org/sources/vte/0.84/vte-0.84.1.tar.xz
