@@ -1,0 +1,10 @@
+Source: core-terminal
+Section: utils
+Priority: optional
+Maintainer: Kasey <211167966+ksudo-dev@users.noreply.github.com>
+Standards-Version: 4.7.2
+
+Package: core-terminal
+Architecture: any
+Description: GTK terminal inspired by macOS Terminal
+ Core Terminal is a small native GTK4 terminal emulator using VTE.

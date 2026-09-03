@@ -1,0 +1,42 @@
+.TH CORE-TERMINAL 1 "September 2026" "Core Terminal 0.2.0" "User Commands"
+.SH NAME
+core-terminal \- GTK4 terminal emulator using VTE
+.SH SYNOPSIS
+.B core-terminal
+.SH DESCRIPTION
+.B core-terminal
+opens a GTK4 terminal window and starts the configured login shell. Each tab
+uses a VTE terminal widget and a separate child process group.
+.PP
+The Settings window contains General, Profiles, Window Groups, and Encodings
+pages. Profile pages cover Text, Window, Tab, Shell, Keyboard, and Advanced
+settings.
+.SH FILES
+.TP
+.I /usr/share/core-terminal/default-profiles.json
+Project-owned profiles installed by the Debian package.
+.TP
+.I $XDG_CONFIG_HOME/core-terminal/settings.json
+User settings. If XDG_CONFIG_HOME is unset, Core Terminal uses
+.IR $HOME/.config/core-terminal/settings.json .
+On Unix, the file is written with mode 0600.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Absolute directory used for the user settings file.
+.TP
+.B HOME
+Fallback parent directory for user settings when XDG_CONFIG_HOME is unset.
+.TP
+.B SHELL
+Login shell used when no absolute shell override is saved.
+.SH LIMITATIONS
+GTK4 and the Wayland compositor control top-level placement. Core Terminal
+doesn't restore macOS-style screen coordinates, live process state, Dock tile
+contents, or Secure Keyboard Entry. VTE controls terminal protocol modes and
+the runtime encoding remains UTF-8.
+.SH EXIT STATUS
+The process returns a non-zero status when GTK application startup fails.
+.SH LICENSE
+Core Terminal is licensed under the GNU General Public License, version 3 or
+later. See /usr/share/doc/core-terminal/copyright.

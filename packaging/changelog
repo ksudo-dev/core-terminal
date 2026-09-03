@@ -1,0 +1,13 @@
+core-terminal (0.2.0) unstable; urgency=medium
+
+  * Add the GTK4/VTE settings panes and profile editor paths.
+  * Wire keyboard input, shell exit, title, notification, and saved group
+    settings to the terminal runtime.
+  * Add the native Wayland acceptance harness.
+  * Keep profile names, labeled actions, and editor tabs visible without an
+    outer horizontal settings scroller.
+  * Add Debian metadata, the core-terminal(1) manual page, and dependency
+    license notices.
+  * Reject private profile and reference inputs during package checks.
+
+ -- Kasey <211167966+ksudo-dev@users.noreply.github.com>  Thu, 03 Sep 2026 14:14:45 -0700

@@ -1,0 +1,7 @@
+* @ksudo-dev
+/.github/ @ksudo-dev
+/packaging/ @ksudo-dev
+/scripts/ @ksudo-dev
+/src/core.rs @ksudo-dev
+/src/profiles.rs @ksudo-dev
+/src/shortcuts.rs @ksudo-dev
