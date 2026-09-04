@@ -39,8 +39,12 @@
   host commands now run under a static, fd-forwarded session supervisor that
   pidfd-binds every revalidated host-session member, including residual jobs
   after a normal child exit. It streams one pidfd at a time so large sessions
-  cannot exhaust its descriptor limit. Flatpak CI binds exact foreground and
-  background markers to host pidfds before accepting this behavior.
+  cannot exhaust its descriptor limit. The sandbox proxy leaves VTE's PTY
+  unclaimed so the supervisor can verify it as the host session's controlling
+  terminal. The supervisor transfers the terminal foreground to the payload
+  before execution, preserving foreground and background job control. Flatpak
+  CI binds exact foreground and background markers to host pidfds before
+  accepting this behavior.
 
 ## 0.2.1
 

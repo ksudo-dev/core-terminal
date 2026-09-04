@@ -14,11 +14,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/ioctl.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -407,6 +409,30 @@ static void finish_with_wait_status(int status) {
   _exit(SUPERVISOR_FAILURE);
 }
 
+static int ignore_supervisor_job_control_signals(void) {
+  struct sigaction action = {.sa_handler = SIG_IGN};
+
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGTSTP, &action, NULL) != 0 ||
+      sigaction(SIGTTIN, &action, NULL) != 0 ||
+      sigaction(SIGTTOU, &action, NULL) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int reset_child_job_control_signals(void) {
+  struct sigaction action = {.sa_handler = SIG_DFL};
+
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGTSTP, &action, NULL) != 0 ||
+      sigaction(SIGTTIN, &action, NULL) != 0 ||
+      sigaction(SIGTTOU, &action, NULL) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
 static int wait_for_event(int signal_fd, int child_pidfd, int *close_signal) {
   struct pollfd descriptors[2] = {
       {.fd = signal_fd, .events = POLLIN},
@@ -436,6 +462,29 @@ static int wait_for_event(int signal_fd, int child_pidfd, int *close_signal) {
   }
 }
 
+static int establish_controlling_terminal(pid_t supervisor) {
+  pid_t terminal_session;
+  pid_t terminal_group;
+
+  if (!isatty(STDIN_FILENO)) {
+    errno = ENOTTY;
+    return -1;
+  }
+  terminal_session = tcgetsid(STDIN_FILENO);
+  if (terminal_session != supervisor) {
+    if (ioctl(STDIN_FILENO, TIOCSCTTY, 0) != 0) {
+      return -1;
+    }
+    terminal_session = tcgetsid(STDIN_FILENO);
+  }
+  terminal_group = tcgetpgrp(STDIN_FILENO);
+  if (terminal_session != supervisor || terminal_group != supervisor) {
+    errno = EPERM;
+    return -1;
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   struct process_identity supervisor_identity;
   sigset_t blocked;
@@ -456,8 +505,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "core-terminal-host-supervisor: private session invariant failed\n");
     return SUPERVISOR_FAILURE;
   }
-
-  close(3);
   sigemptyset(&blocked);
   sigaddset(&blocked, SIGHUP);
   sigaddset(&blocked, SIGINT);
@@ -466,10 +513,17 @@ int main(int argc, char **argv) {
   sigaddset(&blocked, SIGUSR1);
   sigaddset(&blocked, SIGUSR2);
   if (sigprocmask(SIG_BLOCK, &blocked, NULL) != 0 ||
+      ignore_supervisor_job_control_signals() != 0 ||
       prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
     perror("core-terminal-host-supervisor: initialization");
     return SUPERVISOR_FAILURE;
   }
+  if (establish_controlling_terminal(supervisor) != 0) {
+    perror("core-terminal-host-supervisor: controlling terminal");
+    return SUPERVISOR_FAILURE;
+  }
+
+  close(3);
   signal_fd = signalfd(-1, &blocked, SFD_CLOEXEC);
   if (signal_fd < 0) {
     perror("core-terminal-host-supervisor: signalfd");
@@ -495,7 +549,7 @@ int main(int argc, char **argv) {
 
     close(authorization_pipe[1]);
     close(signal_fd);
-    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0 ||
+    if (setpgid(0, 0) != 0 || prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0 ||
         getppid() != supervisor) {
       _exit(SUPERVISOR_FAILURE);
     }
@@ -504,6 +558,7 @@ int main(int argc, char **argv) {
     } while (length < 0 && errno == EINTR);
     close(authorization_pipe[0]);
     if (length != (ssize_t)sizeof(authorization) || authorization != 1 ||
+        reset_child_job_control_signals() != 0 ||
         sigprocmask(SIG_UNBLOCK, &blocked, NULL) != 0) {
       _exit(SUPERVISOR_FAILURE);
     }
@@ -523,6 +578,16 @@ int main(int argc, char **argv) {
     close(authorization_pipe[1]);
     while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {
     }
+    close(signal_fd);
+    return SUPERVISOR_FAILURE;
+  }
+  if (setpgid(child, child) != 0 || tcsetpgrp(STDIN_FILENO, child) != 0) {
+    perror("core-terminal-host-supervisor: foreground handoff");
+    close(authorization_pipe[1]);
+    (void)pidfd_signal(child_pidfd, SIGKILL);
+    while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {
+    }
+    close(child_pidfd);
     close(signal_fd);
     return SUPERVISOR_FAILURE;
   }

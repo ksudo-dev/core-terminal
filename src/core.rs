@@ -399,7 +399,7 @@ where
         // fd 3, which matches flatpak-spawn's fixed --forward-fd option.
         unsafe {
             terminal.spawn_with_fds_async(
-                vte4::PtyFlags::DEFAULT,
+                flatpak_proxy_pty_flags(),
                 None,
                 &argv,
                 &envv,
@@ -444,6 +444,15 @@ pub(crate) fn running_in_flatpak() -> bool {
 const FLATPAK_HOST_SUPERVISOR_PATH: &str = "/app/libexec/core-terminal-host-supervisor";
 const FLATPAK_HOST_SUPERVISOR_FD: i32 = 3;
 const FLATPAK_HOST_SUPERVISOR_EXEC: &str = "/proc/self/fd/3";
+
+fn flatpak_proxy_pty_flags() -> vte4::PtyFlags {
+    // The sandbox-side flatpak-spawn process is only a D-Bus proxy. If VTE
+    // assigns the PTY to that proxy's session, Flatpak's host session helper
+    // cannot claim the same PTY for the host shell and interactive job control
+    // is disabled. Keep VTE's separate proxy session, but leave the PTY
+    // unclaimed so HostCommand can make it the host session's controlling TTY.
+    vte4::PtyFlags::NO_CTTY
+}
 
 /// Build the command that crosses the Flatpak boundary.
 ///
@@ -1485,6 +1494,12 @@ mod tests {
             &argv[argv.len() - 3..],
             ["/bin/bash", "-lc", "printf '%s' \"$HOME\""]
         );
+    }
+
+    #[test]
+    fn flatpak_proxy_leaves_the_pty_for_the_host_session() {
+        assert_eq!(flatpak_proxy_pty_flags(), vte4::PtyFlags::NO_CTTY);
+        assert!(!flatpak_proxy_pty_flags().contains(vte4::PtyFlags::NO_SESSION));
     }
 
     #[test]

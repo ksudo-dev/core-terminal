@@ -63,13 +63,17 @@ app closes the tab, and then requires both pidfds to report exit. This prevents
 a sandbox-only process scan from producing a false pass.
 
 `scripts/check-flatpak-host-supervisor.py` compiles the C pidfd helper as a
-static PIE with warnings treated as errors. It runs the helper as a session
-leader on a pseudoterminal and verifies cleanup of distinct foreground and
-background process groups after HUP, INT, QUIT, TERM, USR1, and USR2. It also
-verifies residual-job cleanup plus exit-status preservation when the direct
-child exits normally. A low-descriptor test sets `RLIMIT_NOFILE` to 8, starts
-40 signal-ignoring jobs, and proves that streaming pidfd cleanup does not depend
-on holding one descriptor per session member.
+static PIE with warnings treated as errors. It gives the helper an already-open
+but unclaimed pseudoterminal, then requires the helper to acquire and verify it
+as its controlling terminal. The suite verifies cleanup of distinct foreground
+and background process groups after HUP, INT, QUIT, TERM, USR1, and USR2. It
+also accepts a PTY already owned by the helper's session, rejects a PTY owned by
+another session without starting the payload, and checks the host shell owns
+the terminal's foreground process group. Residual-job cleanup and exit-status
+preservation are tested when the direct child exits normally. A low-descriptor
+test sets `RLIMIT_NOFILE` to 8, starts 40 signal-ignoring jobs, and proves that
+streaming pidfd cleanup does not depend on holding one descriptor per session
+member.
 
 The harness cannot control GL.iNet Comet's browser Pointer Lock. A maintainer
 using that KVM must also take a macOS and GNOME screenshot, return focus to Core

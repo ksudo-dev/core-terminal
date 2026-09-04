@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
 import pty
 import resource
@@ -12,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 from pathlib import Path
 
@@ -91,12 +94,100 @@ def wait_for_exact_count(
 def spawn_in_pty(
     arguments: list[str], nofile_limit: int | None = None
 ) -> tuple[int, int, int]:
+    """Spawn a session leader with an open, but deliberately unclaimed, PTY."""
+    master, slave = pty.openpty()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(master)
+            os.setsid()
+            for descriptor in (0, 1, 2):
+                os.dup2(slave, descriptor)
+            if slave > 2:
+                os.close(slave)
+            if nofile_limit is not None:
+                resource.setrlimit(
+                    resource.RLIMIT_NOFILE, (nofile_limit, nofile_limit)
+                )
+            os.execv(arguments[0], arguments)
+        except BaseException:
+            os._exit(127)
+    os.close(slave)
+    return pid, os.pidfd_open(pid), master
+
+
+def spawn_in_owned_pty(arguments: list[str]) -> tuple[int, int, int]:
+    """Spawn with a PTY already owned by the new process's own session."""
     pid, master = pty.fork()
     if pid == 0:
-        if nofile_limit is not None:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (nofile_limit, nofile_limit))
-        os.execv(arguments[0], arguments)
+        try:
+            os.execv(arguments[0], arguments)
+        except BaseException:
+            os._exit(127)
     return pid, os.pidfd_open(pid), master
+
+
+def spawn_behind_portal_preclaimed_pty(
+    arguments: list[str],
+) -> tuple[int, int, int]:
+    """Model a Flatpak proxy that owns the PTY before a host session starts.
+
+    The launcher remains the controlling terminal's session leader while its
+    child starts a separate session and executes the host helper with the same
+    slave descriptor. This is the topology produced when VTE does not use
+    VTE_PTY_NO_CTTY for the sandbox-side flatpak-spawn process.
+    """
+    master, slave = pty.openpty()
+    launcher = os.fork()
+    if launcher == 0:
+        try:
+            os.close(master)
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            child = os.fork()
+            if child == 0:
+                try:
+                    os.setsid()
+                    for descriptor in (0, 1, 2):
+                        os.dup2(slave, descriptor)
+                    if slave > 2:
+                        os.close(slave)
+                    os.execv(arguments[0], arguments)
+                except BaseException:
+                    os._exit(127)
+            waited, status = os.waitpid(child, 0)
+            if waited != child:
+                os._exit(126)
+            if os.WIFEXITED(status):
+                os._exit(os.WEXITSTATUS(status))
+            if os.WIFSIGNALED(status):
+                signal.signal(os.WTERMSIG(status), signal.SIG_DFL)
+                os.kill(os.getpid(), os.WTERMSIG(status))
+            os._exit(126)
+        except BaseException:
+            os._exit(127)
+    os.close(slave)
+    return launcher, os.pidfd_open(launcher), master
+
+
+def read_pty_output(master: int, timeout: float = 0.5) -> bytes:
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([master], [], [], remaining)
+        if not ready:
+            break
+        try:
+            data = os.read(master, 4096)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not data:
+            break
+        output.extend(data)
+    return bytes(output)
 
 
 def terminate_exact(arguments: list[bytes]) -> None:
@@ -189,6 +280,12 @@ def signal_cleanup_test(
         watcher_status = watcher.wait(timeout=14)
         if watcher_status != 0:
             raise RuntimeError(f"host lifecycle watcher exited {watcher_status}")
+        acknowledgement_text = acknowledgement.read_text(encoding="ascii")
+        if not acknowledgement_text.startswith("topology=PASS "):
+            raise RuntimeError(
+                f"host lifecycle watcher did not confirm job control: "
+                f"{acknowledgement_text.rstrip()}"
+            )
         status = wait_pid(supervisor_pid)
         if not os.WIFSIGNALED(status) or os.WTERMSIG(status) != signal_number:
             raise RuntimeError(
@@ -208,6 +305,72 @@ def signal_cleanup_test(
             os.close(master)
         terminate_exact([os.fsencode(background), b"41.234"])
         terminate_exact([os.fsencode(foreground), b"40.234"])
+
+
+def already_owned_terminal_test(helper: Path) -> None:
+    supervisor_pid = supervisor_pidfd = master = None
+    try:
+        supervisor_pid, supervisor_pidfd, master = spawn_in_owned_pty(
+            [str(helper), "/bin/sh", "-c", "exit 23"]
+        )
+        status = wait_pid(supervisor_pid)
+        if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 23:
+            raise RuntimeError(
+                f"supervisor did not accept its existing controlling terminal: {status}"
+            )
+    finally:
+        if supervisor_pidfd is not None:
+            try:
+                signal.pidfd_send_signal(supervisor_pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.close(supervisor_pidfd)
+        if master is not None:
+            os.close(master)
+
+
+def portal_preclaimed_terminal_rejection_test(helper: Path, suffix: str) -> None:
+    marker = f"core-terminal-helper-preclaimed-{suffix}"
+    arguments = [os.fsencode(marker), b"44.234"]
+    supervisor_arguments = [
+        str(helper),
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        'exec -a "$1" sleep 44.234',
+        "core-terminal-helper-test",
+        marker,
+    ]
+    launcher_pid = launcher_pidfd = master = None
+    try:
+        launcher_pid, launcher_pidfd, master = spawn_behind_portal_preclaimed_pty(
+            supervisor_arguments
+        )
+        status = wait_pid(launcher_pid)
+        output = read_pty_output(master)
+        if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 125:
+            raise RuntimeError(
+                f"supervisor did not reject a portal-preclaimed terminal: {status}; "
+                f"output={output!r}"
+            )
+        if b"core-terminal-host-supervisor: controlling terminal" not in output:
+            raise RuntimeError(
+                f"preclaimed-terminal rejection lacked its diagnostic: {output!r}"
+            )
+        if exact_processes(arguments):
+            raise RuntimeError("preclaimed-terminal rejection launched the payload")
+    finally:
+        if launcher_pidfd is not None:
+            try:
+                signal.pidfd_send_signal(launcher_pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.close(launcher_pidfd)
+        if master is not None:
+            os.close(master)
+        terminate_exact([os.fsencode(argument) for argument in supervisor_arguments])
+        terminate_exact(arguments)
 
 
 def normal_exit_cleanup_test(helper: Path, suffix: str) -> None:
@@ -332,9 +495,14 @@ def main() -> int:
             signal.SIGUSR2,
         ):
             signal_cleanup_test(helper, work, suffix, signal_number)
+        already_owned_terminal_test(helper)
+        portal_preclaimed_terminal_rejection_test(helper, suffix)
         normal_exit_cleanup_test(helper, suffix)
         low_descriptor_limit_test(helper, suffix)
-    print("Flatpak host supervisor signal and normal-exit cleanup passed")
+    print(
+        "Flatpak host supervisor PTY ownership, job control, signals, "
+        "and normal-exit cleanup passed"
+    )
     return 0
 
 

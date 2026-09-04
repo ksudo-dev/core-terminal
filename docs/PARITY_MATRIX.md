@@ -109,13 +109,17 @@ process prompts instead of silently closing. Its sandbox-side proxy receives
 the same pidfd check before each signal. The app opens a static PIE supervisor,
 maps it to fd 3, and asks the broker to execute `/proc/self/fd/3`; a missing
 helper therefore fails the spawn instead of running an unsupervised host shell.
-The helper verifies that Flatpak made it the isolated host session and process
-group leader, consumes HUP, INT, QUIT, TERM, USR1, and USR2 synchronously, and
-sends the staged signals only through pidfds opened before complete `/proc`
-revalidation. Enumeration signals and closes one bound pidfd at a time, so a
-fork-heavy session cannot exhaust the helper's descriptor limit. The helper
-also removes residual session members when the direct child exits normally.
-`--watch-bus` ties the supervisor to the sandbox proxy. Unit tests cover every
+The sandbox proxy deliberately leaves VTE's PTY unclaimed. The helper verifies
+that Flatpak made it the isolated host session and process-group leader, then
+acquires and verifies that PTY as the host session's controlling terminal. The
+helper places the payload in its own process group and transfers the terminal
+foreground to it before execution. It consumes HUP, INT, QUIT, TERM, USR1, and
+USR2 synchronously and sends the staged signals only through pidfds opened
+before complete `/proc` revalidation.
+Enumeration signals and closes one bound pidfd at a time, so a fork-heavy
+session cannot exhaust the helper's descriptor limit. The helper also removes
+residual session members when the direct child exits normally. `--watch-bus`
+ties the supervisor to the sandbox proxy. Unit tests cover every
 automatic/fallback combination, clean, error, and signaled statuses, legacy
 migration, disk
 round-trips, exception matching, pending spawns, and stale confirmations.

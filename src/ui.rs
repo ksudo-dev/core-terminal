@@ -4119,9 +4119,13 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 .unwrap_or_else(|| std::process::id().to_string());
             let background_marker = format!("core-terminal-acceptance-bg-{probe_suffix}");
             let foreground_marker = format!("core-terminal-acceptance-fg-{probe_suffix}");
+            let probe_script = format!(
+                "set -m; (trap '' HUP TERM; exec -a {background_marker} sleep 41.234) & \
+                 (trap '' HUP TERM; exec -a {foreground_marker} sleep 40.234); wait"
+            );
             let probe_command = format!(
-                "set -m; (exec -a {background_marker} sleep 41.234) & \
-                 (exec -a {foreground_marker} sleep 40.234); wait"
+                "/bin/bash --noprofile --norc -c {}",
+                glib::shell_quote(&probe_script).to_string_lossy()
             );
             let brokered_ready_path = std::env::var_os("CORE_TERMINAL_ACCEPTANCE_HOST_JOBS_SEEN")
                 .map(std::path::PathBuf::from);
@@ -4136,7 +4140,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 profile.name = probe_name.into();
                 profile.shell = "/bin/bash".into();
                 profile.shell_command = probe_command.clone();
-                profile.run_inside_shell = true;
+                profile.run_inside_shell = false;
                 profile.ask_before_close_policy = AskBeforeClosePolicy::Always;
                 state.profiles.add_profile(profile).is_ok()
             });
@@ -4150,7 +4154,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 let session_processes = probe_id.and_then(|id| {
                     let captured_session_processes = captured_session_processes.clone();
                     let observation_timeout = if brokered_runtime {
-                        Duration::from_secs(12)
+                        Duration::from_secs(16)
                     } else {
                         Duration::from_secs(4)
                     };
@@ -4212,8 +4216,10 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                                             == [
                                                 "/proc/self/fd/3",
                                                 "/bin/bash",
-                                                "-lc",
-                                                probe_command.as_str(),
+                                                "--noprofile",
+                                                "--norc",
+                                                "-c",
+                                                probe_script.as_str(),
                                             ]
                                 });
                             let host_started = brokered_ready_path
@@ -4255,7 +4261,12 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                                     && child.session == child.pid
                                     && child.arguments.first().map(String::as_str)
                                         == Some("/bin/bash")
-                                    && child.arguments.get(1).map(String::as_str) == Some("-lc")
+                                    && child.arguments.get(1).map(String::as_str)
+                                        == Some("--noprofile")
+                                    && child.arguments.get(2).map(String::as_str) == Some("--norc")
+                                    && child.arguments.get(3).map(String::as_str) == Some("-c")
+                                    && child.arguments.get(4).map(String::as_str)
+                                        == Some(probe_script.as_str())
                                     && child.session == background.session
                                     && child.session == foreground.session
                                     && background.process_group != foreground.process_group
