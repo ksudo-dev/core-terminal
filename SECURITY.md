@@ -32,6 +32,13 @@ environment and overrides only `TERM`, `COLORTERM`, `VTE_VERSION`, and an
 explicitly configured locale. It does not copy the Flatpak process environment
 over the broker-provided host environment.
 
+The Flatpak host supervisor requires Linux 5.3 or newer and uses pidfds rather
+than numeric PIDs for cleanup. It cannot signal a process that has changed to a
+user or security domain the current user may not control. Such a privileged
+process can outlive its terminal session, so cleanup cannot be guaranteed. The
+helper exits with a failure status, but this release does not show a dedicated
+cleanup-error dialog.
+
 JSON settings and profile documents are bounded to 4 MiB. `.terminal` imports
 are parsed as plist data; XML entity and unsupported document-type constructs
 are rejected. Imported values are mapped to profile fields and are never

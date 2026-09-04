@@ -11,6 +11,40 @@
 - Preserved the saved default profile while switching tabs, and kept unrelated
   startup choices stable when custom profiles are removed.
 - Added the missing startup-profile choice to the new-window policy control.
+- Unified tab, window, and shell-exit window closing under one revalidated
+  confirmation policy. Native builds inspect the foreground process group;
+  sandboxed builds fail safely by asking when that process cannot be resolved.
+- Made idle native login shells implicitly exempt from the non-exempt-process
+  policy only after matching the live executable's device and inode and
+  confirming that no background process remains in its Linux process session.
+  Pending spawns, replaced shells, same-named executables, and unverified
+  processes remain protected.
+- Removed conflicting legacy Shell checkboxes, added an explicit error-exit
+  action, labeled automatic-close precedence and process exceptions, and kept
+  legacy profile migration at the JSON boundary.
+- Prevented profile Shell controls from overwriting a hidden global command
+  mode, and added exhaustive policy persistence and exit-decision tests.
+- Prevented stale confirmations, overlapping close requests, and asynchronous
+  spawns from losing a requested close or leaving a child process behind. An
+  exit-before-callback tombstone prevents a stale returned PID from being
+  resolved after the kernel can recycle it.
+- Kept close-confirmation actions reachable by placing the running-process
+  details in a bounded, scrollable list with an explicit process count.
+- On native Linux, closing a confirmed tab now re-enumerates the tab's isolated
+  process session while escalating through HUP, TERM, and a final KILL after
+  non-blocking grace intervals, covering foreground and background jobs.
+  Every signal uses a pidfd bound to a matching PID, start value, session, and
+  process group, so PID reuse cannot redirect it. Sandboxed proxy children
+  receive the same pidfd validation before each narrow proxy signal. Flatpak
+  host commands now run under a static, fd-forwarded session supervisor that
+  pidfd-binds every revalidated host-session member, including residual jobs
+  after a normal child exit. It streams one pidfd at a time so large sessions
+  cannot exhaust its descriptor limit. The sandbox proxy leaves VTE's PTY
+  unclaimed so the supervisor can verify it as the host session's controlling
+  terminal. The supervisor transfers the terminal foreground to the payload
+  before execution, preserving foreground and background job control. Flatpak
+  CI binds exact foreground and background markers to host pidfds before
+  accepting this behavior.
 
 ## 0.2.1
 

@@ -58,6 +58,7 @@ pub enum CloseOnExit {
     #[default]
     Never,
     Clean,
+    Error,
     Always,
 }
 
@@ -198,11 +199,11 @@ pub struct TerminalProfile {
     pub restore_rows: bool,
     #[serde(default, alias = "shell_exit_behavior")]
     pub shell_exit_action: ShellExitAction,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub close_on_clean_exit: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub close_on_error: bool,
-    #[serde(default, alias = "ask_before_closing")]
+    #[serde(default, alias = "ask_before_closing", skip_serializing)]
     pub ask_before_close: bool,
     #[serde(default, alias = "ask_before_close_processes")]
     pub ask_before_close_exceptions: Vec<String>,
@@ -352,6 +353,12 @@ fn default_alpha() -> f64 {
     1.0
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct LegacyCloseFieldPresence {
+    close_on_exit: bool,
+    ask_before_close_policy: bool,
+}
+
 impl TerminalProfile {
     pub fn homebrew() -> Self {
         Self {
@@ -439,6 +446,20 @@ impl TerminalProfile {
         }
     }
 
+    fn migrate_legacy_close_fields(&mut self, presence: LegacyCloseFieldPresence) {
+        if !presence.close_on_exit {
+            self.close_on_exit = match (self.close_on_clean_exit, self.close_on_error) {
+                (true, true) => CloseOnExit::Always,
+                (true, false) => CloseOnExit::Clean,
+                (false, true) => CloseOnExit::Error,
+                (false, false) => CloseOnExit::Never,
+            };
+        }
+        if !presence.ask_before_close_policy && self.ask_before_close {
+            self.ask_before_close_policy = AskBeforeClosePolicy::Always;
+        }
+    }
+
     /// Return a usable profile even when a field is missing from a hand-edited
     /// project JSON file.
     pub fn normalized(mut self) -> Self {
@@ -502,16 +523,14 @@ impl TerminalProfile {
             })
             .filter(|mapping| !mapping.key.is_empty() && !mapping.action.is_empty())
             .collect();
-        if self.close_on_exit == CloseOnExit::Never {
-            self.close_on_exit = match (self.close_on_clean_exit, self.close_on_error) {
-                (true, true) => CloseOnExit::Always,
-                (true, false) => CloseOnExit::Clean,
-                _ => CloseOnExit::Never,
-            };
-        }
-        if self.ask_before_close_policy == AskBeforeClosePolicy::Never && self.ask_before_close {
-            self.ask_before_close_policy = AskBeforeClosePolicy::Always;
-        }
+        // These booleans predate the explicit close-policy enums. Legacy JSON
+        // is migrated at the document boundary, where field presence is still
+        // observable. Clear them here so a value already represented by an
+        // enum cannot override a later explicit choice on another normalize,
+        // save, and reload cycle.
+        self.close_on_clean_exit = false;
+        self.close_on_error = false;
+        self.ask_before_close = false;
         self.locale = self.locale.trim().to_owned();
         if !self.locale.is_empty()
             && !self
@@ -867,7 +886,33 @@ impl ProfileStore {
     }
 
     pub fn load_from_str(content: &str) -> Result<Self, ProfileError> {
-        let document: ProfileDocument = serde_json::from_str(content)?;
+        // Serde's field defaults intentionally make old documents readable,
+        // but the derived value alone cannot distinguish an omitted enum from
+        // an explicitly saved `never`. Inspect the JSON object first so only
+        // documents that truly predate the enum fields consume the legacy
+        // booleans.
+        let value: serde_json::Value = serde_json::from_str(content)?;
+        let close_field_presence = value
+            .get("profiles")
+            .and_then(serde_json::Value::as_array)
+            .map(|profiles| {
+                profiles
+                    .iter()
+                    .map(|profile| LegacyCloseFieldPresence {
+                        close_on_exit: profile.get("close_on_exit").is_some(),
+                        ask_before_close_policy: profile.get("ask_before_close_policy").is_some(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut document: ProfileDocument = serde_json::from_value(value)?;
+        for (profile, presence) in document
+            .profiles
+            .iter_mut()
+            .zip(close_field_presence.into_iter())
+        {
+            profile.migrate_legacy_close_fields(presence);
+        }
         let mut store = Self::new_with_window_groups(document.profiles, document.window_groups)?;
         if let Some(default_profile) = document.default_profile {
             // A malformed default should not prevent the application from
@@ -1702,6 +1747,128 @@ mod tests {
     }
 
     #[test]
+    fn normalization_clears_legacy_close_flags_without_overriding_current_policies() {
+        let mut profile = TerminalProfile::homebrew();
+        profile.close_on_exit = CloseOnExit::Never;
+        profile.ask_before_close_policy = AskBeforeClosePolicy::Never;
+        profile.close_on_clean_exit = true;
+        profile.close_on_error = true;
+        profile.ask_before_close = true;
+
+        let profile = profile.normalized();
+
+        assert_eq!(profile.close_on_exit, CloseOnExit::Never);
+        assert_eq!(profile.ask_before_close_policy, AskBeforeClosePolicy::Never);
+        assert!(!profile.close_on_clean_exit);
+        assert!(!profile.close_on_error);
+        assert!(!profile.ask_before_close);
+    }
+
+    #[test]
+    fn legacy_close_flags_migrate_only_when_current_policy_fields_are_omitted() {
+        let cases = [
+            (false, false, CloseOnExit::Never),
+            (true, false, CloseOnExit::Clean),
+            (false, true, CloseOnExit::Error),
+            (true, true, CloseOnExit::Always),
+        ];
+
+        for (close_on_clean_exit, close_on_error, expected) in cases {
+            let mut profile = TerminalProfile::homebrew();
+            profile.close_on_clean_exit = close_on_clean_exit;
+            profile.close_on_error = close_on_error;
+            profile.ask_before_close = true;
+            let mut value = serde_json::to_value(ProfileDocument {
+                default_profile: Some(DEFAULT_PROFILE_NAME.into()),
+                profiles: vec![profile],
+                window_groups: Vec::new(),
+            })
+            .unwrap();
+            let profile_object = value["profiles"][0].as_object_mut().unwrap();
+            profile_object.insert("close_on_clean_exit".into(), close_on_clean_exit.into());
+            profile_object.insert("close_on_error".into(), close_on_error.into());
+            profile_object.insert("ask_before_close".into(), true.into());
+            profile_object.remove("close_on_exit");
+            profile_object.remove("ask_before_close_policy");
+
+            let store = ProfileStore::load_from_str(&value.to_string()).unwrap();
+            let profile = store.profile(DEFAULT_PROFILE_NAME).unwrap();
+            assert_eq!(profile.close_on_exit, expected);
+            assert_eq!(
+                profile.ask_before_close_policy,
+                AskBeforeClosePolicy::Always
+            );
+            assert!(!profile.close_on_clean_exit);
+            assert!(!profile.close_on_error);
+            assert!(!profile.ask_before_close);
+        }
+    }
+
+    #[test]
+    fn explicit_never_close_policies_survive_normalize_save_and_reload() {
+        let mut profile = TerminalProfile::homebrew();
+        profile.close_on_exit = CloseOnExit::Never;
+        profile.ask_before_close_policy = AskBeforeClosePolicy::Never;
+        profile.close_on_clean_exit = true;
+        profile.close_on_error = true;
+        profile.ask_before_close = true;
+        let mut input = serde_json::to_value(ProfileDocument {
+            default_profile: Some(DEFAULT_PROFILE_NAME.into()),
+            profiles: vec![profile],
+            window_groups: Vec::new(),
+        })
+        .unwrap();
+        let profile_object = input["profiles"][0].as_object_mut().unwrap();
+        profile_object.insert("close_on_clean_exit".into(), true.into());
+        profile_object.insert("close_on_error".into(), true.into());
+        profile_object.insert("ask_before_close".into(), true.into());
+        let store = ProfileStore::load_from_str(&input.to_string()).unwrap();
+        let loaded = store.profile(DEFAULT_PROFILE_NAME).unwrap();
+        assert_eq!(loaded.close_on_exit, CloseOnExit::Never);
+        assert_eq!(loaded.ask_before_close_policy, AskBeforeClosePolicy::Never);
+        assert!(!loaded.close_on_clean_exit);
+        assert!(!loaded.close_on_error);
+        assert!(!loaded.ask_before_close);
+
+        let path = std::env::temp_dir().join(format!(
+            "core-terminal-close-policy-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        store.save_to_path(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        let saved_profile = saved["profiles"][0].as_object().unwrap();
+        assert!(!saved_profile.contains_key("close_on_clean_exit"));
+        assert!(!saved_profile.contains_key("close_on_error"));
+        assert!(!saved_profile.contains_key("ask_before_close"));
+        let restored = ProfileStore::load_from_path(&path).unwrap();
+        let restored = restored.profile(DEFAULT_PROFILE_NAME).unwrap();
+        assert_eq!(restored.close_on_exit, CloseOnExit::Never);
+        assert_eq!(
+            restored.ask_before_close_policy,
+            AskBeforeClosePolicy::Never
+        );
+        assert!(!restored.close_on_clean_exit);
+        assert!(!restored.close_on_error);
+        assert!(!restored.ask_before_close);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn error_only_close_policy_round_trips_through_json() {
+        let encoded = serde_json::to_string(&CloseOnExit::Error).unwrap();
+        assert_eq!(encoded, r#""error""#);
+        assert_eq!(
+            serde_json::from_str::<CloseOnExit>(&encoded).unwrap(),
+            CloseOnExit::Error
+        );
+    }
+
+    #[test]
     fn custom_profiles_round_trip_through_project_document() {
         let mut store = ProfileStore::defaults();
         store
@@ -1720,6 +1887,60 @@ mod tests {
         let restored = ProfileStore::load_from_path(&path).unwrap();
         assert_eq!(restored.selected_name(), "Custom");
         assert_eq!(restored.profile("Custom").unwrap().ansi_palette.len(), 16);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn every_shell_policy_and_command_field_round_trips_through_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "core-terminal-shell-policies-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for close_on_exit in [
+            CloseOnExit::Never,
+            CloseOnExit::Clean,
+            CloseOnExit::Error,
+            CloseOnExit::Always,
+        ] {
+            for ask_before_close_policy in [
+                AskBeforeClosePolicy::Never,
+                AskBeforeClosePolicy::Always,
+                AskBeforeClosePolicy::NonExempt,
+            ] {
+                for shell_exit_action in [
+                    ShellExitAction::Ask,
+                    ShellExitAction::Keep,
+                    ShellExitAction::CloseTab,
+                    ShellExitAction::CloseWindow,
+                ] {
+                    let mut store = ProfileStore::defaults();
+                    let mut profile = store.profile(DEFAULT_PROFILE_NAME).unwrap().clone();
+                    profile.shell = "/bin/bash".into();
+                    profile.shell_command = "printf '%s' round-trip".into();
+                    profile.run_inside_shell = false;
+                    profile.close_on_exit = close_on_exit;
+                    profile.ask_before_close_policy = ask_before_close_policy;
+                    profile.ask_before_close_exceptions = vec!["bash".into(), "tmux".into()];
+                    profile.shell_exit_action = shell_exit_action;
+                    store.update_profile(profile).unwrap();
+                    store.save_to_path(&path).unwrap();
+
+                    let restored = ProfileStore::load_from_path(&path).unwrap();
+                    let restored = restored.profile(DEFAULT_PROFILE_NAME).unwrap();
+                    assert_eq!(restored.shell, "/bin/bash");
+                    assert_eq!(restored.shell_command, "printf '%s' round-trip");
+                    assert!(!restored.run_inside_shell);
+                    assert_eq!(restored.close_on_exit, close_on_exit);
+                    assert_eq!(restored.ask_before_close_policy, ask_before_close_policy);
+                    assert_eq!(restored.ask_before_close_exceptions, ["bash", "tmux"]);
+                    assert_eq!(restored.shell_exit_action, shell_exit_action);
+                }
+            }
+        }
         let _ = fs::remove_file(path);
     }
 

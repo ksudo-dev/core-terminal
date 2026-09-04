@@ -23,6 +23,8 @@ grep -Fqx "        url: https://download.gnome.org/sources/vte/0.84/vte-0.84.1.t
 grep -Fqx "        sha256: aca1caa8478aebcdbb1d67897fb3511eb7601debae6810e16a15b6fa25f31ac8" "$manifest"
 grep -Fqx "      - -Dgtk4=true" "$manifest"
 grep -Fqx "      - -Dgtk3=false" "$manifest"
+grep -Fqx "      - cc -std=c11 -O2 -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror -fstack-protector-strong -fPIE -static-pie -Wl,-z,relro,-z,now src/flatpak-host-supervisor.c -o core-terminal-host-supervisor" "$manifest"
+grep -Fqx "      - install -Dm0755 core-terminal-host-supervisor \${FLATPAK_DEST}/libexec/core-terminal-host-supervisor" "$manifest"
 grep -Fqx "      - install -m0644 ../COPYING.CC-BY-4-0 ../COPYING.GPL3 ../COPYING.LGPL3 ../COPYING.README ../COPYING.XTERM \${FLATPAK_DEST}/share/doc/core-terminal/vte/" "$manifest"
 grep -Fqx "StartupWMClass=$app_id" "$repo_root/packaging/core-terminal.desktop"
 grep -Fqx "Icon=$app_id" "$repo_root/packaging/core-terminal.desktop"

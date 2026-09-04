@@ -87,10 +87,57 @@ marks a background tab when its VTE contents change.
 
 The page exposes a profile command, run-inside-shell choice, close-on-exit
 policies, close confirmation policy, exception names, and shell-exit behavior.
-Child exit handling receives the VTE wait status and can keep, close, or ask
-according to the selected policy. Unit tests cover clean, nonzero, and signaled
-exit decisions. The native lifecycle run confirms that closing the application
-terminates and reaps its login-shell process group.
+Child exit handling receives the VTE wait status. An automatic clean, error,
+or any-exit rule is evaluated first; the clearly labeled fallback can ask,
+keep the finished tab open, close the tab, or request a window close. Manual
+tab and window closure use one confirmation path and recheck every affected
+session before terminating a process. Native builds inspect the PTY foreground
+process group and the live executable identity. A login shell is considered
+idle only when its device and inode still match the executable that was
+launched and no other process remains in its Linux process session. Pending
+spawns, background jobs, replaced or same-named executables, and unverified
+processes remain protected. After an approved native close, every member of the
+tab's isolated Linux process session is re-enumerated while HUP, TERM, and a
+final KILL are sent, so known background jobs receive the same escalation as
+the foreground command. The work runs off the GTK thread, with 200 milliseconds
+after HUP and a full second after TERM for clean shutdown. Every signal uses a
+pidfd opened before a full PID, process-start, session, and process-group check,
+so the kernel handle cannot retarget a recycled PID. Native Linux deliberately
+does not use an unchecked fallback if that identity is unavailable. A sandboxed
+Flatpak cannot safely inspect the host process group, so an unknown foreground
+process prompts instead of silently closing. Its sandbox-side proxy receives
+the same pidfd check before each signal. The app opens a static PIE supervisor,
+maps it to fd 3, and asks the broker to execute `/proc/self/fd/3`; a missing
+helper therefore fails the spawn instead of running an unsupervised host shell.
+The sandbox proxy deliberately leaves VTE's PTY unclaimed. The helper verifies
+that Flatpak made it the isolated host session and process-group leader, then
+acquires and verifies that PTY as the host session's controlling terminal. The
+helper places the payload in its own process group and transfers the terminal
+foreground to it before execution. It consumes HUP, INT, QUIT, TERM, USR1, and
+USR2 synchronously and sends the staged signals only through pidfds opened
+before complete `/proc` revalidation.
+Enumeration signals and closes one bound pidfd at a time, so a fork-heavy
+session cannot exhaust the helper's descriptor limit. The helper also removes
+residual session members when the direct child exits normally. `--watch-bus`
+ties the supervisor to the sandbox proxy. Unit tests cover every
+automatic/fallback combination, clean, error, and signaled statuses, legacy
+migration, disk
+round-trips, exception matching, pending spawns, and stale confirmations.
+Native acceptance covers non-modal prompts, queued requests, stale-plan
+revalidation, JSON reload, the real close-before-spawn cleanup path, and a
+three-process shell session whose foreground and background jobs must both be
+gone after confirmation. The probe uses per-run process names and verifies the
+shell, foreground group, and background group before accepting the prompt.
+Flatpak CI supplies unique per-run process markers and uses a host-side pidfd
+watcher to prove the same two marked jobs start in the controlling terminal's
+foreground and background process groups and both exit after the sandbox
+confirms the proxy-backed close.
+
+The Flatpak helper requires Linux 5.3 or newer. It does not fall back to numeric
+PID signaling on older kernels. A process that changes into a privilege domain
+the user cannot signal may outlive the terminal session; that operating-system
+boundary is outside the cleanup guarantee. The helper exits with a failure
+status, but this release does not show a dedicated cleanup-error dialog.
 
 ### Keyboard
 

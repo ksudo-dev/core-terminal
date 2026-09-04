@@ -7,7 +7,17 @@ use crate::{
     settings::Settings,
 };
 use gtk::{gio, glib};
-use std::env;
+use std::{env, fs::File, os::fd::AsRawFd, time::Duration};
+
+#[cfg(target_os = "linux")]
+use std::{
+    io::Read,
+    os::{
+        fd::{FromRawFd, OwnedFd},
+        unix::fs::MetadataExt,
+    },
+    path::Path,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SessionId(u64);
@@ -366,59 +376,51 @@ pub fn spawn_with_profile<F>(
     spawn_terminal(terminal, &options, callback);
 }
 
-/// Spawn while retaining ownership of the session lookup needed for the
-/// close-before-spawn race. If a tab disappeared while VTE was setting up the
-/// PTY, the returned child is terminated immediately and the callback is
-/// intentionally not invoked.
-pub fn spawn_terminal_for_tab<F>(
-    terminal: &vte4::Terminal,
-    options: &SpawnOptions,
-    sessions: std::rc::Rc<std::cell::RefCell<SessionManager>>,
-    id: SessionId,
-    callback: F,
-) where
-    F: FnOnce(Result<glib::Pid, glib::Error>) + 'static,
-{
-    let sessions_callback = sessions.clone();
-    spawn_terminal(terminal, options, move |result| {
-        if let Ok(pid) = result {
-            let Ok(mut sessions) = sessions_callback.try_borrow_mut() else {
-                terminate_child(pid);
-                return;
-            };
-            if sessions.tab(id).is_none() {
-                terminate_child(pid);
-                return;
-            }
-            sessions.set_child_pid(id, Some(pid));
-            callback(Ok(pid));
-        } else {
-            callback(result);
-        }
-    });
-}
-
 pub fn spawn_terminal<F>(terminal: &vte4::Terminal, options: &SpawnOptions, callback: F)
 where
     F: FnOnce(Result<glib::Pid, glib::Error>) + 'static,
 {
     let envv_owned = child_environment(&options.terminal_type, options.locale.as_deref());
-    let (command, working_directory) = if running_in_flatpak() {
-        (
-            flatpak_host_argv(options, env::var("HOME").ok().as_deref()),
-            None,
-        )
-    } else {
-        let shell = options.shell.clone().unwrap_or_else(login_shell);
-        (
-            startup_argv(
-                &shell,
-                options.custom_command.as_deref(),
-                options.run_command_inside_shell,
-            ),
-            options.working_directory.clone(),
-        )
-    };
+    if running_in_flatpak() {
+        let supervisor = match File::open(FLATPAK_HOST_SUPERVISOR_PATH) {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                callback(Err(glib::Error::new(
+                    gio::IOErrorEnum::Failed,
+                    &format!("cannot open Flatpak host supervisor: {error}"),
+                )));
+                return;
+            }
+        };
+        let command = flatpak_host_argv(options, env::var("HOME").ok().as_deref());
+        let argv: Vec<&str> = command.iter().map(String::as_str).collect();
+        let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
+        // SAFETY: the one owned helper descriptor is deliberately mapped to
+        // fd 3, which matches flatpak-spawn's fixed --forward-fd option.
+        unsafe {
+            terminal.spawn_with_fds_async(
+                flatpak_proxy_pty_flags(),
+                None,
+                &argv,
+                &envv,
+                vec![supervisor.into()],
+                &[FLATPAK_HOST_SUPERVISOR_FD],
+                glib::SpawnFlags::DEFAULT,
+                || {},
+                -1,
+                None::<&gio::Cancellable>,
+                callback,
+            );
+        }
+        return;
+    }
+    let shell = options.shell.clone().unwrap_or_else(login_shell);
+    let command = startup_argv(
+        &shell,
+        options.custom_command.as_deref(),
+        options.run_command_inside_shell,
+    );
+    let working_directory = options.working_directory.clone();
     let argv: Vec<&str> = command.iter().map(String::as_str).collect();
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
     use vte4::prelude::TerminalExtManual;
@@ -435,8 +437,21 @@ where
     );
 }
 
-fn running_in_flatpak() -> bool {
+pub(crate) fn running_in_flatpak() -> bool {
     env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").is_file()
+}
+
+const FLATPAK_HOST_SUPERVISOR_PATH: &str = "/app/libexec/core-terminal-host-supervisor";
+const FLATPAK_HOST_SUPERVISOR_FD: i32 = 3;
+const FLATPAK_HOST_SUPERVISOR_EXEC: &str = "/proc/self/fd/3";
+
+fn flatpak_proxy_pty_flags() -> vte4::PtyFlags {
+    // The sandbox-side flatpak-spawn process is only a D-Bus proxy. If VTE
+    // assigns the PTY to that proxy's session, Flatpak's host session helper
+    // cannot claim the same PTY for the host shell and interactive job control
+    // is disabled. Keep VTE's separate proxy session, but leave the PTY
+    // unclaimed so HostCommand can make it the host session's controlling TTY.
+    vte4::PtyFlags::NO_CTTY
 }
 
 /// Build the command that crosses the Flatpak boundary.
@@ -451,6 +466,7 @@ fn flatpak_host_argv(options: &SpawnOptions, sandbox_home: Option<&str>) -> Vec<
         "flatpak-spawn".into(),
         "--host".into(),
         "--watch-bus".into(),
+        format!("--forward-fd={FLATPAK_HOST_SUPERVISOR_FD}"),
     ];
     let directory = options
         .working_directory
@@ -475,6 +491,7 @@ fn flatpak_host_argv(options: &SpawnOptions, sandbox_home: Option<&str>) -> Vec<
         argv.push(format!("--env=LC_ALL={locale}"));
     }
     argv.push("--".into());
+    argv.push(FLATPAK_HOST_SUPERVISOR_EXEC.into());
     argv.extend(flatpak_host_command(options));
     argv
 }
@@ -586,14 +603,11 @@ pub fn child_exit_decision(profile: &TerminalProfile, status: i32) -> ChildExitD
         crate::profiles::CloseOnExit::Clean if clean => {
             return ChildExitDecision::CloseTab;
         }
+        crate::profiles::CloseOnExit::Error if !clean => {
+            return ChildExitDecision::CloseTab;
+        }
         crate::profiles::CloseOnExit::Always => return ChildExitDecision::CloseTab,
         _ => {}
-    }
-    if clean && profile.close_on_clean_exit {
-        return ChildExitDecision::CloseTab;
-    }
-    if !clean && profile.close_on_error {
-        return ChildExitDecision::CloseTab;
     }
     match profile.shell_exit_action {
         ShellExitAction::CloseWindow => ChildExitDecision::CloseWindow,
@@ -604,11 +618,6 @@ pub fn child_exit_decision(profile: &TerminalProfile, status: i32) -> ChildExitD
 }
 
 pub fn should_prompt_before_close(profile: &TerminalProfile, process: Option<&str>) -> bool {
-    // Keep the legacy boolean meaningful for profiles written before the
-    // explicit policy enum was introduced.
-    if profile.ask_before_close && profile.ask_before_close_policy == AskBeforeClosePolicy::Never {
-        return true;
-    }
     match profile.ask_before_close_policy {
         AskBeforeClosePolicy::Always => true,
         AskBeforeClosePolicy::Never => false,
@@ -622,6 +631,457 @@ pub fn should_prompt_before_close(profile: &TerminalProfile, process: Option<&st
                 .any(|exception| exception == process)
         }
     }
+}
+
+/// Stable identity for the live or pending process attached to a terminal tab.
+///
+/// The VTE child PID is retained when available even if the foreground process
+/// cannot be inspected. Close planning treats pending and unknown processes as
+/// non-exempt rather than assuming that the login shell is still active.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Spawn-time identity for the VTE child process.
+///
+/// Linux stores the process start time, session ID, and process group from
+/// `/proc`. Those values must still match before Core Terminal enumerates or
+/// signals a process session, preventing a recycled PID from targeting an
+/// unrelated process. Flatpak records the same identity for its local proxy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildProcessIdentity {
+    pid: i32,
+    start_time: Option<u64>,
+    session: Option<i32>,
+    process_group: Option<i32>,
+    brokered: bool,
+}
+
+impl ChildProcessIdentity {
+    pub const fn pid(&self) -> glib::Pid {
+        glib::Pid(self.pid)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunningProcessIdentity {
+    pub child_pid: Option<i32>,
+    pub foreground_pgid: Option<i32>,
+    pub name: Option<String>,
+    pub executable: Option<ExecutableIdentity>,
+    /// Sorted Linux process IDs that still belong to the VTE child's process
+    /// session. `None` means the session could not be inspected reliably.
+    pub session_processes: Option<Vec<i32>>,
+}
+
+impl RunningProcessIdentity {
+    /// Represent a spawn request that has not returned its child PID yet.
+    ///
+    /// Pending spawns participate in close planning as unknown processes. Once
+    /// a PID arrives, the identity changes and any earlier confirmation must be
+    /// revalidated.
+    pub const fn pending() -> Self {
+        Self {
+            child_pid: None,
+            foreground_pgid: None,
+            name: None,
+            executable: None,
+            session_processes: None,
+        }
+    }
+
+    /// Represent a PID whose spawn-time identity is unavailable or no longer
+    /// matches. It remains a close blocker but is never signalled as native
+    /// process-session authority.
+    pub const fn unverified(child_pid: glib::Pid) -> Self {
+        Self {
+            child_pid: Some(child_pid.0),
+            foreground_pgid: None,
+            name: None,
+            executable: None,
+            session_processes: None,
+        }
+    }
+}
+
+/// One tab considered by a tab- or window-close request.
+#[derive(Clone, Debug)]
+pub struct CloseCandidate<'a> {
+    pub session_id: SessionId,
+    pub process: Option<RunningProcessIdentity>,
+    pub profile: Option<&'a TerminalProfile>,
+    /// Kernel-backed executable identity expected for a login-shell launch. A
+    /// custom command or an unresolvable shell has no automatic exemption.
+    pub expected_login_shell: Option<&'a ExecutableIdentity>,
+}
+
+/// A live or pending process whose profile requires confirmation before closing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloseBlocker {
+    pub session_id: SessionId,
+    pub process: RunningProcessIdentity,
+}
+
+/// Immutable result of evaluating every tab in one close request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClosePlan {
+    pub targets: Vec<SessionId>,
+    pub blockers: Vec<CloseBlocker>,
+}
+
+/// Evaluate tab close policies without changing session or process state.
+///
+/// A live tab whose profile cannot be resolved is a blocker. Failing safe here
+/// prevents malformed or concurrently edited profile data from silently
+/// terminating a process.
+pub fn plan_close<'a>(candidates: impl IntoIterator<Item = CloseCandidate<'a>>) -> ClosePlan {
+    let mut targets = Vec::new();
+    let mut blockers = Vec::new();
+    for candidate in candidates {
+        targets.push(candidate.session_id);
+        let Some(process) = candidate.process else {
+            continue;
+        };
+        let is_native_idle_login_shell = candidate
+            .expected_login_shell
+            .zip(process.executable.as_ref())
+            .is_some_and(|(expected, actual)| expected == actual)
+            && process.child_pid.is_some()
+            && process.child_pid == process.foreground_pgid
+            && process.session_processes.as_deref()
+                == process.child_pid.as_ref().map(std::slice::from_ref);
+        let should_prompt = match candidate.profile {
+            None => true,
+            Some(profile)
+                if profile.ask_before_close_policy == AskBeforeClosePolicy::NonExempt
+                    && is_native_idle_login_shell =>
+            {
+                false
+            }
+            Some(profile) => should_prompt_before_close(profile, process.name.as_deref()),
+        };
+        if should_prompt {
+            blockers.push(CloseBlocker {
+                session_id: candidate.session_id,
+                process,
+            });
+        }
+    }
+    ClosePlan { targets, blockers }
+}
+
+/// Return whether a previous confirmation still covers the current close plan.
+///
+/// Tabs and processes may exit while a non-modal confirmation is open, so the
+/// current target and blocker sets may be subsets of the confirmed sets. A new
+/// target or a changed PID, foreground process group, or process name
+/// invalidates authorization.
+pub fn close_authorization_covers(plan: &ClosePlan, confirmed: &ClosePlan) -> bool {
+    plan.targets
+        .iter()
+        .all(|target| confirmed.targets.contains(target))
+        && plan
+            .blockers
+            .iter()
+            .all(|blocker| confirmed.blockers.contains(blocker))
+}
+
+/// Inspect the kernel-owned foreground process for a VTE PTY when possible.
+///
+/// A Flatpak VTE child is `flatpak-spawn`, a sandbox-side proxy for a host
+/// process. Its name must not be used to exempt an otherwise unobservable host
+/// command, so Flatpak deliberately returns an unknown foreground process.
+pub fn running_process_identity(
+    terminal: Option<&vte4::Terminal>,
+    child: &ChildProcessIdentity,
+) -> RunningProcessIdentity {
+    let child_pid = child.pid();
+    if !child_process_identity_is_current(child) {
+        return RunningProcessIdentity::unverified(child_pid);
+    }
+    let foreground_pgid = if running_in_flatpak() {
+        None
+    } else {
+        terminal.and_then(foreground_process_group)
+    };
+    RunningProcessIdentity {
+        child_pid: Some(child_pid.0),
+        foreground_pgid,
+        name: foreground_pgid.and_then(process_name_for_pid),
+        executable: foreground_pgid.and_then(process_executable_identity),
+        session_processes: if running_in_flatpak() {
+            None
+        } else {
+            session_processes_for_pid(child_pid.0)
+        },
+    }
+}
+
+/// Capture the kernel identity of a just-spawned VTE child.
+///
+/// Failure on Linux means the child already exited or `/proc` could not
+/// be inspected. Callers must retain the PID for display/lifecycle bookkeeping
+/// but must not later signal it without this token.
+pub fn child_process_identity(pid: glib::Pid) -> Option<ChildProcessIdentity> {
+    if pid.0 <= 1 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let process = proc_process(pid.0)?;
+        Some(ChildProcessIdentity {
+            pid: pid.0,
+            start_time: Some(process.start_time),
+            session: Some(process.session),
+            process_group: Some(process.process_group),
+            brokered: running_in_flatpak(),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn child_process_identity_is_current(identity: &ChildProcessIdentity) -> bool {
+    if identity.brokered != running_in_flatpak() {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        identity
+            .expected_process()
+            .zip(proc_process(identity.pid))
+            .is_some_and(|(expected, current)| same_process(&expected, &current))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Resolve the kernel-backed identity a native login shell is expected to
+/// expose in `/proc/<pid>/exe`. Device and inode identity prevents a different
+/// executable with the same basename from being mistaken for an idle shell.
+pub fn expected_executable_identity(path: &str) -> Option<ExecutableIdentity> {
+    #[cfg(target_os = "linux")]
+    {
+        let canonical = std::fs::canonicalize(path).ok()?;
+        executable_identity_from_path(&canonical)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn foreground_process_group(terminal: &vte4::Terminal) -> Option<i32> {
+    use vte4::prelude::TerminalExt;
+
+    let pty = terminal.pty()?;
+    // SAFETY: VTE owns the borrowed PTY file descriptor for the duration of
+    // this call. tcgetpgrp does not retain or modify the descriptor.
+    let process_group = unsafe { libc::tcgetpgrp(pty.fd().as_raw_fd()) };
+    (process_group > 0).then_some(process_group)
+}
+
+#[cfg(target_os = "linux")]
+fn process_name_for_pid(pid: i32) -> Option<String> {
+    if pid <= 1 {
+        return None;
+    }
+    let proc_root = format!("/proc/{pid}");
+    executable_name_from_link(Path::new(&proc_root).join("exe")).or_else(|| {
+        // `comm` is writable by the process itself, so its value is advisory.
+        // Marking it prevents built-in exception names such as `bash` from
+        // treating an unverified fallback as a trusted executable identity.
+        read_bounded_proc_file(Path::new(&proc_root).join("comm"), MAX_PROC_COMM_BYTES)
+            .and_then(|value| advisory_process_name_from_comm(&value))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable_identity(pid: i32) -> Option<ExecutableIdentity> {
+    (pid > 1).then_some(())?;
+    executable_identity_from_path(format!("/proc/{pid}/exe"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_executable_identity(_pid: i32) -> Option<ExecutableIdentity> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_name_for_pid(_pid: i32) -> Option<String> {
+    None
+}
+
+const MAX_PROCESS_NAME_BYTES: usize = 255;
+
+#[cfg(target_os = "linux")]
+const MAX_PROC_COMM_BYTES: usize = 64;
+
+#[cfg(target_os = "linux")]
+const MAX_PROC_STAT_BYTES: usize = 4096;
+
+#[cfg(target_os = "linux")]
+fn session_processes_for_pid(child_pid: i32) -> Option<Vec<i32>> {
+    session_members_for_pid(child_pid)
+        .map(|members| members.into_iter().map(|member| member.pid).collect())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcProcess {
+    pid: i32,
+    process_group: i32,
+    session: i32,
+    start_time: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl ChildProcessIdentity {
+    fn expected_process(&self) -> Option<ProcProcess> {
+        Some(ProcProcess {
+            pid: self.pid,
+            process_group: self.process_group?,
+            session: self.session?,
+            start_time: self.start_time?,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn session_members_for_pid(child_pid: i32) -> Option<Vec<ProcProcess>> {
+    if child_pid <= 1 {
+        return None;
+    }
+    let child_session = proc_process(child_pid)?.session;
+    let members = session_members_for_session(child_session)?;
+    members
+        .iter()
+        .any(|member| member.pid == child_pid)
+        .then_some(members)
+}
+
+#[cfg(target_os = "linux")]
+fn session_members_for_session(session: i32) -> Option<Vec<ProcProcess>> {
+    if session <= 1 {
+        return None;
+    }
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if let Some(process) = proc_process(pid) {
+            if process.session == session {
+                members.push(process);
+            }
+        }
+    }
+    members.sort_unstable_by_key(|member| member.pid);
+    members.dedup_by_key(|member| member.pid);
+    (!members.is_empty()).then_some(members)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn session_processes_for_pid(_child_pid: i32) -> Option<Vec<i32>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn proc_process(pid: i32) -> Option<ProcProcess> {
+    let stat = read_bounded_proc_file(format!("/proc/{pid}/stat"), MAX_PROC_STAT_BYTES)?;
+    proc_process_from_stat(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_process_from_stat(stat: &[u8]) -> Option<ProcProcess> {
+    let stat = std::str::from_utf8(stat).ok()?;
+    // The command field is parenthesized and may contain spaces or `)`, so
+    // split after its final closing delimiter. The remaining fields begin
+    // with state, parent PID, process group, then session ID.
+    let fields = stat.rsplit_once(") ")?.1;
+    let mut fields = fields.split_whitespace();
+    let _state = fields.next()?;
+    let _parent = fields.next()?;
+    let process_group = fields.next()?.parse().ok()?;
+    let session = fields.next()?.parse().ok()?;
+    for _ in 0..15 {
+        fields.next()?;
+    }
+    let start_time = fields.next()?.parse().ok()?;
+    let pid = stat.split_whitespace().next()?.parse().ok()?;
+    Some(ProcProcess {
+        pid,
+        process_group,
+        session,
+        start_time,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn executable_name_from_link(path: impl AsRef<Path>) -> Option<String> {
+    let target = std::fs::read_link(path).ok()?;
+    executable_name_from_target(&target)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_identity_from_path(path: impl AsRef<Path>) -> Option<ExecutableIdentity> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(ExecutableIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_proc_file(path: impl AsRef<Path>, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut value = Vec::with_capacity(max_bytes.min(256) + 1);
+    std::fs::File::open(path)
+        .ok()?
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut value)
+        .ok()?;
+    (value.len() <= max_bytes).then_some(value)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_name_from_target(target: &Path) -> Option<String> {
+    let name = target.file_name()?.to_str()?;
+    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+    normalize_process_name(name)
+}
+
+fn normalize_process_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > MAX_PROCESS_NAME_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let name = value.rsplit('/').next()?.trim();
+    (!name.is_empty() && name != "." && name != "..").then(|| name.to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn advisory_process_name_from_comm(value: &[u8]) -> Option<String> {
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(normalize_process_name)
+        .map(|name| format!("{name} (unverified)"))
 }
 
 fn child_environment(terminal_type: &str, locale: Option<&str>) -> Vec<String> {
@@ -674,26 +1134,225 @@ pub fn send_control_v(terminal: &vte4::Terminal) {
     send_control_character(terminal, crate::shortcuts::CONTROL_V);
 }
 
-/// Ask a session's process group to exit when its tab is closed. VTE's PTY
-/// child is the process-group leader, so signalling the group also cleans up a
-/// foreground command instead of leaving it orphaned after a tab closes.
-pub fn terminate_child(child_pid: glib::Pid) {
-    // SAFETY: kill only receives a process id supplied by VTE for this app's
-    // own child. A failed signal (for an already exited child) is harmless.
+#[cfg(target_os = "linux")]
+fn same_process(expected: &ProcProcess, current: &ProcProcess) -> bool {
+    current.pid == expected.pid
+        && current.session == expected.session
+        && current.process_group == expected.process_group
+        && current.start_time == expected.start_time
+}
+
+/// Open a kernel process handle before validating the numeric PID. If the PID
+/// was recycled before `pidfd_open`, the subsequent `/proc` comparison rejects
+/// the replacement. If it exits after validation, the pidfd remains bound to
+/// the old process and cannot retarget a later reuse.
+#[cfg(target_os = "linux")]
+fn open_validated_pidfd(expected: &ProcProcess) -> Option<OwnedFd> {
+    // SAFETY: `pidfd_open` takes a numeric PID and flags value and returns a new
+    // owned file descriptor on success. The descriptor is immediately wrapped
+    // in `OwnedFd` so every later return path closes it.
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, expected.pid, 0u32) };
+    if raw_fd < 0 {
+        return None;
+    }
+    // SAFETY: a successful `pidfd_open` returns a fresh descriptor owned by the
+    // caller, transferred exactly once into `OwnedFd`.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as i32) };
+    proc_process(expected.pid)
+        .filter(|current| same_process(expected, current))
+        .map(|_| pidfd)
+}
+
+#[cfg(target_os = "linux")]
+fn send_pidfd_signal(pidfd: &OwnedFd, signal: i32) -> bool {
+    // SAFETY: `pidfd` is a live owned process descriptor; a null siginfo and
+    // zero flags have the same semantics as `kill(2)` for the supplied signal.
     unsafe {
-        let pid = child_pid.0;
-        if pid <= 1 {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        ) == 0
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_validated_process(expected: &ProcProcess, signal: i32) -> bool {
+    open_validated_pidfd(expected)
+        .as_ref()
+        .is_some_and(|pidfd| send_pidfd_signal(pidfd, signal))
+}
+
+/// Emergency cleanup for the native acceptance probe. Keep the operation
+/// crate-private and fixed to SIGKILL: production shutdown uses
+/// `terminate_child`, while the harness may need to remove an exact leftover
+/// job after a failed assertion.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_process_if_exact(
+    pid: i32,
+    start_time: u64,
+    session: i32,
+    process_group: i32,
+) -> bool {
+    if pid <= 1 || session == unsafe { libc::getsid(0) } {
+        return false;
+    }
+    signal_validated_process(
+        &ProcProcess {
+            pid,
+            process_group,
+            session,
+            start_time,
+        },
+        libc::SIGKILL,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn kill_process_if_exact(
+    _pid: i32,
+    _start_time: u64,
+    _session: i32,
+    _process_group: i32,
+) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn revalidated_session_members(session: i32, anchors: &[ProcProcess]) -> Option<Vec<ProcProcess>> {
+    for expected in anchors
+        .iter()
+        .filter(|expected| expected.session == session)
+    {
+        let Some(pidfd) = open_validated_pidfd(expected) else {
+            continue;
+        };
+        let members = session_members_for_session(session)?;
+        // Signal zero verifies that the pidfd-bound anchor remained alive for
+        // the complete enumeration. Therefore the numeric session ID could not
+        // have disappeared and been reused for an unrelated session midway.
+        if send_pidfd_signal(&pidfd, 0) {
+            return Some(members);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn signal_session_members(members: &mut [ProcProcess], leader_pid: i32, signal: i32) {
+    // Keep the session leader alive until its jobs receive each signal. This
+    // preserves an authorization anchor while newly forked members are
+    // discovered between escalation stages.
+    members.sort_unstable_by_key(|member| member.pid == leader_pid);
+    for member in members {
+        let _ = signal_validated_process(member, signal);
+    }
+}
+
+/// Terminate processes still in a terminal's native process session.
+/// Interactive foreground and background jobs can have process groups that do
+/// not match VTE's child PID, so session membership is re-enumerated between
+/// escalation stages and every member is revalidated immediately before a
+/// signal. The caller runs this escalation away from GTK's main thread so the
+/// grace intervals do not stall input or window redraws.
+pub fn terminate_child(child: ChildProcessIdentity) {
+    let pid = child.pid;
+    if pid <= 1 {
+        return;
+    }
+    if !child_process_identity_is_current(&child) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(expected_child) = child.expected_process() else {
+            return;
+        };
+        if child.brokered {
+            // The sandbox-side `flatpak-spawn` proxy is the only process Core
+            // Terminal can identify directly. Its host-side supervisor expands
+            // a proxy signal to the verified private host session. Give the
+            // synchronous supervisor time to consume HUP and begin cleanup
+            // before signalling the proxy again.
+            if signal_validated_process(&expected_child, libc::SIGHUP) {
+                std::thread::sleep(Duration::from_millis(200));
+                let _ = signal_validated_process(&expected_child, libc::SIGTERM);
+            }
             return;
         }
-        let _ = libc::kill(-pid, libc::SIGHUP);
-        let _ = libc::kill(pid, libc::SIGTERM);
+        // VTE creates a separate process session. Never enumerate or signal the
+        // application's own login/desktop session if that invariant cannot be
+        // established.
+        let own_session = unsafe { libc::getsid(0) };
+        let session = expected_child.session;
+        if session == own_session {
+            return;
+        }
+        let Some(mut members) = revalidated_session_members(session, &[expected_child]) else {
+            return;
+        };
+        let Some(mut current) = revalidated_session_members(session, &members) else {
+            return;
+        };
+        signal_session_members(&mut current, pid, libc::SIGHUP);
+        members = current;
+
+        // Give shells and jobs a chance to react to their terminal going away
+        // before escalating. TERM then receives a full second for handlers to
+        // flush state and exit cleanly before KILL is considered.
+        std::thread::sleep(Duration::from_millis(200));
+        let Some(mut current) = revalidated_session_members(session, &members) else {
+            return;
+        };
+        signal_session_members(&mut current, pid, libc::SIGTERM);
+        members = current;
+
+        std::thread::sleep(Duration::from_secs(1));
+        if let Some(mut current) = revalidated_session_members(session, &members) {
+            signal_session_members(&mut current, pid, libc::SIGKILL);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::{CursorShape, DEFAULT_PROFILE_NAME};
+    use crate::profiles::{CloseOnExit, CursorShape, DEFAULT_PROFILE_NAME};
+
+    fn running_process(
+        child_pid: i32,
+        foreground_pgid: Option<i32>,
+        name: Option<&str>,
+    ) -> RunningProcessIdentity {
+        RunningProcessIdentity {
+            child_pid: Some(child_pid),
+            foreground_pgid,
+            name: name.map(str::to_owned),
+            executable: name.map(test_executable),
+            session_processes: foreground_pgid.map(|_| vec![child_pid]),
+        }
+    }
+
+    fn test_executable(name: &str) -> ExecutableIdentity {
+        ExecutableIdentity {
+            device: 1,
+            inode: name.bytes().map(u64::from).sum(),
+        }
+    }
+
+    fn close_blocker(
+        session_id: u64,
+        child_pid: i32,
+        foreground_pgid: Option<i32>,
+        name: Option<&str>,
+    ) -> CloseBlocker {
+        CloseBlocker {
+            session_id: SessionId::from(session_id),
+            process: running_process(child_pid, foreground_pgid, name),
+        }
+    }
 
     #[test]
     fn login_command_uses_login_flag() {
@@ -827,10 +1486,20 @@ mod tests {
             .any(|entry| entry == "--env=COLORTERM=truecolor"));
         assert!(argv.iter().any(|entry| entry == "--env=LANG=C.UTF-8"));
         assert!(argv.iter().any(|entry| entry == "--env=LC_ALL=C.UTF-8"));
+        assert!(argv.iter().any(|entry| entry == "--forward-fd=3"));
+        let separator = argv.iter().position(|entry| entry == "--").unwrap();
+        assert_eq!(argv[separator + 1], FLATPAK_HOST_SUPERVISOR_EXEC);
+        assert_eq!(&argv[separator + 2..separator + 4], ["/bin/bash", "-lc"]);
         assert_eq!(
             &argv[argv.len() - 3..],
             ["/bin/bash", "-lc", "printf '%s' \"$HOME\""]
         );
+    }
+
+    #[test]
+    fn flatpak_proxy_leaves_the_pty_for_the_host_session() {
+        assert_eq!(flatpak_proxy_pty_flags(), vte4::PtyFlags::NO_CTTY);
+        assert!(!flatpak_proxy_pty_flags().contains(vte4::PtyFlags::NO_SESSION));
     }
 
     #[test]
@@ -880,6 +1549,19 @@ mod tests {
             flatpak_host_command(&options),
             ["printf", "hello world", "$HOME"]
         );
+    }
+
+    #[test]
+    fn flatpak_host_command_executes_only_the_forwarded_supervisor() {
+        let options = SpawnOptions::new(None, Some("printf '%s' safe"), "xterm-256color")
+            .with_shell("/bin/bash", true);
+        let argv = flatpak_host_argv(&options, Some("/home/user"));
+        let separator = argv.iter().position(|entry| entry == "--").unwrap();
+        assert_eq!(argv[separator + 1], "/proc/self/fd/3");
+        assert_eq!(argv[separator + 2], "/bin/bash");
+        assert_eq!(argv[separator + 3], "-lc");
+        assert_eq!(argv[separator + 4], "printf '%s' safe");
+        assert!(!argv.iter().any(|entry| entry == "/bin/sh"));
     }
 
     #[test]
@@ -937,15 +1619,13 @@ mod tests {
     }
 
     #[test]
-    fn child_exit_policy_distinguishes_clean_and_failed_children() {
+    fn legacy_child_exit_flags_do_not_override_explicit_policy() {
         let mut profile = TerminalProfile::homebrew();
+        profile.close_on_exit = CloseOnExit::Never;
         profile.close_on_clean_exit = true;
         profile.close_on_error = false;
         profile.shell_exit_action = ShellExitAction::Keep;
-        assert_eq!(
-            child_exit_decision(&profile, 0),
-            ChildExitDecision::CloseTab
-        );
+        assert_eq!(child_exit_decision(&profile, 0), ChildExitDecision::Keep);
         assert_eq!(
             child_exit_decision(&profile, 1 << 8),
             ChildExitDecision::Keep
@@ -954,7 +1634,7 @@ mod tests {
         profile.close_on_error = true;
         assert_eq!(
             child_exit_decision(&profile, 1 << 8),
-            ChildExitDecision::CloseTab
+            ChildExitDecision::Keep
         );
         profile.close_on_clean_exit = false;
         profile.shell_exit_action = ShellExitAction::CloseWindow;
@@ -962,6 +1642,76 @@ mod tests {
             child_exit_decision(&profile, 0),
             ChildExitDecision::CloseWindow
         );
+    }
+
+    #[test]
+    fn close_on_exit_policy_distinguishes_clean_and_error_statuses() {
+        let mut profile = TerminalProfile::homebrew();
+        profile.close_on_clean_exit = false;
+        profile.close_on_error = false;
+        profile.shell_exit_action = ShellExitAction::Keep;
+
+        profile.close_on_exit = CloseOnExit::Clean;
+        assert_eq!(
+            child_exit_decision(&profile, 0),
+            ChildExitDecision::CloseTab
+        );
+        assert_eq!(
+            child_exit_decision(&profile, 7 << 8),
+            ChildExitDecision::Keep
+        );
+
+        profile.close_on_exit = CloseOnExit::Error;
+        assert_eq!(child_exit_decision(&profile, 0), ChildExitDecision::Keep);
+        assert_eq!(
+            child_exit_decision(&profile, 7 << 8),
+            ChildExitDecision::CloseTab
+        );
+        assert_eq!(
+            child_exit_decision(&profile, libc::SIGTERM),
+            ChildExitDecision::CloseTab
+        );
+    }
+
+    #[test]
+    fn every_close_on_exit_rule_precedes_every_fallback_action() {
+        let fallback_decision = |action| match action {
+            ShellExitAction::Ask => ChildExitDecision::Ask,
+            ShellExitAction::Keep => ChildExitDecision::Keep,
+            ShellExitAction::CloseTab => ChildExitDecision::CloseTab,
+            ShellExitAction::CloseWindow => ChildExitDecision::CloseWindow,
+        };
+        for close_on_exit in [
+            CloseOnExit::Never,
+            CloseOnExit::Clean,
+            CloseOnExit::Error,
+            CloseOnExit::Always,
+        ] {
+            for shell_exit_action in [
+                ShellExitAction::Ask,
+                ShellExitAction::Keep,
+                ShellExitAction::CloseTab,
+                ShellExitAction::CloseWindow,
+            ] {
+                for (status, clean) in [(0, true), (7 << 8, false), (libc::SIGTERM, false)] {
+                    let mut profile = TerminalProfile::homebrew();
+                    profile.close_on_exit = close_on_exit;
+                    profile.shell_exit_action = shell_exit_action;
+                    let automatic_close = match close_on_exit {
+                        CloseOnExit::Never => false,
+                        CloseOnExit::Clean => clean,
+                        CloseOnExit::Error => !clean,
+                        CloseOnExit::Always => true,
+                    };
+                    let expected = if automatic_close {
+                        ChildExitDecision::CloseTab
+                    } else {
+                        fallback_decision(shell_exit_action)
+                    };
+                    assert_eq!(child_exit_decision(&profile, status), expected);
+                }
+            }
+        }
     }
 
     #[test]
@@ -974,7 +1724,423 @@ mod tests {
         assert!(should_prompt_before_close(&profile, None));
         profile.ask_before_close_policy = AskBeforeClosePolicy::Never;
         profile.ask_before_close = true;
-        assert!(should_prompt_before_close(&profile, Some("bash")));
+        assert!(!should_prompt_before_close(&profile, Some("bash")));
+    }
+
+    #[test]
+    fn close_plan_ignores_exited_sessions() {
+        let profile = TerminalProfile::homebrew();
+        let id = SessionId::from(11);
+        let plan = plan_close([CloseCandidate {
+            session_id: id,
+            process: None,
+            profile: Some(&profile),
+            expected_login_shell: None,
+        }]);
+        assert_eq!(plan.targets, [id]);
+        assert!(plan.blockers.is_empty());
+    }
+
+    #[test]
+    fn close_plan_honors_always_and_never() {
+        let mut always = TerminalProfile::homebrew();
+        always.ask_before_close_policy = AskBeforeClosePolicy::Always;
+        let mut never = TerminalProfile::homebrew();
+        never.ask_before_close_policy = AskBeforeClosePolicy::Never;
+        let always_id = SessionId::from(12);
+        let never_id = SessionId::from(13);
+        let always_process = running_process(1200, Some(1201), Some("bash"));
+        let plan = plan_close([
+            CloseCandidate {
+                session_id: always_id,
+                process: Some(always_process.clone()),
+                profile: Some(&always),
+                expected_login_shell: None,
+            },
+            CloseCandidate {
+                session_id: never_id,
+                process: Some(running_process(1300, Some(1301), Some("vim"))),
+                profile: Some(&never),
+                expected_login_shell: None,
+            },
+        ]);
+        assert_eq!(plan.targets, [always_id, never_id]);
+        assert_eq!(
+            plan.blockers,
+            [CloseBlocker {
+                session_id: always_id,
+                process: always_process,
+            }]
+        );
+    }
+
+    #[test]
+    fn close_plan_honors_non_exempt_foreground_process() {
+        let mut profile = TerminalProfile::homebrew();
+        profile.ask_before_close_policy = AskBeforeClosePolicy::NonExempt;
+        profile.ask_before_close_exceptions = vec!["bash".into(), "tmux".into()];
+        let shell_id = SessionId::from(14);
+        let editor_id = SessionId::from(15);
+        let unknown_id = SessionId::from(16);
+        let editor_process = running_process(1500, Some(1501), Some("vim"));
+        let unknown_process = running_process(1600, None, None);
+        let plan = plan_close([
+            CloseCandidate {
+                session_id: shell_id,
+                process: Some(running_process(1400, Some(1401), Some("bash"))),
+                profile: Some(&profile),
+                expected_login_shell: None,
+            },
+            CloseCandidate {
+                session_id: editor_id,
+                process: Some(editor_process.clone()),
+                profile: Some(&profile),
+                expected_login_shell: None,
+            },
+            CloseCandidate {
+                session_id: unknown_id,
+                process: Some(unknown_process.clone()),
+                profile: Some(&profile),
+                expected_login_shell: None,
+            },
+        ]);
+        assert_eq!(plan.targets, [shell_id, editor_id, unknown_id]);
+        assert_eq!(
+            plan.blockers,
+            [
+                CloseBlocker {
+                    session_id: editor_id,
+                    process: editor_process,
+                },
+                CloseBlocker {
+                    session_id: unknown_id,
+                    process: unknown_process,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn close_plan_fails_safe_when_profile_is_missing() {
+        let id = SessionId::from(17);
+        let process = running_process(1700, Some(1701), Some("bash"));
+        let plan = plan_close([CloseCandidate {
+            session_id: id,
+            process: Some(process.clone()),
+            profile: None,
+            expected_login_shell: None,
+        }]);
+        assert_eq!(
+            plan.blockers,
+            [CloseBlocker {
+                session_id: id,
+                process,
+            }]
+        );
+    }
+
+    #[test]
+    fn pending_spawn_blocks_close_and_invalidates_its_confirmation_on_start() {
+        let mut profile = TerminalProfile::homebrew();
+        profile.ask_before_close_policy = AskBeforeClosePolicy::NonExempt;
+        profile.ask_before_close_exceptions = vec!["bash".into()];
+        let id = SessionId::from(24);
+        let expected_shell = test_executable("bash");
+        let pending_plan = plan_close([CloseCandidate {
+            session_id: id,
+            process: Some(RunningProcessIdentity::pending()),
+            profile: Some(&profile),
+            expected_login_shell: Some(&expected_shell),
+        }]);
+        assert_eq!(pending_plan.blockers.len(), 1);
+        assert_eq!(pending_plan.blockers[0].process.child_pid, None);
+
+        let running_plan = plan_close([CloseCandidate {
+            session_id: id,
+            process: Some(running_process(2400, Some(2401), Some("vim"))),
+            profile: Some(&profile),
+            expected_login_shell: Some(&expected_shell),
+        }]);
+        assert!(!close_authorization_covers(&running_plan, &pending_plan));
+    }
+
+    #[test]
+    fn only_a_native_idle_login_shell_is_automatically_exempt() {
+        let mut profile = TerminalProfile::homebrew();
+        profile.ask_before_close_policy = AskBeforeClosePolicy::NonExempt;
+        profile.ask_before_close_exceptions.clear();
+        let expected_shell = test_executable("bash");
+
+        let idle_id = SessionId::from(25);
+        let job_id = SessionId::from(26);
+        let pending_id = SessionId::from(27);
+        let unobservable_id = SessionId::from(28);
+        let job = running_process(2600, Some(2601), Some("vim"));
+        let pending = RunningProcessIdentity::pending();
+        let unobservable = running_process(2800, None, None);
+        let mut background_job = running_process(2900, Some(2900), Some("bash"));
+        background_job.session_processes = Some(vec![2900, 2901]);
+        let replaced_shell = running_process(3000, Some(3000), Some("sleep"));
+        let mut same_name_replacement = running_process(3100, Some(3100), Some("bash"));
+        same_name_replacement.executable = Some(ExecutableIdentity {
+            device: 99,
+            inode: 99,
+        });
+        let plan = plan_close([
+            CloseCandidate {
+                session_id: idle_id,
+                process: Some(running_process(2500, Some(2500), Some("bash"))),
+                profile: Some(&profile),
+                expected_login_shell: Some(&expected_shell),
+            },
+            CloseCandidate {
+                session_id: job_id,
+                process: Some(job.clone()),
+                profile: Some(&profile),
+                expected_login_shell: Some(&expected_shell),
+            },
+            CloseCandidate {
+                session_id: pending_id,
+                process: Some(pending.clone()),
+                profile: Some(&profile),
+                expected_login_shell: Some(&expected_shell),
+            },
+            CloseCandidate {
+                session_id: unobservable_id,
+                process: Some(unobservable.clone()),
+                profile: Some(&profile),
+                expected_login_shell: Some(&expected_shell),
+            },
+            CloseCandidate {
+                session_id: SessionId::from(29),
+                process: Some(background_job.clone()),
+                profile: Some(&profile),
+                expected_login_shell: Some(&expected_shell),
+            },
+            CloseCandidate {
+                session_id: SessionId::from(30),
+                process: Some(replaced_shell.clone()),
+                profile: Some(&profile),
+                expected_login_shell: Some(&expected_shell),
+            },
+            CloseCandidate {
+                session_id: SessionId::from(31),
+                process: Some(same_name_replacement.clone()),
+                profile: Some(&profile),
+                expected_login_shell: Some(&expected_shell),
+            },
+        ]);
+
+        assert_eq!(
+            plan.blockers,
+            [
+                CloseBlocker {
+                    session_id: job_id,
+                    process: job,
+                },
+                CloseBlocker {
+                    session_id: pending_id,
+                    process: pending,
+                },
+                CloseBlocker {
+                    session_id: unobservable_id,
+                    process: unobservable,
+                },
+                CloseBlocker {
+                    session_id: SessionId::from(29),
+                    process: background_job,
+                },
+                CloseBlocker {
+                    session_id: SessionId::from(30),
+                    process: replaced_shell,
+                },
+                CloseBlocker {
+                    session_id: SessionId::from(31),
+                    process: same_name_replacement,
+                },
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_parser_handles_spaces_and_closing_parentheses_in_command() {
+        assert_eq!(
+            proc_process_from_stat(
+                b"123 (odd ) shell) S 1 123 456 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 98765\n"
+            ),
+            Some(ProcProcess {
+                pid: 123,
+                process_group: 123,
+                session: 456,
+                start_time: 98765,
+            })
+        );
+        assert_eq!(proc_process_from_stat(b"malformed"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_time_identity_rejects_a_reused_or_changed_process() {
+        if running_in_flatpak() {
+            return;
+        }
+        let pid = glib::Pid(unsafe { libc::getpid() });
+        let identity = child_process_identity(pid).expect("test process identity");
+        assert!(child_process_identity_is_current(&identity));
+
+        let mut changed_start = identity.clone();
+        changed_start.start_time = changed_start
+            .start_time
+            .map(|value| value.saturating_add(1));
+        assert!(!child_process_identity_is_current(&changed_start));
+
+        let mut changed_session = identity.clone();
+        changed_session.session = changed_session.session.map(|value| value.saturating_add(1));
+        assert!(!child_process_identity_is_current(&changed_session));
+
+        let mut changed_group = identity;
+        changed_group.process_group = changed_group
+            .process_group
+            .map(|value| value.saturating_add(1));
+        assert!(!child_process_identity_is_current(&changed_group));
+        assert_eq!(child_process_identity(glib::Pid(1)), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_binding_validates_the_complete_process_identity() {
+        let pid = unsafe { libc::getpid() };
+        let expected = proc_process(pid).expect("test process identity");
+        let pidfd = open_validated_pidfd(&expected).expect("validated pidfd");
+        assert!(send_pidfd_signal(&pidfd, 0));
+
+        let mut changed_start = expected;
+        changed_start.start_time = changed_start.start_time.saturating_add(1);
+        assert!(open_validated_pidfd(&changed_start).is_none());
+
+        let mut changed_session = expected;
+        changed_session.session = changed_session.session.saturating_add(1);
+        assert!(open_validated_pidfd(&changed_session).is_none());
+
+        let mut changed_group = expected;
+        changed_group.process_group = changed_group.process_group.saturating_add(1);
+        assert!(open_validated_pidfd(&changed_group).is_none());
+    }
+
+    #[test]
+    fn close_authorization_rejects_new_or_changed_blockers() {
+        let confirmed = close_blocker(18, 1800, Some(1801), Some("vim"));
+        let confirmed_plan = ClosePlan {
+            targets: vec![confirmed.session_id],
+            blockers: vec![confirmed.clone()],
+        };
+        let new_blocker = close_blocker(19, 1900, Some(1901), Some("top"));
+        let plan_with_new_process = ClosePlan {
+            targets: vec![confirmed.session_id, new_blocker.session_id],
+            blockers: vec![confirmed.clone(), new_blocker],
+        };
+        assert!(!close_authorization_covers(
+            &plan_with_new_process,
+            &confirmed_plan
+        ));
+
+        let changed_process = close_blocker(18, 1800, Some(1802), Some("less"));
+        let plan_with_changed_process = ClosePlan {
+            targets: vec![changed_process.session_id],
+            blockers: vec![changed_process],
+        };
+        assert!(!close_authorization_covers(
+            &plan_with_changed_process,
+            &confirmed_plan
+        ));
+    }
+
+    #[test]
+    fn close_authorization_rejects_a_new_unblocked_target() {
+        let confirmed = close_blocker(22, 2200, Some(2201), Some("vim"));
+        let confirmed_plan = ClosePlan {
+            targets: vec![confirmed.session_id],
+            blockers: vec![confirmed.clone()],
+        };
+        let plan_with_new_target = ClosePlan {
+            targets: vec![confirmed.session_id, SessionId::from(23)],
+            blockers: vec![confirmed],
+        };
+        assert!(!close_authorization_covers(
+            &plan_with_new_target,
+            &confirmed_plan
+        ));
+    }
+
+    #[test]
+    fn close_authorization_accepts_same_or_exited_blockers() {
+        let first = close_blocker(20, 2000, Some(2001), Some("vim"));
+        let second = close_blocker(21, 2100, Some(2101), Some("top"));
+        let confirmed_plan = ClosePlan {
+            targets: vec![first.session_id, second.session_id],
+            blockers: vec![first.clone(), second.clone()],
+        };
+        assert!(close_authorization_covers(&confirmed_plan, &confirmed_plan));
+
+        let one_exited = ClosePlan {
+            targets: confirmed_plan.targets.clone(),
+            blockers: vec![second.clone()],
+        };
+        assert!(close_authorization_covers(&one_exited, &confirmed_plan));
+        assert!(close_authorization_covers(
+            &ClosePlan {
+                targets: vec![second.session_id],
+                blockers: Vec::new(),
+            },
+            &confirmed_plan
+        ));
+    }
+
+    #[test]
+    fn process_name_normalization_is_safe_and_deterministic() {
+        assert_eq!(normalize_process_name("  bash\n").as_deref(), Some("bash"));
+        assert_eq!(normalize_process_name("tmux").as_deref(), Some("tmux"));
+        assert_eq!(normalize_process_name("\n\t"), None);
+        assert_eq!(normalize_process_name("vi\nm"), None);
+        assert_eq!(normalize_process_name("bash\0"), None);
+    }
+
+    #[test]
+    fn executable_identity_recovers_long_and_deleted_basenames() {
+        let name = "core-terminal-command-name-over-fifteen-bytes";
+        assert_eq!(
+            executable_name_from_target(Path::new(&format!("/opt/core-terminal/bin/{name}")))
+                .as_deref(),
+            Some(name)
+        );
+        assert_eq!(
+            executable_name_from_target(Path::new("/usr/bin/bash (deleted)")).as_deref(),
+            Some("bash")
+        );
+    }
+
+    #[test]
+    fn advisory_comm_identity_cannot_match_a_plain_exception() {
+        let name = advisory_process_name_from_comm(b"bash\n").unwrap();
+        assert_eq!(name, "bash (unverified)");
+
+        let mut profile = TerminalProfile::homebrew();
+        profile.ask_before_close_policy = AskBeforeClosePolicy::NonExempt;
+        profile.ask_before_close_exceptions = vec!["bash".into()];
+        assert!(should_prompt_before_close(&profile, Some(&name)));
+    }
+
+    #[test]
+    fn process_name_candidates_reject_unsafe_or_unbounded_values() {
+        assert_eq!(normalize_process_name(""), None);
+        assert_eq!(normalize_process_name("/usr/bin/.."), None);
+        assert_eq!(normalize_process_name("/usr/bin/vi\nm"), None);
+        assert_eq!(advisory_process_name_from_comm(b"/usr/bin/\xff\n"), None);
+        assert_eq!(
+            advisory_process_name_from_comm(&[b'a'; MAX_PROCESS_NAME_BYTES + 1]),
+            None
+        );
     }
 
     #[test]
