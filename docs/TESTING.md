@@ -9,6 +9,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --no-fail-fast
 cargo audit
 bash -n scripts/*.sh
+scripts/check-release-consistency.sh
 desktop-file-validate packaging/core-terminal.desktop
 appstreamcli validate --no-net \
   packaging/io.github.ksudo_dev.CoreTerminal.metainfo.xml
