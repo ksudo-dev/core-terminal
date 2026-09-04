@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.1
+
+Released 2026-09-03.
+
+- Added a complete ordered-entry editor for Window Groups, with visible tab
+  summaries and labeled add, remove, move, and launch actions.
+- Made the bottom Settings Save action commit Window Group drafts. Switching
+  groups and launching a group also retain current edits.
+- Made group renames atomic, refreshed profile selectors after profile
+  mutations, and blocked deletion of profiles still used by a group.
+- Added bounded absolute-path validation for saved group directories.
+- Corrected Flatpak host-shell startup so it uses the host login shell, PATH,
+  D-Bus session, agent sockets, and desktop environment.
+- Removed VTE development files from the Flatpak and expanded installed-bundle,
+  host-bridge, security, and release-verification checks.
+- Reworked public documentation and metadata around the supported Debian and
+  x86_64 Flatpak artifacts.
+
 ## 0.2.0
 
 Released 2026-09-03.

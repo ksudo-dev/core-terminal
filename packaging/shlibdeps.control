@@ -6,5 +6,7 @@ Standards-Version: 4.7.2
 
 Package: core-terminal
 Architecture: any
-Description: GTK terminal inspired by macOS Terminal
- Core Terminal is a small native GTK4 terminal emulator using VTE.
+Description: terminal emulator with profiles and reusable window groups
+ Core Terminal is a native GTK4 and VTE terminal emulator. Profiles store
+ appearance and behavior, while window groups reopen ordered tabs with their
+ saved profiles, directories, and terminal dimensions.

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ksudo-dev/core-terminal/security/advisories/new
+    about: Send vulnerability reports privately through GitHub Security Advisories.
+  - name: Read the contributing guide
+    url: https://github.com/ksudo-dev/core-terminal/blob/main/CONTRIBUTING.md
+    about: Check the supported scope and required checks before opening a change.
+  - name: Download a release
+    url: https://github.com/ksudo-dev/core-terminal/releases
+    about: Install a published Debian package or Flatpak bundle.

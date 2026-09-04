@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Version 0.2.0 is the supported release line. Older package files are not
+Version 0.2.1 is the supported release line. Older package files are not
 maintained.
 
 ## Reporting a vulnerability

@@ -4,12 +4,14 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>Core Terminal</name>
-  <summary>A native GTK4 terminal with detailed profiles and settings</summary>
+  <summary>A GTK4 terminal with Terminal.app-style profiles and window groups</summary>
   <description>
     <p>
-      Core Terminal is a GTK4 and VTE terminal emulator for Linux. It provides
-      configurable profiles, tabs, window groups, keyboard mappings, colors,
-      shell behavior, and import support for selected Terminal profile fields.
+      Core Terminal is a GTK4 and VTE terminal emulator for Linux. Profiles save
+      terminal appearance and behavior, while window groups reopen ordered tabs
+      with their saved profiles and directories. It also provides keyboard
+      mappings, colors, shell behavior, and import support for selected Terminal
+      profile fields.
     </p>
   </description>
   <launchable type="desktop-id">io.github.ksudo_dev.CoreTerminal.desktop</launchable>
@@ -27,6 +29,11 @@
   <url type="bugtracker">https://github.com/ksudo-dev/core-terminal/issues</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.2.1" date="2026-09-03">
+      <description>
+        <p>Improved Window Group editing and Flatpak host-shell integration.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-09-03">
       <description>
         <p>First public release.</p>

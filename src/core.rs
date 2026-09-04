@@ -396,20 +396,22 @@ pub fn spawn_terminal<F>(terminal: &vte4::Terminal, options: &SpawnOptions, call
 where
     F: FnOnce(Result<glib::Pid, glib::Error>) + 'static,
 {
-    let shell = options.shell.clone().unwrap_or_else(login_shell);
-    let command = startup_argv(
-        &shell,
-        options.custom_command.as_deref(),
-        options.run_command_inside_shell,
-    );
     let envv_owned = child_environment(&options.terminal_type, options.locale.as_deref());
     let (command, working_directory) = if running_in_flatpak() {
         (
-            flatpak_host_argv(&command, options.working_directory.as_deref(), &envv_owned),
+            flatpak_host_argv(options, env::var("HOME").ok().as_deref()),
             None,
         )
     } else {
-        (command, options.working_directory.clone())
+        let shell = options.shell.clone().unwrap_or_else(login_shell);
+        (
+            startup_argv(
+                &shell,
+                options.custom_command.as_deref(),
+                options.run_command_inside_shell,
+            ),
+            options.working_directory.clone(),
+        )
     };
     let argv: Vec<&str> = command.iter().map(String::as_str).collect();
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
@@ -431,67 +433,95 @@ fn running_in_flatpak() -> bool {
     env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").is_file()
 }
 
-fn flatpak_host_argv(
-    command: &[String],
-    working_directory: Option<&str>,
-    environment: &[String],
-) -> Vec<String> {
+/// Build the command that crosses the Flatpak boundary.
+///
+/// `flatpak-spawn --host` obtains the desktop session's environment from the
+/// Flatpak broker. It must not be cleared and rebuilt from `env::vars()`: the
+/// latter is the sandbox environment and contains a sandbox shell, D-Bus
+/// proxy, PATH and XDG paths that are invalid for an unsandboxed host child.
+/// Only terminal-specific values selected by Core Terminal are overridden.
+fn flatpak_host_argv(options: &SpawnOptions, sandbox_home: Option<&str>) -> Vec<String> {
     let mut argv = vec![
         "flatpak-spawn".into(),
         "--host".into(),
-        "--clear-env".into(),
         "--watch-bus".into(),
     ];
-    let host_home = environment
-        .iter()
-        .find_map(|entry| entry.strip_prefix("HOME="))
-        .filter(|value| value.starts_with('/') && !value.contains('\0'));
-    let directory = working_directory
+    let directory = options
+        .working_directory
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.contains('\0'))
-        .or(host_home)
+        .or_else(|| {
+            sandbox_home
+                .map(str::trim)
+                .filter(|value| value.starts_with('/') && !value.contains('\0'))
+        })
         .unwrap_or("/");
     argv.push(format!("--directory={directory}"));
-
-    let host_path = host_home
-        .map(|home| {
-            format!(
-                "PATH={home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-            )
-        })
-        .unwrap_or_else(|| {
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
-        });
-    argv.push(format!("--env={host_path}"));
-
-    const HOST_ENVIRONMENT: [&str; 15] = [
-        "COLORTERM",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "DISPLAY",
-        "HOME",
-        "LANG",
-        "LC_ALL",
-        "LOGNAME",
-        "SHELL",
-        "SSH_AUTH_SOCK",
-        "TERM",
-        "TZ",
-        "USER",
-        "WAYLAND_DISPLAY",
-        "XAUTHORITY",
-        "XDG_RUNTIME_DIR",
-    ];
-    for entry in environment {
-        let Some((name, _)) = entry.split_once('=') else {
-            continue;
-        };
-        if HOST_ENVIRONMENT.contains(&name) || name.starts_with("LC_") {
-            argv.push(format!("--env={entry}"));
-        }
+    argv.push(format!(
+        "--env=TERM={}",
+        sanitize_terminal_type(&options.terminal_type)
+    ));
+    argv.push("--env=COLORTERM=truecolor".into());
+    argv.push(format!("--env=VTE_VERSION={}", vte_version_number()));
+    if let Some(locale) = options.locale.as_deref() {
+        argv.push(format!("--env=LANG={locale}"));
+        argv.push(format!("--env=LC_ALL={locale}"));
     }
     argv.push("--".into());
-    argv.extend(command.iter().cloned());
+    argv.extend(flatpak_host_command(options));
     argv
+}
+
+fn flatpak_host_command(options: &SpawnOptions) -> Vec<String> {
+    if let Some(shell) = &options.shell {
+        return startup_argv(
+            shell,
+            options.custom_command.as_deref(),
+            options.run_command_inside_shell,
+        );
+    }
+
+    let Some(command) = options.custom_command.as_deref() else {
+        return host_login_shell_argv(None);
+    };
+    if options.run_command_inside_shell {
+        host_login_shell_argv(Some(command))
+    } else {
+        parse_direct_command(command).unwrap_or_else(|| host_login_shell_argv(None))
+    }
+}
+
+/// Resolve `$SHELL` after crossing onto the host. Flatpak deliberately exposes
+/// `/bin/sh` as the sandbox's `SHELL`, which is unrelated to the user's login
+/// shell. The fixed wrapper script treats the broker-provided host value only
+/// as an executable path and passes custom command text as a positional
+/// argument, so it does not interpolate settings into shell source.
+fn host_login_shell_argv(custom_command: Option<&str>) -> Vec<String> {
+    match custom_command {
+        Some(command) => vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "host_shell=${SHELL:-/bin/sh}; case $host_shell in /*) ;; *) host_shell=/bin/sh;; esac; exec \"$host_shell\" -lc \"$1\"".into(),
+            "core-terminal".into(),
+            command.into(),
+        ],
+        None => vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "host_shell=${SHELL:-/bin/sh}; case $host_shell in /*) ;; *) host_shell=/bin/sh;; esac; exec \"$host_shell\" -l".into(),
+        ],
+    }
+}
+
+fn vte_version_number() -> u32 {
+    // SAFETY: these VTE accessors are pure version queries for the linked
+    // library and require no initialized object or borrowed pointer.
+    unsafe {
+        vte4::ffi::vte_get_major_version() * 10_000
+            + vte4::ffi::vte_get_minor_version() * 100
+            + vte4::ffi::vte_get_micro_version()
+    }
 }
 
 /// Apply the profile's requested terminal grid size. VTE measures this in
@@ -769,57 +799,81 @@ mod tests {
     }
 
     #[test]
-    fn flatpak_host_command_preserves_arguments_directory_and_environment() {
-        let command = vec![
-            "/bin/bash".into(),
-            "-lc".into(),
-            "printf '%s' \"$HOME\"".into(),
-        ];
-        let environment = vec![
-            "HOME=/home/user".into(),
-            "TERM=xterm-256color".into(),
-            "LANG=C.UTF-8".into(),
-            "XDG_CONFIG_HOME=/home/user/.var/app/example/config".into(),
-            "PATH=/app/bin:/usr/bin".into(),
-            "EXAMPLE_SECRET=not-forwarded-on-the-command-line".into(),
-        ];
+    fn flatpak_host_command_preserves_explicit_shell_arguments_and_directory() {
+        let options = SpawnOptions {
+            working_directory: Some("/home/user/Project Files".into()),
+            custom_command: Some("printf '%s' \"$HOME\"".into()),
+            terminal_type: "xterm-256color".into(),
+            shell: Some("/bin/bash".into()),
+            run_command_inside_shell: true,
+            locale: Some("C.UTF-8".into()),
+        };
+        let argv = flatpak_host_argv(&options, Some("/home/user"));
+        assert_eq!(&argv[..3], ["flatpak-spawn", "--host", "--watch-bus"]);
+        assert!(argv
+            .iter()
+            .any(|entry| entry == "--directory=/home/user/Project Files"));
+        assert!(argv
+            .iter()
+            .any(|entry| entry == "--env=TERM=xterm-256color"));
+        assert!(argv
+            .iter()
+            .any(|entry| entry == "--env=COLORTERM=truecolor"));
+        assert!(argv.iter().any(|entry| entry == "--env=LANG=C.UTF-8"));
+        assert!(argv.iter().any(|entry| entry == "--env=LC_ALL=C.UTF-8"));
         assert_eq!(
-            flatpak_host_argv(&command, Some("/home/user/Project Files"), &environment),
-            [
-                "flatpak-spawn",
-                "--host",
-                "--clear-env",
-                "--watch-bus",
-                "--directory=/home/user/Project Files",
-                "--env=PATH=/home/user/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                "--env=HOME=/home/user",
-                "--env=TERM=xterm-256color",
-                "--env=LANG=C.UTF-8",
-                "--",
-                "/bin/bash",
-                "-lc",
-                "printf '%s' \"$HOME\"",
-            ]
+            &argv[argv.len() - 3..],
+            ["/bin/bash", "-lc", "printf '%s' \"$HOME\""]
         );
     }
 
     #[test]
-    fn flatpak_host_command_defaults_to_home_and_drops_sandbox_environment() {
-        let command = vec!["/bin/bash".into(), "-l".into()];
-        let environment = vec![
-            "HOME=/home/user".into(),
-            "FLATPAK_ID=io.github.example.App".into(),
-            "XDG_DATA_HOME=/home/user/.var/app/example/data".into(),
-            "PATH=/app/bin:/usr/bin".into(),
-        ];
-        let argv = flatpak_host_argv(&command, None, &environment);
+    fn flatpak_host_command_uses_broker_environment_and_resolves_default_shell_on_host() {
+        let options = SpawnOptions::new(None, None, "xterm-direct");
+        let argv = flatpak_host_argv(&options, Some("/home/user"));
         assert!(argv.iter().any(|entry| entry == "--directory=/home/user"));
-        assert!(argv.iter().any(|entry| entry == "--clear-env"));
-        assert!(!argv.iter().any(|entry| entry.contains("FLATPAK_ID=")));
-        assert!(!argv.iter().any(|entry| entry.contains("XDG_DATA_HOME=")));
+        assert!(!argv.iter().any(|entry| entry == "--clear-env"));
+        assert!(!argv.iter().any(|entry| entry.starts_with("--env=PATH=")));
+        assert!(!argv.iter().any(|entry| entry.starts_with("--env=HOME=")));
         assert!(!argv
             .iter()
-            .any(|entry| entry == "--env=PATH=/app/bin:/usr/bin"));
+            .any(|entry| entry.starts_with("--env=DBUS_SESSION_BUS_ADDRESS=")));
+        assert!(!argv.iter().any(|entry| entry.starts_with("--env=XDG_")));
+        assert_eq!(argv[argv.len() - 3], "/bin/sh");
+        assert_eq!(argv[argv.len() - 2], "-c");
+        assert!(argv[argv.len() - 1].contains("${SHELL:-/bin/sh}"));
+    }
+
+    #[test]
+    fn flatpak_default_shell_custom_command_is_a_positional_argument() {
+        let options = SpawnOptions::new(
+            None,
+            Some("printf '%s' \"$HOME\"; touch /tmp/example"),
+            "xterm-256color",
+        );
+        let argv = flatpak_host_argv(&options, Some("/home/user"));
+        assert_eq!(argv[argv.len() - 5], "/bin/sh");
+        assert_eq!(argv[argv.len() - 4], "-c");
+        assert!(argv[argv.len() - 3].contains("exec \"$host_shell\" -lc \"$1\""));
+        assert_eq!(argv[argv.len() - 2], "core-terminal");
+        assert_eq!(
+            argv[argv.len() - 1],
+            "printf '%s' \"$HOME\"; touch /tmp/example"
+        );
+    }
+
+    #[test]
+    fn flatpak_direct_command_does_not_use_a_shell() {
+        let mut options = SpawnOptions::new(
+            None,
+            Some("printf 'hello world' \"$HOME\""),
+            "xterm-256color",
+        );
+        options.run_command_inside_shell = false;
+        assert_eq!(
+            flatpak_host_command(&options),
+            ["printf", "hello world", "$HOME"]
+        );
     }
 
     #[test]

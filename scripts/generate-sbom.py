@@ -45,6 +45,12 @@ def main() -> int:
 
     root_id = metadata["resolve"]["root"]
     packages = {package["id"]: package for package in metadata["packages"]}
+    package_refs = {
+        package_id: purl(package["name"], package["version"])
+        for package_id, package in packages.items()
+    }
+    if len(set(package_refs.values())) != len(package_refs):
+        raise RuntimeError("Cargo metadata contains duplicate name/version package identities")
     root = packages[root_id]
     components = []
     for package in sorted(metadata["packages"], key=lambda item: item["id"]):
@@ -52,7 +58,7 @@ def main() -> int:
             continue
         component: dict[str, object] = {
             "type": "library",
-            "bom-ref": package["id"],
+            "bom-ref": package_refs[package["id"]],
             "name": package["name"],
             "version": package["version"],
             "purl": purl(package["name"], package["version"]),
@@ -68,7 +74,12 @@ def main() -> int:
         components.append(component)
 
     dependencies = [
-        {"ref": node["id"], "dependsOn": sorted(node["dependencies"])}
+        {
+            "ref": package_refs[node["id"]],
+            "dependsOn": sorted(
+                package_refs[dependency] for dependency in node["dependencies"]
+            ),
+        }
         for node in sorted(metadata["resolve"]["nodes"], key=lambda item: item["id"])
     ]
     document = {
@@ -78,7 +89,7 @@ def main() -> int:
         "metadata": {
             "component": {
                 "type": "application",
-                "bom-ref": root_id,
+                "bom-ref": package_refs[root_id],
                 "name": root["name"],
                 "version": root["version"],
                 "purl": purl(root["name"], root["version"]),

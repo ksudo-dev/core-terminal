@@ -63,8 +63,8 @@ and the Debian package.
 ## Debian package
 
 ```sh
-scripts/build-deb.sh 0.2.0
-deb=dist/core-terminal_0.2.0_$(dpkg --print-architecture).deb
+scripts/build-deb.sh 0.2.1
+deb=dist/core-terminal_0.2.1_$(dpkg --print-architecture).deb
 scripts/check-deb.sh "$deb"
 scripts/check-private-data.sh "$deb"
 scripts/security-audit.sh "$deb"
@@ -100,13 +100,15 @@ scripts/build-flatpak.sh
 flatpak install --user --or-update \
   dist/io.github.ksudo_dev.CoreTerminal.flatpak
 flatpak info --user io.github.ksudo_dev.CoreTerminal
+expected_host_shell=$(getent passwd "$(id -u)" | cut -d: -f7)
 flatpak run --user --command=flatpak-spawn \
   io.github.ksudo_dev.CoreTerminal \
-  --host --clear-env --env=HOME="$HOME" --directory="$HOME" \
-  /bin/sh -c 'test "$PWD" = "$HOME"'
+  --host --directory="$HOME" \
+  "$PWD/scripts/check-flatpak-host-environment.sh" \
+  "$expected_host_shell" "$HOME"
 ```
 
-The last command checks the host-shell bridge without starting the graphical
-application. CI also launches the installed Flatpak under X11 and runs the
-real GTK/VTE acceptance harness. A native desktop acceptance run remains
-required for GTK, VTE, Wayland, tabs, settings, and pointer behavior.
+The last command checks the host-shell bridge without replacing the host
+session environment. CI also launches the installed Flatpak under X11 and
+runs the real GTK/VTE acceptance harness. A native desktop acceptance run
+remains required for GTK, VTE, Wayland, tabs, settings, and pointer behavior.

@@ -9,7 +9,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  PACKAGE_VERSION: 0.2.0
+  PACKAGE_VERSION: 0.2.1
 
 jobs:
   fmt:
@@ -107,8 +107,10 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            appstream dbus-daemon desktop-file-utils elfutils flatpak flatpak-builder xauth xvfb
+            appstream dbus-daemon desktop-file-utils elfutils flatpak flatpak-builder \
+            libglib2.0-bin xauth xvfb
           command -v desktop-file-validate
+          command -v gdbus
       - run: |
           flatpak remote-add --if-not-exists --user flathub \
             https://flathub.org/repo/flathub.flatpakrepo
@@ -120,11 +122,23 @@ jobs:
           flatpak info --user io.github.ksudo_dev.CoreTerminal
           flatpak run --user --command=sh \
             io.github.ksudo_dev.CoreTerminal \
-            -c 'test -x /app/bin/core-terminal && test -r /app/share/core-terminal/default-profiles.json'
+            -c '
+              set -eu
+              test -x /app/bin/core-terminal
+              test -r /app/share/core-terminal/default-profiles.json
+              test -x /app/libexec/vte-urlencode-cwd
+              test -r /app/etc/profile.d/vte.sh
+              test -r /app/share/doc/core-terminal/vte/COPYING.README
+              test ! -d /app/include
+              test ! -d /app/lib/pkgconfig
+              find /app/lib -name "libvte-2.91-gtk4.so.0*" -print -quit | grep -q .
+            '
+          expected_host_shell=$(getent passwd "$(id -u)" | cut -d: -f7)
           dbus-run-session -- flatpak run --user --command=flatpak-spawn \
             io.github.ksudo_dev.CoreTerminal \
-            --host --clear-env --env=HOME="$HOME" --directory="$HOME" \
-            /bin/sh -c 'test "$PWD" = "$HOME"'
+            --host --directory="$HOME" \
+            "$PWD/scripts/check-flatpak-host-environment.sh" \
+            "$expected_host_shell" "$HOME"
           acceptance_root="$HOME/core-terminal-flatpak-acceptance"
           install -d -m 0700 "$acceptance_root/config"
           dbus-run-session -- xvfb-run -a flatpak run --user \
@@ -158,6 +172,17 @@ jobs:
       - run: scripts/generate-notices.sh /tmp/THIRD_PARTY_NOTICES.md
       - run: diff -u THIRD_PARTY_NOTICES.md /tmp/THIRD_PARTY_NOTICES.md
 
+  sbom:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.93.1
+      - run: scripts/generate-sbom.py . /tmp/core-terminal.cdx.json
+      - run: python3 -m json.tool /tmp/core-terminal.cdx.json >/dev/null
+      - run: '! grep -Eq ''/home/|/Users/|file://'' /tmp/core-terminal.cdx.json'
+
   cargo-audit:
     runs-on: ubuntu-26.04
     steps:
@@ -181,8 +206,9 @@ jobs:
       - flatpak
       - private-data
       - notices
+      - sbom
       - cargo-audit
-    if: github.ref == 'refs/tags/v0.2.0'
+    if: github.ref == 'refs/tags/v0.2.1'
     runs-on: ubuntu-26.04
     permissions:
       actions: read
@@ -208,6 +234,8 @@ jobs:
           git archive --format=tar --prefix="core-terminal-$PACKAGE_VERSION/" "$GITHUB_SHA" \
             | gzip -n > "release-assets/core-terminal-$PACKAGE_VERSION.tar.gz"
           scripts/generate-sbom.py . "release-assets/core-terminal-$PACKAGE_VERSION.cdx.json"
+          ! grep -Eq '/home/|/Users/|file://' \
+            "release-assets/core-terminal-$PACKAGE_VERSION.cdx.json"
           cd release-assets
           sha256sum *.deb *.flatpak *.tar.gz *.cdx.json > SHA256SUMS
           sha256sum --check SHA256SUMS
@@ -218,6 +246,6 @@ jobs:
           gh release create "$GITHUB_REF_NAME" release-assets/* \
             --verify-tag \
             --title "Core Terminal $PACKAGE_VERSION" \
-            --notes-file packaging/release-notes-0.2.0.md
+            --notes-file packaging/release-notes-0.2.1.md
         env:
           GH_TOKEN: ${{ github.token }}

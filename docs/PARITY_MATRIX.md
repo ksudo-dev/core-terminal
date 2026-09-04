@@ -3,13 +3,13 @@
 Audit date: 2026-09-03
 
 This matrix compares the requested Terminal.app settings layout with Core
-Terminal 0.2.0 on Ubuntu GNOME Wayland. A control counts as implemented only
+Terminal 0.2.1 on Ubuntu GNOME Wayland. A control counts as implemented only
 when it has a GTK control, persists its value, and changes application or VTE
 behavior. A value that is only stored does not count.
 
 ## Current status
 
-| Area | Status in 0.2.0 |
+| Area | Status in 0.2.1 |
 | --- | --- |
 | Native terminal | GTK4 application with one VTE PTY per tab, login-shell startup, and child-process cleanup |
 | Windows and tabs | New window, new tab, close tab, tab navigation, and Ctrl+1 through Ctrl+9 switching |
@@ -72,7 +72,8 @@ title components, columns, rows, resize behavior, scrollback limits, restored
 rows, and a bookmark field. VTE receives the requested columns and rows.
 Profile, shell, directory, process-reported title, and dimensions feed the
 window title. TTY and Ctrl-key title components are disabled because VTE does
-not report them. GNOME controls pixel geometry and top-level placement.
+not report them. The desktop compositor controls pixel geometry and top-level
+placement.
 
 ### Tab
 
@@ -117,12 +118,12 @@ bell output can be limited to profiles where the app's audible bell is off.
 ### Window Groups
 
 The data model validates group names, profile references, directories, and
-dimensions. The settings UI adds, removes, renames, and saves groups. A group
-selected in General launches one tab per ordered entry with its saved profile,
-directory, columns, and rows. The current editor changes the first entry while
-preserving extra entries loaded from disk. Editing every entry in one table and
-launching separate top-level windows remain deferred. GNOME chooses each
-top-level window's position.
+dimensions. The settings UI adds, removes, renames, and saves groups. Every
+ordered entry can be selected, edited, added, removed, or moved up and down. A
+group selected in General launches one tab per entry with its saved profile,
+directory, columns, and rows. Launching entries as separate top-level windows
+remains deferred. The Linux compositor chooses each top-level window's
+position.
 
 ### Encodings
 
@@ -141,11 +142,10 @@ These belong in a later feature plan rather than a release claim.
 
 ## Platform limits
 
-- GNOME Wayland owns global window placement. Core Terminal can request terminal
-  cell dimensions but cannot restore macOS screen coordinates.
-- GNOME Dock or Dash-to-Dock does not provide a portable equivalent of live
-  macOS Dock tiles or Dock bounce. Notifications and urgency hints are the
-  available Linux alternatives.
+- The Wayland compositor owns global window placement. Core Terminal can
+  request terminal cell dimensions but cannot restore macOS screen coordinates.
+- Linux docks do not provide a portable equivalent of live macOS Dock tiles or
+  Dock bounce. Notifications and urgency hints are the available alternatives.
 - GTK4 and Wayland do not provide a system-wide secure-input mode equivalent to
   macOS Secure Keyboard Entry.
 - VTE owns alternate-screen switching, mouse reporting, keypad mode, and
@@ -189,9 +189,9 @@ cargo test --locked --all-targets --no-fail-fast
 cargo audit
 scripts/native-acceptance.sh target/release/core-terminal
 scripts/build-deb.sh
-scripts/check-deb.sh dist/core-terminal_0.2.0_$(dpkg --print-architecture).deb
-lintian --pedantic dist/core-terminal_0.2.0_$(dpkg --print-architecture).deb
-scripts/check-private-data.sh dist/core-terminal_0.2.0_$(dpkg --print-architecture).deb
+scripts/check-deb.sh dist/core-terminal_0.2.1_$(dpkg --print-architecture).deb
+lintian --pedantic dist/core-terminal_0.2.1_$(dpkg --print-architecture).deb
+scripts/check-private-data.sh dist/core-terminal_0.2.1_$(dpkg --print-architecture).deb
 ```
 
 Launch the installed package with `GDK_BACKEND=wayland` from the Ubuntu GNOME

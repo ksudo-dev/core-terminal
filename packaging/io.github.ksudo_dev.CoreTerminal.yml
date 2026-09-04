@@ -17,6 +17,14 @@ finish-args:
 modules:
   - name: vte
     buildsystem: meson
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - /lib/*.a
+      - /lib/*.la
+      - /share/gir-1.0
+      - /share/gtk-doc
+      - /share/man
     config-opts:
       - -Dapp=false
       - -Ddocs=false
