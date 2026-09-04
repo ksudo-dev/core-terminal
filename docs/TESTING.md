@@ -34,16 +34,47 @@ The harness runs on the current Wayland socket with GTK critical messages made
 fatal. It creates an isolated XDG configuration directory, opens all four
 settings pages and all six profile pages, and checks the rendered settings
 allocation. The profile sidebar, names, labeled actions, and six profile tabs
-must remain visible without a horizontally scrolling outer page. The harness
-also edits a profile through the real Save button, reloads the JSON, checks
+must remain visible without a horizontally scrolling outer page. Shell inputs
+must also expose GTK accessibility labels and descriptions. The harness edits
+a profile through the real Save button, reloads the JSON, checks
 applied VTE properties, creates and closes a tab, verifies non-modal settings,
-and confirms pointer autohide is disabled. The script prints one `status=PASS`
-line and removes the temporary configuration directory when it exits.
+confirms pointer autohide is disabled, and exercises tab-close and shell-exit
+window confirmation with a protected sibling. It also closes a genuinely
+pending VTE spawn before its callback returns, checks the callback cleanup,
+revalidates stale confirmations, and preserves a queued window-close request.
+It also captures a live shell session containing foreground and background
+jobs, verifies their distinct process-group roles and per-run process names,
+accepts any safely revalidated close prompt, and verifies that every captured
+process exits. Emergency probe cleanup also opens a pidfd before checking PID,
+start time, session, and process group, then sends the signal through that
+kernel-bound handle.
+The script prints one `status=PASS` line and removes the temporary configuration
+directory when it exits.
 
 The harness cannot control GL.iNet Comet's browser Pointer Lock. A maintainer
 using that KVM must also take a macOS and GNOME screenshot, return focus to Core
 Terminal, and click a settings tab, Cancel, and Save. The app never requests
 Pointer Lock and never asks VTE to hide its pointer.
+
+The harness automates the background-session and close-race cases. These manual
+native checks remain useful for release candidates because a Flatpak cannot
+inspect the host PTY's foreground process group:
+
+1. Start a foreground command whose name is in the profile exception list and
+   confirm that closing its tab does not prompt.
+2. Start a non-exempt foreground command such as `sleep 60` and confirm that
+   closing its tab asks before terminating it.
+3. Run `sleep 60 &` from an otherwise idle login shell and confirm that the
+   background job still causes a close prompt.
+4. Set shell-exit behavior to close the window, keep a protected command open
+   in a second tab, and exit the first shell. The window must ask before closing
+   the protected sibling.
+5. While a confirmation is open, change which process is running. Confirming
+   the stale prompt must not close the new process without another check.
+6. Request a whole-window close while a tab confirmation is open. Cancelling
+   or accepting the tab prompt must not discard the pending window request.
+7. Close a tab immediately after opening it and confirm that a child returned
+   by the asynchronous spawn callback is terminated instead of orphaned.
 
 ## Private profile fixtures
 

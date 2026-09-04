@@ -19,16 +19,51 @@ use crate::{
 use gtk::{gio, glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 use vte4::prelude::{TerminalExt, TerminalExtManual};
 
 const SETTINGS_PAGE_IDS: [&str; 4] = ["general", "profiles", "window-groups", "encodings"];
 const PROFILE_PAGE_IDS: [&str; 6] = ["text", "window", "tab", "shell", "keyboard", "advanced"];
+static ACCEPTANCE_CLOSED_SPAWN_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Run process-session escalation away from GTK's main thread. Holding the
+/// application until the worker finishes keeps last-window shutdown from
+/// abandoning a pending TERM/KILL sequence.
+fn terminate_child_async(identity: core::ChildProcessIdentity) {
+    let mut application_hold = gio::Application::default().map(|application| application.hold());
+    let (completed_sender, completed_receiver) = mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("core-terminal-terminate".into())
+        .spawn(move || {
+            core::terminate_child(identity);
+            let _ = completed_sender.send(());
+        });
+
+    if let Err(error) = worker {
+        application_hold.take();
+        eprintln!("Core Terminal: failed to start process cleanup worker: {error}");
+        return;
+    }
+
+    glib::timeout_add_local(
+        Duration::from_millis(10),
+        move || match completed_receiver.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                application_hold.take();
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        },
+    );
+}
 
 #[cfg(test)]
 fn settings_page_ids() -> &'static [&'static str; 4] {
@@ -40,9 +75,9 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 mod structural_tests {
     use super::{
         resolve_new_tab_profile, resolve_window_profile, runtime_profile_requires_reapply,
-        runtime_terminal_settings_changed, settings_page_ids, startup_profile_after_deletion,
-        window_group_entry_summary, ProfileStore, SessionManager, Settings, WindowGroupEntry,
-        APPLICATION_ID, PROFILE_PAGE_IDS,
+        runtime_terminal_settings_changed, settings_page_ids, spawn_callback_action,
+        startup_profile_after_deletion, window_group_entry_summary, ProfileStore, SessionManager,
+        Settings, SpawnCallbackAction, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -59,6 +94,26 @@ mod structural_tests {
         assert_eq!(PROFILE_PAGE_IDS[0], "text");
         assert_eq!(PROFILE_PAGE_IDS[2], "tab");
         assert_eq!(PROFILE_PAGE_IDS[5], "advanced");
+    }
+
+    #[test]
+    fn an_exit_tombstone_wins_before_any_pid_is_resolved() {
+        assert_eq!(
+            spawn_callback_action(true, true, false, false),
+            SpawnCallbackAction::IgnoreExitedChild
+        );
+        assert_eq!(
+            spawn_callback_action(false, false, false, true),
+            SpawnCallbackAction::TerminateClosedTab
+        );
+        assert_eq!(
+            spawn_callback_action(false, false, true, true),
+            SpawnCallbackAction::StoreLiveChild
+        );
+        assert_eq!(
+            spawn_callback_action(false, false, true, false),
+            SpawnCallbackAction::IgnoreLateCallback
+        );
     }
 
     #[test]
@@ -659,7 +714,8 @@ where
                 .collect();
             profile.close_on_exit = match controls.profile_close_on_exit.selected() {
                 1 => CloseOnExit::Clean,
-                2 => CloseOnExit::Always,
+                2 => CloseOnExit::Error,
+                3 => CloseOnExit::Always,
                 _ => CloseOnExit::Never,
             };
             profile.ask_before_close_policy = match controls.profile_ask_policy.selected() {
@@ -673,9 +729,11 @@ where
                 3 => ShellExitAction::CloseWindow,
                 _ => ShellExitAction::Ask,
             };
-            profile.close_on_clean_exit = controls.profile_close_clean.is_active();
-            profile.close_on_error = controls.profile_close_error.is_active();
-            profile.ask_before_close = controls.profile_ask_close.is_active();
+            // These booleans are read-only migration inputs. Current profiles
+            // persist the explicit enum controls above.
+            profile.close_on_clean_exit = false;
+            profile.close_on_error = false;
+            profile.ask_before_close = false;
             read_profile_widgets(
                 &controls.profile_stack,
                 &mut profile,
@@ -713,7 +771,10 @@ where
                 use_custom_command: controls.use_custom_command.is_active(),
                 custom_command: controls.custom_command.text().to_string(),
                 shell: controls.shell.text().to_string(),
-                run_command_inside_shell: controls.run_command_inside_shell.is_active(),
+                // This checkbox belongs to the selected profile. Retain the
+                // legacy global fallback until General exposes a separate
+                // control for it.
+                run_command_inside_shell: initial.run_command_inside_shell,
                 // Locale is profile-owned in the editor; retain the global
                 // setting until a dedicated global locale control exists.
                 locale: initial.locale.clone(),
@@ -766,9 +827,6 @@ struct SettingsControls {
     profile_ask_policy: gtk::DropDown,
     profile_exceptions: gtk::Entry,
     profile_exit_action: gtk::DropDown,
-    profile_close_clean: gtk::CheckButton,
-    profile_close_error: gtk::CheckButton,
-    profile_ask_close: gtk::CheckButton,
     new_tab_same_directory: gtk::CheckButton,
     new_window_same_directory: gtk::CheckButton,
     ctrl_number_tabs: gtk::CheckButton,
@@ -1502,57 +1560,72 @@ impl SettingsControls {
             &[],
         );
         shell_page.0.set_widget_name("shell");
-        let run_command_inside_shell = check(
-            "Run command inside login shell",
-            selected_defaults.run_inside_shell,
-        );
-        run_command_inside_shell.set_widget_name("profile-run-inside-shell");
-        shell_page.0.append(&run_command_inside_shell);
         let run_command = gtk::Entry::new();
         run_command.set_widget_name("profile-shell-command");
         run_command.set_text(&selected_defaults.shell_command);
         run_command.set_placeholder_text(Some("/bin/bash --login -c 'command'"));
         run_command.set_hexpand(true);
+        run_command.update_property(&[
+            gtk::accessible::Property::Label("Run command"),
+            gtk::accessible::Property::Description(
+                "Command started for this profile. A blank value inherits the General startup command.",
+            ),
+        ]);
         shell_page.0.append(&field_label("Run command"));
         shell_page.0.append(&run_command);
+        let run_command_inside_shell = check(
+            "Run command inside login shell",
+            selected_defaults.run_inside_shell,
+        );
+        run_command_inside_shell.set_widget_name("profile-run-inside-shell");
+        run_command_inside_shell.set_sensitive(!selected_defaults.shell_command.trim().is_empty());
+        run_command_inside_shell.set_tooltip_text(Some(
+            "Applies to this profile's Run command. A blank command uses the General startup command and its shell mode.",
+        ));
+        let run_mode_for_command = run_command_inside_shell.clone();
+        run_command.connect_changed(move |entry| {
+            run_mode_for_command.set_sensitive(!entry.text().trim().is_empty());
+        });
+        shell_page.0.append(&run_command_inside_shell);
+        shell_page.0.append(&hint_label(
+            "A blank profile command inherits the General startup command. Shell and command changes apply to new tabs.",
+        ));
         let profile_shell = gtk::Entry::new();
         profile_shell.set_widget_name("profile-shell");
         profile_shell.set_text(&selected_defaults.shell);
         profile_shell.set_placeholder_text(Some("Optional complete shell path"));
         profile_shell.set_hexpand(true);
+        profile_shell.update_property(&[
+            gtk::accessible::Property::Label("Login shell"),
+            gtk::accessible::Property::Description(
+                "Optional absolute shell path used for newly opened tabs.",
+            ),
+        ]);
         shell_page.0.append(&field_label("Login shell"));
         shell_page.0.append(&profile_shell);
-        let close_clean = named_check(
-            "Close window after clean exit",
-            selected_defaults.close_on_clean_exit,
-            "profile-close-clean",
-        );
-        shell_page.0.append(&close_clean);
-        let close_error = named_check(
-            "Close window after error",
-            selected_defaults.close_on_error,
-            "profile-close-error",
-        );
-        shell_page.0.append(&close_error);
-        let ask_close = named_check(
-            "Ask before closing running process",
-            selected_defaults.ask_before_close,
-            "profile-ask-close",
-        );
-        shell_page.0.append(&ask_close);
         let close_on_exit = gtk::DropDown::new(
-            Some(gtk::StringList::new(&["Never", "Clean exit", "Always"])),
+            Some(gtk::StringList::new(&[
+                "Never automatically close",
+                "After a clean exit",
+                "After an error exit",
+                "After any exit",
+            ])),
             None::<&gtk::Expression>,
         );
         close_on_exit.set_widget_name("profile-close-on-exit");
+        close_on_exit.update_property(&[
+            gtk::accessible::Property::Label("Automatically close tab"),
+            gtk::accessible::Property::Description(
+                "Select which child exit status automatically closes the tab before the fallback action is evaluated.",
+            ),
+        ]);
         close_on_exit.set_selected(match selected_defaults.close_on_exit {
             CloseOnExit::Never => 0,
             CloseOnExit::Clean => 1,
-            CloseOnExit::Always => 2,
+            CloseOnExit::Error => 2,
+            CloseOnExit::Always => 3,
         });
-        shell_page
-            .0
-            .append(&field_label("Close after command exits"));
+        shell_page.0.append(&field_label("Automatically close tab"));
         shell_page.0.append(&close_on_exit);
         let ask_policy = gtk::DropDown::new(
             Some(gtk::StringList::new(&[
@@ -1563,38 +1636,88 @@ impl SettingsControls {
             None::<&gtk::Expression>,
         );
         ask_policy.set_widget_name("profile-ask-policy");
+        ask_policy.update_property(&[
+            gtk::accessible::Property::Label(
+                "Ask before terminating a running process",
+            ),
+            gtk::accessible::Property::Description(
+                "Controls confirmation when manually closing a tab or window with a running process.",
+            ),
+        ]);
         ask_policy.set_selected(match selected_defaults.ask_before_close_policy {
             AskBeforeClosePolicy::Never => 0,
             AskBeforeClosePolicy::Always => 1,
             AskBeforeClosePolicy::NonExempt => 2,
         });
-        shell_page.0.append(&field_label("Close confirmation"));
+        shell_page
+            .0
+            .append(&field_label("Ask before terminating a running process"));
         shell_page.0.append(&ask_policy);
+        let exceptions = gtk::Entry::new();
+        exceptions.set_widget_name("profile-exceptions");
+        exceptions.set_placeholder_text(Some("bash, screen, tmux"));
+        exceptions.set_text(&selected_defaults.ask_before_close_exceptions.join(", "));
+        exceptions.set_hexpand(true);
+        exceptions.update_property(&[
+            gtk::accessible::Property::Label("Processes that do not require confirmation"),
+            gtk::accessible::Property::Description(
+                "Comma-separated executable basenames matched exactly and case-sensitively.",
+            ),
+        ]);
+        exceptions.set_sensitive(
+            selected_defaults.ask_before_close_policy == AskBeforeClosePolicy::NonExempt,
+        );
+        exceptions.set_tooltip_text(Some(
+            "Comma-separated executable basenames. Matching is exact and case-sensitive.",
+        ));
+        shell_page
+            .0
+            .append(&field_label("Processes that do not require confirmation"));
+        shell_page.0.append(&exceptions);
+        shell_page.0.append(&hint_label(
+            "This policy applies when closing a tab or window that still has a running process. Unknown or unverified processes are never exempt.",
+        ));
+        let exceptions_for_policy = exceptions.clone();
+        ask_policy.connect_selected_notify(move |dropdown| {
+            exceptions_for_policy.set_sensitive(dropdown.selected() == 2);
+        });
         let exit_policy = gtk::DropDown::new(
             Some(gtk::StringList::new(&[
-                "Ask",
-                "Keep window",
+                "Ask after exit",
+                "Keep tab open",
                 "Close tab",
                 "Close window",
-                "Close on clean exit",
             ])),
             None::<&gtk::Expression>,
         );
         exit_policy.set_widget_name("shell-exit-policy");
+        exit_policy.update_property(&[
+            gtk::accessible::Property::Label("When automatic close does not apply"),
+            gtk::accessible::Property::Description(
+                "Action used after the child exits when the automatic close rule does not match.",
+            ),
+        ]);
         exit_policy.set_selected(match selected_defaults.shell_exit_action {
             ShellExitAction::Ask => 0,
             ShellExitAction::Keep => 1,
             ShellExitAction::CloseTab => 2,
             ShellExitAction::CloseWindow => 3,
         });
-        shell_page.0.append(&field_label("On shell exit"));
+        shell_page
+            .0
+            .append(&field_label("When automatic close does not apply"));
         shell_page.0.append(&exit_policy);
-        let exceptions = gtk::Entry::new();
-        exceptions.set_widget_name("profile-exceptions");
-        exceptions.set_placeholder_text(Some("process-name, another-process"));
-        exceptions.set_text(&selected_defaults.ask_before_close_exceptions.join(", "));
-        exceptions.set_hexpand(true);
-        shell_page.0.append(&exceptions);
+        exit_policy.set_sensitive(selected_defaults.close_on_exit != CloseOnExit::Always);
+        exit_policy.set_tooltip_text(Some(
+            "Used only when the automatic close rule above does not match the child's exit status.",
+        ));
+        let fallback_for_close = exit_policy.clone();
+        close_on_exit.connect_selected_notify(move |dropdown| {
+            fallback_for_close.set_sensitive(dropdown.selected() != 3);
+        });
+        shell_page.0.append(&hint_label(
+            "The automatic rule is evaluated first. “Ask after exit” is separate from confirmation before terminating a process.",
+        ));
         profile_stack.add_titled(&scroll_page(&shell_page.0), Some("shell"), "Shell");
         let keyboard_page = profile_page_with_checks(
             "Keyboard",
@@ -2553,9 +2676,6 @@ impl SettingsControls {
             profile_ask_policy: ask_policy,
             profile_exceptions: exceptions,
             profile_exit_action: exit_policy,
-            profile_close_clean: close_clean,
-            profile_close_error: close_error,
-            profile_ask_close: ask_close,
             new_tab_same_directory,
             new_window_same_directory,
             ctrl_number_tabs,
@@ -2791,9 +2911,6 @@ fn read_profile_widgets(
         ),
         ("profile-restore-rows", &mut profile.restore_rows),
         ("profile-run-inside-shell", &mut profile.run_inside_shell),
-        ("profile-close-clean", &mut profile.close_on_clean_exit),
-        ("profile-close-error", &mut profile.close_on_error),
-        ("profile-ask-close", &mut profile.ask_before_close),
         ("profile-option-meta", &mut profile.option_as_meta),
         ("profile-alt-scroll", &mut profile.alternate_screen_scroll),
         (
@@ -2875,9 +2992,12 @@ fn read_profile_widgets(
     if let Some(value) = profile_dropdown(stack, "profile-close-on-exit") {
         profile.close_on_exit = match value {
             1 => CloseOnExit::Clean,
-            2 => CloseOnExit::Always,
+            2 => CloseOnExit::Error,
+            3 => CloseOnExit::Always,
             _ => CloseOnExit::Never,
         };
+        profile.close_on_clean_exit = false;
+        profile.close_on_error = false;
     }
     if let Some(value) = profile_dropdown(stack, "profile-ask-policy") {
         profile.ask_before_close_policy = match value {
@@ -3041,7 +3161,8 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
         widget.set_selected(match profile.close_on_exit {
             CloseOnExit::Never => 0,
             CloseOnExit::Clean => 1,
-            CloseOnExit::Always => 2,
+            CloseOnExit::Error => 2,
+            CloseOnExit::Always => 3,
         });
     }
     if let Some(widget) =
@@ -3126,9 +3247,6 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
         ("profile-unlimited-scrollback", profile.scrollback_unlimited),
         ("profile-restore-rows", profile.restore_rows),
         ("profile-run-inside-shell", profile.run_inside_shell),
-        ("profile-close-clean", profile.close_on_clean_exit),
-        ("profile-close-error", profile.close_on_error),
-        ("profile-ask-close", profile.ask_before_close),
         ("profile-option-meta", profile.option_as_meta),
         ("profile-alt-scroll", profile.alternate_screen_scroll),
         ("profile-delete-control-h", profile.delete_sends_control_h),
@@ -3436,6 +3554,46 @@ struct UiState {
     window: gtk::ApplicationWindow,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
+    pending_spawns: HashSet<u64>,
+    exited_before_spawn_callbacks: HashSet<u64>,
+    child_process_identities: HashMap<u64, core::ChildProcessIdentity>,
+    login_shell_identities: HashMap<u64, core::ExecutableIdentity>,
+    closing: bool,
+    close_prompt_open: bool,
+    active_close_request: Option<CloseRequest>,
+    pending_close_request: Option<CloseRequest>,
+    window_close_authorization: Option<core::ClosePlan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseRequest {
+    Tab(SessionId),
+    Window,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpawnCallbackAction {
+    IgnoreExitedChild,
+    TerminateClosedTab,
+    StoreLiveChild,
+    IgnoreLateCallback,
+}
+
+fn spawn_callback_action(
+    exited_before_callback: bool,
+    closing: bool,
+    session_exists: bool,
+    was_pending: bool,
+) -> SpawnCallbackAction {
+    if exited_before_callback {
+        SpawnCallbackAction::IgnoreExitedChild
+    } else if closing || !session_exists {
+        SpawnCallbackAction::TerminateClosedTab
+    } else if was_pending {
+        SpawnCallbackAction::StoreLiveChild
+    } else {
+        SpawnCallbackAction::IgnoreLateCallback
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3574,6 +3732,15 @@ fn build_window_with_directory(
         window: window.clone(),
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
+        pending_spawns: HashSet::new(),
+        exited_before_spawn_callbacks: HashSet::new(),
+        child_process_identities: HashMap::new(),
+        login_shell_identities: HashMap::new(),
+        closing: false,
+        close_prompt_open: false,
+        active_close_request: None,
+        pending_close_request: None,
+        window_close_authorization: None,
     }));
 
     let header = build_header_bar();
@@ -3705,16 +3872,30 @@ fn build_window_with_directory(
 
     let close_state = state.clone();
     window.connect_close_request(move |_| {
-        let mut state = close_state.borrow_mut();
-        state.settings.window_width = state.window.width().max(320);
-        state.settings.window_height = state.window.height().max(240);
-        let _ = state.settings.save_user();
-        for tab in state.sessions.tabs() {
-            if let Some(pid) = tab.child_pid {
-                core::terminate_child(pid);
+        let (plan, authorization) = {
+            let mut state = close_state.borrow_mut();
+            if state.closing {
+                return glib::Propagation::Proceed;
             }
+            let plan = close_plan_for(&state, CloseRequest::Window);
+            let authorization = state.window_close_authorization.take();
+            (plan, authorization)
+        };
+        let authorized = plan.blockers.is_empty()
+            || authorization
+                .as_ref()
+                .is_some_and(|confirmed| core::close_authorization_covers(&plan, confirmed));
+        if authorized {
+            finish_window_close(&close_state);
+            return glib::Propagation::Proceed;
         }
-        glib::Propagation::Proceed
+        if queue_or_reserve_close_prompt(&close_state, CloseRequest::Window) {
+            let prompt_state = close_state.clone();
+            glib::idle_add_local_once(move || {
+                present_close_confirmation(&prompt_state, CloseRequest::Window, plan);
+            });
+        }
+        glib::Propagation::Stop
     });
     window.present();
     schedule_acceptance_harness(app, &state);
@@ -3741,6 +3922,125 @@ fn project_icon() -> gtk::Image {
 /// get an automated tab/window lifecycle.  It uses the real GTK widget tree
 /// and VTE instances created by this module rather than string-only tests.
 fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiState>>) {
+    fn close_prompt_window() -> Option<gtk::Window> {
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .find(|widget| widget.widget_name() == "close-confirmation")
+            .and_downcast::<gtk::Window>()
+    }
+
+    fn close_prompt_button(name: &str) -> Option<gtk::Button> {
+        let window = close_prompt_window()?;
+        find_widget_by_name(&window.upcast::<gtk::Widget>(), name).and_downcast::<gtk::Button>()
+    }
+
+    fn close_prompt_details_are_bounded() -> bool {
+        let Some(window) = close_prompt_window() else {
+            return false;
+        };
+        let Some(scroller) = find_widget_by_name(
+            &window.upcast::<gtk::Widget>(),
+            "close-confirmation-processes",
+        )
+        .and_downcast::<gtk::ScrolledWindow>() else {
+            return false;
+        };
+        scroller.max_content_height() == 160
+            && scroller.vscrollbar_policy() == gtk::PolicyType::Automatic
+    }
+
+    fn drain_pending_events() {
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    fn wait_for_condition(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            drain_pending_events();
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AcceptanceProcess {
+        pid: i32,
+        process_group: i32,
+        session: i32,
+        start_time: u64,
+        arguments: Vec<String>,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acceptance_process(pid: i32) -> Option<AcceptanceProcess> {
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        let stat = std::str::from_utf8(&stat).ok()?;
+        let fields = stat.rsplit_once(") ")?.1;
+        let mut fields = fields.split_whitespace();
+        let _state = fields.next()?;
+        let _parent = fields.next()?;
+        let process_group = fields.next()?.parse().ok()?;
+        let session = fields.next()?.parse().ok()?;
+        for _ in 0..15 {
+            fields.next()?;
+        }
+        let start_time = fields.next()?.parse().ok()?;
+        let arguments = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()?
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| std::str::from_utf8(argument).ok().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        Some(AcceptanceProcess {
+            pid,
+            process_group,
+            session,
+            start_time,
+            arguments,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn acceptance_process(_pid: i32) -> Option<AcceptanceProcess> {
+        None
+    }
+
+    fn acceptance_process_has_arguments(
+        process: &AcceptanceProcess,
+        executable_name: &str,
+        argument: &str,
+    ) -> bool {
+        process.arguments.first().map(String::as_str) == Some(executable_name)
+            && process.arguments.get(1).map(String::as_str) == Some(argument)
+            && process.arguments.len() == 2
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acceptance_marker_pids(executable_name: &str, argument: &str) -> Vec<i32> {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut pids = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+            .filter_map(acceptance_process)
+            .filter(|process| acceptance_process_has_arguments(process, executable_name, argument))
+            .map(|process| process.pid)
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn acceptance_marker_pids(_executable_name: &str, _argument: &str) -> Vec<i32> {
+        Vec::new()
+    }
+
     static STARTED: AtomicBool = AtomicBool::new(false);
     if std::env::var_os("CORE_TERMINAL_ACCEPTANCE").is_none()
         || STARTED.swap(true, Ordering::SeqCst)
@@ -3753,6 +4053,657 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         let Some(app) = weak_app.upgrade() else {
             return;
         };
+        let mut confirmation_accepted = false;
+        let mut stale_pending_revalidated = false;
+        let mut new_window_target_revalidated = false;
+        let mut overlapping_window_request_preserved = false;
+        let mut state_machine_probe_cleanup = false;
+        let close_before_spawn_cleanup = {
+            let probe_name = "Acceptance Real Spawn Race";
+            let profile_added = state.try_borrow_mut().is_ok_and(|mut state| {
+                let Some(mut profile) = state.profiles.profile("Homebrew").cloned() else {
+                    return false;
+                };
+                profile.name = probe_name.into();
+                profile.shell_command = "/bin/sleep 37.123".into();
+                profile.run_inside_shell = false;
+                profile.close_on_exit = CloseOnExit::Never;
+                state.profiles.add_profile(profile).is_ok()
+            });
+            if profile_added {
+                let resolutions_before = ACCEPTANCE_CLOSED_SPAWN_RESOLUTIONS.load(Ordering::SeqCst);
+                open_tab_with_spec(&state, TabLaunchSpec::new(probe_name, None));
+                let pending_id = state.try_borrow().ok().and_then(|state| {
+                    let id = state.sessions.active()?.id;
+                    state.pending_spawns.contains(&id.get()).then_some(id)
+                });
+                if let Some(id) = pending_id {
+                    // Do not dispatch the main loop between open and close:
+                    // this is the real interval before VTE's callback returns.
+                    force_close_tab(&state, id);
+                    let callback_resolved = wait_for_condition(Duration::from_secs(4), || {
+                        ACCEPTANCE_CLOSED_SPAWN_RESOLUTIONS.load(Ordering::SeqCst)
+                            > resolutions_before
+                    });
+                    let clean = state.try_borrow_mut().is_ok_and(|mut state| {
+                        let state_clean = state.sessions.tab(id).is_none()
+                            && !state.pending_spawns.contains(&id.get())
+                            && !state.exited_before_spawn_callbacks.contains(&id.get())
+                            && !state.login_shell_identities.contains_key(&id.get())
+                            && !state.closing;
+                        let _ = state.profiles.delete_profile(probe_name);
+                        state_clean && state.profiles.profile(probe_name).is_none()
+                    });
+                    callback_resolved && clean
+                } else {
+                    let _ = state.borrow_mut().profiles.delete_profile(probe_name);
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        let mut close_prompt_details_bounded = false;
+        let background_session_cleanup = {
+            let probe_name = "Acceptance Background Session";
+            let probe_suffix = std::process::id();
+            let background_marker = format!("core-terminal-acceptance-bg-{probe_suffix}");
+            let foreground_marker = format!("core-terminal-acceptance-fg-{probe_suffix}");
+            let original_selected = state
+                .try_borrow()
+                .map(|state| state.settings.selected_profile.clone())
+                .unwrap_or_default();
+            let profile_added = state.try_borrow_mut().is_ok_and(|mut state| {
+                let Some(mut profile) = state.profiles.profile("Homebrew").cloned() else {
+                    return false;
+                };
+                profile.name = probe_name.into();
+                profile.shell = "/bin/bash".into();
+                profile.shell_command = format!(
+                    "set -m; (exec -a {background_marker} sleep 41.234) & \
+                     (exec -a {foreground_marker} sleep 40.234); wait"
+                );
+                profile.run_inside_shell = true;
+                profile.ask_before_close_policy = AskBeforeClosePolicy::Always;
+                state.profiles.add_profile(profile).is_ok()
+            });
+            if profile_added {
+                open_tab_with_spec(&state, TabLaunchSpec::new(probe_name, None));
+                let probe_id = state
+                    .try_borrow()
+                    .ok()
+                    .and_then(|state| state.sessions.active().map(|tab| tab.id));
+                let captured_session_processes = Rc::new(RefCell::new(None));
+                let session_processes = probe_id.and_then(|id| {
+                    let captured_session_processes = captured_session_processes.clone();
+                    wait_for_condition(Duration::from_secs(4), || {
+                        let Ok(state) = state.try_borrow() else {
+                            return false;
+                        };
+                        let process = close_plan_for(&state, CloseRequest::Tab(id))
+                            .blockers
+                            .first()
+                            .map(|blocker| blocker.process.clone());
+                        let Some(process) = process else {
+                            return false;
+                        };
+                        let (Some(child_pid), Some(foreground_pgid), Some(pids)) = (
+                            process.child_pid,
+                            process.foreground_pgid,
+                            process.session_processes,
+                        ) else {
+                            return false;
+                        };
+                        let members = pids
+                            .iter()
+                            .filter_map(|pid| acceptance_process(*pid))
+                            .collect::<Vec<_>>();
+                        let child = members.iter().find(|member| member.pid == child_pid);
+                        let background = members.iter().find(|member| {
+                            acceptance_process_has_arguments(member, &background_marker, "41.234")
+                        });
+                        let foreground = members.iter().find(|member| {
+                            acceptance_process_has_arguments(member, &foreground_marker, "40.234")
+                        });
+                        let roles_are_exact = child.zip(background).zip(foreground).is_some_and(
+                            |((child, background), foreground)| {
+                                child.pid != background.pid
+                                    && child.pid != foreground.pid
+                                    && background.pid != foreground.pid
+                                    && child.session == child.pid
+                                    && child.arguments.first().map(String::as_str)
+                                        == Some("/bin/bash")
+                                    && child.arguments.get(1).map(String::as_str) == Some("-lc")
+                                    && child.session == background.session
+                                    && child.session == foreground.session
+                                    && background.process_group != foreground.process_group
+                                    && foreground.process_group == foreground_pgid
+                            },
+                        );
+                        if roles_are_exact {
+                            *captured_session_processes.borrow_mut() = Some(members);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .then(|| captured_session_processes.borrow().clone())
+                    .flatten()
+                });
+                let prompted = probe_id.is_some_and(|id| {
+                    close_tab(&state, id);
+                    drain_pending_events();
+                    close_prompt_details_bounded = close_prompt_details_are_bounded();
+                    close_prompt_button("close-confirmation-accept")
+                        .is_some_and(|button| button.label().as_deref() == Some("Close Tab"))
+                        && state.try_borrow().is_ok_and(|state| {
+                            state.active_close_request == Some(CloseRequest::Tab(id))
+                        })
+                });
+                let close_accepted = prompted
+                    && probe_id.is_some_and(|id| {
+                        wait_for_condition(Duration::from_secs(4), || {
+                            if state
+                                .try_borrow()
+                                .is_ok_and(|state| state.sessions.tab(id).is_none())
+                            {
+                                return true;
+                            }
+                            let expected_prompt = state.try_borrow().is_ok_and(|state| {
+                                state.close_prompt_open
+                                    && state.active_close_request == Some(CloseRequest::Tab(id))
+                            });
+                            if expected_prompt {
+                                if let Some(accept) =
+                                    close_prompt_button("close-confirmation-accept")
+                                {
+                                    if accept.label().as_deref() == Some("Close Tab") {
+                                        accept.emit_clicked();
+                                        drain_pending_events();
+                                    }
+                                }
+                            }
+                            false
+                        })
+                    });
+                let processes_gone = session_processes.as_ref().is_some_and(|processes| {
+                    wait_for_condition(Duration::from_secs(4), || {
+                        processes.iter().all(|expected| {
+                            acceptance_process(expected.pid).is_none_or(|current| {
+                                current.start_time != expected.start_time
+                                    || current.session != expected.session
+                            })
+                        }) && acceptance_marker_pids(&background_marker, "41.234").is_empty()
+                            && acceptance_marker_pids(&foreground_marker, "40.234").is_empty()
+                    })
+                });
+                let model_clean = probe_id.is_some_and(|id| {
+                    state
+                        .try_borrow()
+                        .is_ok_and(|state| state.sessions.tab(id).is_none())
+                });
+                if let Some(id) = probe_id {
+                    let prompt_belongs_to_probe = state.try_borrow().is_ok_and(|state| {
+                        state.close_prompt_open
+                            && state.active_close_request == Some(CloseRequest::Tab(id))
+                    });
+                    if prompt_belongs_to_probe {
+                        if let Some(cancel) = close_prompt_button("close-confirmation-cancel") {
+                            cancel.emit_clicked();
+                            drain_pending_events();
+                        }
+                    }
+                    if state
+                        .try_borrow()
+                        .is_ok_and(|state| state.sessions.tab(id).is_some())
+                    {
+                        force_close_tab(&state, id);
+                    }
+                }
+                if let Some(processes) = &session_processes {
+                    for expected in processes {
+                        let _ = core::kill_process_if_exact(
+                            expected.pid,
+                            expected.start_time,
+                            expected.session,
+                            expected.process_group,
+                        );
+                    }
+                }
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    state.settings.selected_profile = original_selected;
+                    let _ = state.profiles.delete_profile(probe_name);
+                }
+                sync_active_profile_ui(&state);
+                prompted && close_accepted && processes_gone && model_clean
+            } else {
+                false
+            }
+        };
+        let state_machine_probe = {
+            let mut state = state.borrow_mut();
+            let active = state.sessions.active().map(|tab| {
+                (
+                    tab.id,
+                    tab.profile_name.clone(),
+                    tab.child_pid,
+                    state.sessions.tabs().len(),
+                )
+            });
+            active.and_then(
+                |(protected_id, profile_name, protected_pid, original_session_count)| {
+                    let template = state.profiles.profile(&profile_name).cloned()?;
+                    let original_selected_profile = state.settings.selected_profile.clone();
+                    let probe_name = "Acceptance Close State Machine".to_owned();
+                    let mut profile = template;
+                    profile.name = probe_name.clone();
+                    profile.shell_command = "/bin/sleep 30".into();
+                    profile.run_inside_shell = false;
+                    profile.ask_before_close = false;
+                    profile.ask_before_close_policy = AskBeforeClosePolicy::Always;
+                    state.profiles.add_profile(profile).ok()?;
+                    Some((
+                        protected_id,
+                        protected_pid,
+                        original_session_count,
+                        original_selected_profile,
+                        probe_name,
+                    ))
+                },
+            )
+        };
+        if let Some((
+            protected_id,
+            protected_pid,
+            original_session_count,
+            original_selected_profile,
+            probe_name,
+        )) = state_machine_probe
+        {
+            open_tab_with_spec(&state, TabLaunchSpec::new(probe_name.clone(), None));
+            let probe_id = state
+                .try_borrow()
+                .ok()
+                .and_then(|state| state.sessions.active().map(|tab| tab.id));
+            let probe_pid = probe_id.and_then(|probe_id| {
+                wait_for_condition(Duration::from_secs(4), || {
+                    state.try_borrow().is_ok_and(|state| {
+                        !state.pending_spawns.contains(&probe_id.get())
+                            && state
+                                .sessions
+                                .tab(probe_id)
+                                .is_some_and(|tab| tab.child_pid.is_some())
+                    })
+                })
+                .then(|| {
+                    state
+                        .borrow()
+                        .sessions
+                        .tab(probe_id)
+                        .and_then(|tab| tab.child_pid)
+                })
+                .flatten()
+            });
+
+            if let (Some(probe_id), Some(probe_pid)) = (probe_id, probe_pid) {
+                // Model the exact interval between VTE creating a tab and its
+                // async spawn callback returning a PID. Accepting that stale
+                // pending-process confirmation must re-prompt for the live PID.
+                state.borrow_mut().pending_spawns.insert(probe_id.get());
+                close_tab(&state, probe_id);
+                drain_pending_events();
+                let pending_prompted = close_prompt_button("close-confirmation-accept")
+                    .is_some_and(|button| button.label().as_deref() == Some("Close Tab"))
+                    && state.try_borrow().is_ok_and(|state| {
+                        state.close_prompt_open
+                            && state.active_close_request == Some(CloseRequest::Tab(probe_id))
+                            && close_plan_for(&state, CloseRequest::Tab(probe_id))
+                                .blockers
+                                .iter()
+                                .any(|blocker| blocker.process.child_pid.is_none())
+                    });
+                state.borrow_mut().pending_spawns.remove(&probe_id.get());
+                if let Some(accept) = close_prompt_button("close-confirmation-accept") {
+                    accept.emit_clicked();
+                    drain_pending_events();
+                }
+                stale_pending_revalidated = pending_prompted
+                    && close_prompt_button("close-confirmation-accept")
+                        .is_some_and(|button| button.label().as_deref() == Some("Close Tab"))
+                    && state.try_borrow().is_ok_and(|state| {
+                        state.close_prompt_open
+                            && state.active_close_request == Some(CloseRequest::Tab(probe_id))
+                            && state.sessions.tab(probe_id).is_some()
+                            && close_plan_for(&state, CloseRequest::Tab(probe_id))
+                                .blockers
+                                .iter()
+                                .any(|blocker| blocker.process.child_pid == Some(probe_pid.0))
+                    });
+                if let Some(cancel) = close_prompt_button("close-confirmation-cancel") {
+                    cancel.emit_clicked();
+                    drain_pending_events();
+                }
+
+                // A later whole-window request must not be lost while the tab
+                // confirmation is visible. Cancelling the tab prompt should
+                // dispatch and display the queued Window request.
+                close_tab(&state, probe_id);
+                drain_pending_events();
+                let tab_prompted = close_prompt_button("close-confirmation-accept")
+                    .is_some_and(|button| button.label().as_deref() == Some("Close Tab"));
+                let window = state.borrow().window.clone();
+                window.close();
+                drain_pending_events();
+                let window_queued = state.try_borrow().is_ok_and(|state| {
+                    state.close_prompt_open
+                        && state.active_close_request == Some(CloseRequest::Tab(probe_id))
+                        && state.pending_close_request == Some(CloseRequest::Window)
+                });
+                if let Some(cancel) = close_prompt_button("close-confirmation-cancel") {
+                    cancel.emit_clicked();
+                    drain_pending_events();
+                }
+                let window_prompted = close_prompt_button("close-confirmation-accept")
+                    .is_some_and(|button| button.label().as_deref() == Some("Close Window"))
+                    && state.try_borrow().is_ok_and(|state| {
+                        state.close_prompt_open
+                            && state.active_close_request == Some(CloseRequest::Window)
+                            && state.pending_close_request.is_none()
+                            && state.sessions.tab(probe_id).is_some()
+                    });
+                let late_target_id = state.borrow_mut().sessions.open_tab(&probe_name, None);
+                if let Some(accept) = close_prompt_button("close-confirmation-accept") {
+                    accept.emit_clicked();
+                    drain_pending_events();
+                }
+                new_window_target_revalidated = window_prompted
+                    && close_prompt_button("close-confirmation-accept")
+                        .is_some_and(|button| button.label().as_deref() == Some("Close Window"))
+                    && state.try_borrow().is_ok_and(|state| {
+                        !state.closing
+                            && state.close_prompt_open
+                            && state.active_close_request == Some(CloseRequest::Window)
+                            && state.sessions.tab(probe_id).is_some()
+                            && state.sessions.tab(late_target_id).is_some()
+                            && close_plan_for(&state, CloseRequest::Window)
+                                .targets
+                                .contains(&late_target_id)
+                    });
+                if let Some(cancel) = close_prompt_button("close-confirmation-cancel") {
+                    cancel.emit_clicked();
+                    drain_pending_events();
+                }
+                force_close_tab(&state, late_target_id);
+                overlapping_window_request_preserved = tab_prompted
+                    && window_queued
+                    && new_window_target_revalidated
+                    && close_prompt_window().is_none()
+                    && state.try_borrow().is_ok_and(|state| {
+                        !state.close_prompt_open
+                            && state.active_close_request.is_none()
+                            && state.pending_close_request.is_none()
+                            && state.sessions.tab(probe_id).is_some()
+                    });
+
+                // Accept a freshly evaluated live-process confirmation and
+                // verify that only the requested tab is terminated.
+                close_tab(&state, probe_id);
+                drain_pending_events();
+                let fresh_prompted = close_prompt_button("close-confirmation-accept")
+                    .is_some_and(|button| button.label().as_deref() == Some("Close Tab"));
+                if let Some(accept) = close_prompt_button("close-confirmation-accept") {
+                    accept.emit_clicked();
+                    drain_pending_events();
+                }
+                confirmation_accepted = fresh_prompted
+                    && close_prompt_window().is_none()
+                    && state.try_borrow().is_ok_and(|state| {
+                        !state.close_prompt_open
+                            && state.active_close_request.is_none()
+                            && state.pending_close_request.is_none()
+                            && state.sessions.tab(probe_id).is_none()
+                            && state.sessions.tabs().len() == original_session_count
+                            && state.sessions.tab(protected_id).is_some_and(|tab| {
+                                protected_pid.is_none() || tab.child_pid == protected_pid
+                            })
+                    });
+            }
+
+            // Failure-path cleanup is deliberately unconditional so a failed
+            // assertion cannot leak a prompt, pending request, or sleep process
+            // into the remainder of the installed-binary acceptance run.
+            if let Ok(mut state) = state.try_borrow_mut() {
+                state.pending_close_request = None;
+            }
+            if let Some(prompt) = close_prompt_window() {
+                prompt.close();
+                drain_pending_events();
+            }
+            if let Some(probe_id) = probe_id {
+                if state
+                    .try_borrow()
+                    .is_ok_and(|state| state.sessions.tab(probe_id).is_some())
+                {
+                    force_close_tab(&state, probe_id);
+                }
+            }
+            if let Ok(mut state) = state.try_borrow_mut() {
+                state.close_prompt_open = false;
+                state.active_close_request = None;
+                state.pending_close_request = None;
+                state.settings.selected_profile = original_selected_profile.clone();
+                let _ = state.profiles.delete_profile(&probe_name);
+            }
+            sync_active_profile_ui(&state);
+            state_machine_probe_cleanup = close_prompt_window().is_none()
+                && state.try_borrow().is_ok_and(|state| {
+                    !state.closing
+                        && !state.close_prompt_open
+                        && state.active_close_request.is_none()
+                        && state.pending_close_request.is_none()
+                        && state.sessions.tabs().len() == original_session_count
+                        && state.sessions.tab(protected_id).is_some_and(|tab| {
+                            protected_pid.is_none() || tab.child_pid == protected_pid
+                        })
+                        && state.profiles.profile(&probe_name).is_none()
+                });
+        }
+        let mut tab_close_prompted = false;
+        let mut tab_close_cancelled = false;
+        let tab_probe = {
+            let mut state = state.borrow_mut();
+            let active = state.sessions.active().map(|tab| {
+                (
+                    tab.id,
+                    tab.profile_name.clone(),
+                    tab.child_pid,
+                    state.sessions.tabs().len(),
+                )
+            });
+            active.and_then(|(id, profile_name, child_pid, session_count)| {
+                let original = state.profiles.profile(&profile_name).cloned()?;
+                child_pid?;
+                let mut guarded = original.clone();
+                guarded.ask_before_close = false;
+                guarded.ask_before_close_policy = AskBeforeClosePolicy::Always;
+                state.profiles.update_profile(guarded).ok()?;
+                Some((id, session_count, original))
+            })
+        };
+        if let Some((id, session_count, original_profile)) = tab_probe {
+            close_tab(&state, id);
+            drain_pending_events();
+            let prompt = close_prompt_window();
+            tab_close_prompted = prompt.as_ref().is_some_and(|window| {
+                !window.is_modal()
+                    && close_prompt_button("close-confirmation-cancel")
+                        .is_some_and(|button| button.label().as_deref() == Some("Cancel"))
+            }) && state.try_borrow().is_ok_and(|state| {
+                state.close_prompt_open
+                    && state.window.is_sensitive()
+                    && state.sessions.tabs().len() == session_count
+                    && state.sessions.tab(id).is_some()
+            });
+            if let Some(cancel) = close_prompt_button("close-confirmation-cancel") {
+                cancel.emit_clicked();
+                drain_pending_events();
+            } else if let Some(prompt) = prompt {
+                prompt.close();
+                drain_pending_events();
+            }
+            tab_close_cancelled = state.try_borrow().is_ok_and(|state| {
+                !state.close_prompt_open
+                    && state.window.is_sensitive()
+                    && state.sessions.tabs().len() == session_count
+                    && state.sessions.tab(id).is_some()
+            }) && close_prompt_window().is_none();
+            if let Ok(mut state) = state.try_borrow_mut() {
+                let _ = state.profiles.update_profile(original_profile);
+            }
+        }
+
+        let mut shell_exit_window_prompted = false;
+        let mut shell_exit_prompt_cancelled = false;
+        let mut exited_pid_cleared = false;
+        let mut protected_sibling_preserved = false;
+        let mut close_probe_cleanup = false;
+        let shell_exit_probe = {
+            let mut state = state.borrow_mut();
+            let active = state
+                .sessions
+                .active()
+                .map(|tab| (tab.id, tab.profile_name.clone(), tab.child_pid));
+            active.and_then(|(protected_id, original_profile_name, protected_pid)| {
+                let protected_pid = protected_pid?;
+                let original = state.profiles.profile(&original_profile_name).cloned()?;
+                let original_selected_profile = state.settings.selected_profile.clone();
+                let original_session_count = state.sessions.tabs().len();
+                let protected_name = "Acceptance Close Protected".to_owned();
+                let exit_name = "Acceptance Close Exit".to_owned();
+                let mut protected_profile = original.clone();
+                protected_profile.name = protected_name.clone();
+                protected_profile.ask_before_close = false;
+                protected_profile.ask_before_close_policy = AskBeforeClosePolicy::Always;
+                let mut exit_profile = original;
+                exit_profile.name = exit_name.clone();
+                exit_profile.shell_command = "/bin/true".into();
+                exit_profile.run_inside_shell = false;
+                exit_profile.close_on_exit = CloseOnExit::Never;
+                exit_profile.close_on_clean_exit = false;
+                exit_profile.close_on_error = false;
+                exit_profile.shell_exit_action = ShellExitAction::CloseWindow;
+                state.profiles.add_profile(protected_profile).ok()?;
+                if state.profiles.add_profile(exit_profile).is_err() {
+                    let _ = state.profiles.delete_profile(&protected_name);
+                    return None;
+                }
+                state.sessions.set_profile(protected_id, &protected_name);
+                Some((
+                    protected_id,
+                    protected_pid,
+                    original_profile_name,
+                    original_selected_profile,
+                    original_session_count,
+                    protected_name,
+                    exit_name,
+                ))
+            })
+        };
+        if let Some((
+            protected_id,
+            protected_pid,
+            original_profile_name,
+            original_selected_profile,
+            original_session_count,
+            protected_name,
+            exit_name,
+        )) = shell_exit_probe
+        {
+            open_tab_with_spec(&state, TabLaunchSpec::new(exit_name.clone(), None));
+            let exiting_id = state
+                .try_borrow()
+                .ok()
+                .and_then(|state| state.sessions.active().map(|tab| tab.id));
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline
+                && state
+                    .try_borrow()
+                    .map_or(true, |state| !state.close_prompt_open)
+            {
+                drain_pending_events();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drain_pending_events();
+            let prompt = close_prompt_window();
+            shell_exit_window_prompted = prompt.as_ref().is_some_and(|window| {
+                !window.is_modal()
+                    && close_prompt_button("close-confirmation-accept")
+                        .is_some_and(|button| button.label().as_deref() == Some("Close Window"))
+            }) && state
+                .try_borrow()
+                .is_ok_and(|state| state.close_prompt_open && state.window.is_sensitive());
+            if let Some(exiting_id) = exiting_id {
+                let state_ref = state.borrow();
+                exited_pid_cleared = state_ref
+                    .sessions
+                    .tab(exiting_id)
+                    .is_some_and(|tab| tab.child_pid.is_none());
+                protected_sibling_preserved = state_ref
+                    .sessions
+                    .tab(protected_id)
+                    .is_some_and(|tab| tab.child_pid == Some(protected_pid));
+            }
+            if let Some(cancel) = close_prompt_button("close-confirmation-cancel") {
+                cancel.emit_clicked();
+                drain_pending_events();
+            } else if let Some(prompt) = prompt {
+                prompt.close();
+                drain_pending_events();
+            }
+            shell_exit_prompt_cancelled = state.try_borrow().is_ok_and(|state| {
+                !state.close_prompt_open
+                    && state.window.is_sensitive()
+                    && state.sessions.tab(protected_id).is_some()
+            }) && close_prompt_window().is_none();
+            if let Some(exiting_id) = exiting_id {
+                force_close_tab(&state, exiting_id);
+            }
+            if let Ok(mut state) = state.try_borrow_mut() {
+                state
+                    .sessions
+                    .set_profile(protected_id, &original_profile_name);
+                state.settings.selected_profile = original_selected_profile.clone();
+                let _ = state.profiles.delete_profile(&exit_name);
+                let _ = state.profiles.delete_profile(&protected_name);
+            }
+            sync_active_profile_ui(&state);
+            if let Some(prompt) = close_prompt_window() {
+                prompt.close();
+                drain_pending_events();
+            }
+            close_probe_cleanup = state.try_borrow().is_ok_and(|state| {
+                !state.close_prompt_open
+                    && state.window.is_sensitive()
+                    && state.sessions.tabs().len() == original_session_count
+                    && state.sessions.tab(protected_id).is_some_and(|tab| {
+                        tab.profile_name == original_profile_name
+                            && tab.child_pid == Some(protected_pid)
+                    })
+                    && state.settings.selected_profile == original_selected_profile
+                    && state.profiles.profile(&exit_name).is_none()
+                    && state.profiles.profile(&protected_name).is_none()
+            }) && close_prompt_window().is_none();
+        }
+        if let Some(prompt) = close_prompt_window() {
+            prompt.close();
+            drain_pending_events();
+        }
+        if state
+            .try_borrow()
+            .is_ok_and(|state| state.close_prompt_open)
+        {
+            reset_close_prompt(&state);
+        }
         // Exercise the same actions used by the header/menu: create, switch,
         // and close a tab before opening the non-modal settings window.
         open_tab(&state);
@@ -3874,7 +4825,11 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             "profile-custom-tab-title",
             "profile-tab-show-other-items",
             "profile-shell-command",
+            "profile-run-inside-shell",
+            "profile-shell",
             "profile-close-on-exit",
+            "profile-ask-policy",
+            "profile-exceptions",
             "shell-exit-policy",
             "keyboard-mappings",
             "keyboard-mapping-key",
@@ -3903,6 +4858,26 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 missing.push(id.to_owned());
             }
         }
+        let shell_accessibility_metadata = root.as_ref().is_some_and(|root| {
+            [
+                "profile-shell-command",
+                "profile-shell",
+                "profile-close-on-exit",
+                "profile-ask-policy",
+                "profile-exceptions",
+                "shell-exit-policy",
+            ]
+            .iter()
+            .all(|name| {
+                find_widget_by_name(root, name).is_some_and(|widget| {
+                    gtk::test_accessible_has_property(&widget, gtk::AccessibleProperty::Label)
+                        && gtk::test_accessible_has_property(
+                            &widget,
+                            gtk::AccessibleProperty::Description,
+                        )
+                })
+            })
+        });
         let mut safe_terminals = true;
         let profile_count = state
             .try_borrow()
@@ -3988,6 +4963,11 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             minimum_profile_action_width = 0;
         }
         let mut window_group_editor_interaction = false;
+        let mut shell_sensitivity_logic = false;
+        let global_shell_mode_before_save = state
+            .try_borrow()
+            .map(|state| state.settings.run_command_inside_shell)
+            .unwrap_or(true);
         // A changed value followed by the actual Save button proves the
         // callback path is live; the callback normalizes and persists it.
         if let Some(root) = &root {
@@ -4056,7 +5036,6 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             for name in [
                 "profile-tab-activity",
                 "profile-tab-show-other-items",
-                "profile-close-clean",
                 "profile-option-meta",
                 "profile-visual-bell",
                 "profile-visual-bell-only-muted",
@@ -4067,6 +5046,63 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 {
                     toggle.set_active(true);
                 }
+            }
+            let command = find_widget_by_name(root, "profile-shell-command")
+                .and_then(|widget| widget.downcast::<gtk::Entry>().ok());
+            let run_inside = find_widget_by_name(root, "profile-run-inside-shell")
+                .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok());
+            let ask_policy = find_widget_by_name(root, "profile-ask-policy")
+                .and_then(|widget| widget.downcast::<gtk::DropDown>().ok());
+            let exceptions = find_widget_by_name(root, "profile-exceptions")
+                .and_then(|widget| widget.downcast::<gtk::Entry>().ok());
+            let close_on_exit = find_widget_by_name(root, "profile-close-on-exit")
+                .and_then(|widget| widget.downcast::<gtk::DropDown>().ok());
+            let exit_action = find_widget_by_name(root, "shell-exit-policy")
+                .and_then(|widget| widget.downcast::<gtk::DropDown>().ok());
+            if let (
+                Some(command),
+                Some(run_inside),
+                Some(ask_policy),
+                Some(exceptions),
+                Some(close_on_exit),
+                Some(exit_action),
+            ) = (
+                command,
+                run_inside,
+                ask_policy,
+                exceptions,
+                close_on_exit,
+                exit_action,
+            ) {
+                command.set_text("");
+                let blank_command_disables_mode = !run_inside.is_sensitive();
+                command.set_text("printf '%s' acceptance");
+                let command_enables_mode = run_inside.is_sensitive();
+                run_inside.set_active(false);
+
+                ask_policy.set_selected(0);
+                let never_disables_exceptions = !exceptions.is_sensitive();
+                ask_policy.set_selected(2);
+                let non_exempt_enables_exceptions = exceptions.is_sensitive();
+                exceptions.set_text("bash, tmux");
+
+                close_on_exit.set_selected(3);
+                let always_disables_fallback = !exit_action.is_sensitive();
+                close_on_exit.set_selected(1);
+                let conditional_enables_fallback = exit_action.is_sensitive();
+                exit_action.set_selected(1);
+
+                shell_sensitivity_logic = blank_command_disables_mode
+                    && command_enables_mode
+                    && never_disables_exceptions
+                    && non_exempt_enables_exceptions
+                    && always_disables_fallback
+                    && conditional_enables_fallback;
+            }
+            if let Some(shell) = find_widget_by_name(root, "profile-shell")
+                .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
+            {
+                shell.set_text("/bin/bash");
             }
             if let Some(locale) = find_widget_by_name(root, "profile-locale")
                 .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
@@ -4142,13 +5178,19 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         let profile_file_written = ProfileStore::config_path()
             .map(|path| path.is_file())
             .unwrap_or(false);
-        let profile_round_trip = state
-            .try_borrow()
-            .ok()
-            .and_then(|state| state.profiles.profile("Acceptance Profile").cloned())
+        let restored_profiles =
+            ProfileStore::config_path().and_then(|path| ProfileStore::load_from_path(path).ok());
+        let profile_round_trip = restored_profiles
+            .as_ref()
+            .and_then(|store| store.profile("Acceptance Profile"))
             .map(|profile| {
                 profile.columns == 100
-                    && profile.close_on_clean_exit
+                    && profile.close_on_exit == CloseOnExit::Clean
+                    && profile.shell == "/bin/bash"
+                    && profile.shell_command == "printf '%s' acceptance"
+                    && !profile.run_inside_shell
+                    && profile.ask_before_close_policy == AskBeforeClosePolicy::NonExempt
+                    && profile.ask_before_close_exceptions == ["bash", "tmux"]
                     && profile.tab_title_show_other_items
                     && profile.option_as_meta
                     && profile.visual_bell
@@ -4160,10 +5202,61 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     && profile.background == "#1a334dff"
             })
             .unwrap_or(false);
-        let window_group_round_trip = state
-            .try_borrow()
-            .ok()
-            .and_then(|state| state.profiles.window_group("Acceptance Group").cloned())
+        let shell_policy_consolidated = restored_profiles
+            .as_ref()
+            .and_then(|store| store.profile("Acceptance Profile"))
+            .is_some_and(|profile| {
+                profile.close_on_exit == CloseOnExit::Clean
+                    && profile.shell_exit_action == ShellExitAction::Keep
+                    && !profile.close_on_clean_exit
+                    && !profile.close_on_error
+            });
+        let shell_widgets_reloaded = restored_profiles.as_ref().is_some_and(|profiles| {
+            if let Ok(mut state) = state.try_borrow_mut() {
+                state.profiles = profiles.clone();
+                state.settings = Settings::load_user();
+            } else {
+                return false;
+            }
+            let reopened = show_settings_for_state(&state);
+            drain_pending_events();
+            let root = reopened.child();
+            let restored = root.as_ref().is_some_and(|root| {
+                let command = find_widget_by_name(root, "profile-shell-command")
+                    .and_then(|widget| widget.downcast::<gtk::Entry>().ok());
+                let run_inside = find_widget_by_name(root, "profile-run-inside-shell")
+                    .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok());
+                let shell = find_widget_by_name(root, "profile-shell")
+                    .and_then(|widget| widget.downcast::<gtk::Entry>().ok());
+                let close_on_exit = find_widget_by_name(root, "profile-close-on-exit")
+                    .and_then(|widget| widget.downcast::<gtk::DropDown>().ok());
+                let ask_policy = find_widget_by_name(root, "profile-ask-policy")
+                    .and_then(|widget| widget.downcast::<gtk::DropDown>().ok());
+                let exceptions = find_widget_by_name(root, "profile-exceptions")
+                    .and_then(|widget| widget.downcast::<gtk::Entry>().ok());
+                let exit_action = find_widget_by_name(root, "shell-exit-policy")
+                    .and_then(|widget| widget.downcast::<gtk::DropDown>().ok());
+                command.is_some_and(|widget| {
+                    widget.text() == "printf '%s' acceptance" && widget.is_sensitive()
+                }) && run_inside.is_some_and(|widget| !widget.is_active() && widget.is_sensitive())
+                    && shell.is_some_and(|widget| widget.text() == "/bin/bash")
+                    && close_on_exit.is_some_and(|widget| widget.selected() == 1)
+                    && ask_policy.is_some_and(|widget| widget.selected() == 2)
+                    && exceptions.is_some_and(|widget| {
+                        widget.text() == "bash, tmux" && widget.is_sensitive()
+                    })
+                    && exit_action
+                        .is_some_and(|widget| widget.selected() == 1 && widget.is_sensitive())
+            });
+            reopened.close();
+            drain_pending_events();
+            restored
+        });
+        let global_shell_mode_preserved =
+            Settings::load_user().run_command_inside_shell == global_shell_mode_before_save;
+        let window_group_round_trip = restored_profiles
+            .as_ref()
+            .and_then(|store| store.window_group("Acceptance Group"))
             .is_some_and(|group| {
                 group.entries.len() == 3
                     && group.entries[1].working_directory.as_deref()
@@ -4245,6 +5338,11 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && profile_count > 0
             && profile_file_written
             && profile_round_trip
+            && shell_policy_consolidated
+            && global_shell_mode_preserved
+            && shell_sensitivity_logic
+            && shell_widgets_reloaded
+            && shell_accessibility_metadata
             && window_group_editor_interaction
             && window_group_round_trip
             && standard_mappings_present
@@ -4255,12 +5353,27 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && profile_default_preserved
             && same_profile_new_tab
             && group_launch_explicit
-            && active_profile_synced_after_close;
+            && active_profile_synced_after_close
+            && close_before_spawn_cleanup
+            && background_session_cleanup
+            && close_prompt_details_bounded
+            && confirmation_accepted
+            && stale_pending_revalidated
+            && new_window_target_revalidated
+            && overlapping_window_request_preserved
+            && state_machine_probe_cleanup
+            && tab_close_prompted
+            && tab_close_cancelled
+            && shell_exit_window_prompted
+            && shell_exit_prompt_cancelled
+            && exited_pid_cleared
+            && protected_sibling_preserved
+            && close_probe_cleanup;
         let report_path = std::env::var_os("CORE_TERMINAL_ACCEPTANCE_REPORT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| Path::new("/tmp/core-terminal-acceptance.json").to_path_buf());
         let report = format!(
-            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={}\n",
+            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
@@ -4280,6 +5393,11 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             profile_count,
             profile_file_written,
             profile_round_trip,
+            shell_policy_consolidated,
+            global_shell_mode_preserved,
+            shell_sensitivity_logic,
+            shell_widgets_reloaded,
+            shell_accessibility_metadata,
             window_group_editor_interaction,
             window_group_round_trip,
             standard_mappings_present,
@@ -4291,6 +5409,21 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             same_profile_new_tab,
             group_launch_explicit,
             active_profile_synced_after_close,
+            close_before_spawn_cleanup,
+            background_session_cleanup,
+            close_prompt_details_bounded,
+            confirmation_accepted,
+            stale_pending_revalidated,
+            new_window_target_revalidated,
+            overlapping_window_request_preserved,
+            state_machine_probe_cleanup,
+            tab_close_prompted,
+            tab_close_cancelled,
+            shell_exit_window_prompted,
+            shell_exit_prompt_cancelled,
+            exited_pid_cleared,
+            protected_sibling_preserved,
+            close_probe_cleanup,
         );
         let _ = std::fs::write(report_path, report);
         settings.close();
@@ -4600,6 +5733,7 @@ fn show_search(state: &Rc<RefCell<UiState>>) {
     let dialog = gtk::Dialog::builder()
         .title("Find in Terminal")
         .transient_for(&parent)
+        .destroy_with_parent(true)
         .modal(false)
         .build();
     enforce_non_modal(&dialog);
@@ -4721,6 +5855,9 @@ fn open_tab(state: &Rc<RefCell<UiState>>) {
 
 #[allow(deprecated)]
 fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
+    if state.borrow().closing {
+        return;
+    }
     let (id, terminal, spawn_options) = {
         let mut state_mut = state.borrow_mut();
         let profile_name = if state_mut.profiles.profile(&spec.profile_name).is_some() {
@@ -4787,6 +5924,16 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
             .add_titled(&surface, Some(&page_name), "Terminal");
         state_mut.stack.set_visible_child_name(&page_name);
         state_mut.terminals.insert(id.get(), terminal.clone());
+        state_mut.pending_spawns.insert(id.get());
+        if spawn_options.custom_command.is_none() {
+            let login_shell = spawn_options
+                .shell
+                .clone()
+                .unwrap_or_else(core::login_shell);
+            if let Some(identity) = core::expected_executable_identity(&login_shell) {
+                state_mut.login_shell_identities.insert(id.get(), identity);
+            }
+        }
         (id, terminal, spawn_options)
     };
     sync_active_profile_ui(state);
@@ -4808,6 +5955,16 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
     let exit_state = state.clone();
     terminal.connect_child_exited(move |_, status| {
         notify_background_exit(&exit_state, id, status);
+        // The child-exited signal is authoritative. Clear the PID before any
+        // close policy runs so an exited tab never appears as a live blocker.
+        {
+            let mut state = exit_state.borrow_mut();
+            if state.pending_spawns.remove(&id.get()) {
+                state.exited_before_spawn_callbacks.insert(id.get());
+            }
+            state.child_process_identities.remove(&id.get());
+            state.sessions.clear_child_pid(id);
+        }
         let decision = {
             let state = exit_state.borrow();
             state
@@ -4823,37 +5980,64 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
                 .unwrap_or(core::ChildExitDecision::CloseTab)
         };
         match decision {
-            core::ChildExitDecision::CloseWindow => exit_state.borrow().window.close(),
+            core::ChildExitDecision::CloseWindow => {
+                let window = exit_state.borrow().window.clone();
+                window.close();
+            }
             core::ChildExitDecision::CloseTab => force_close_tab(&exit_state, id),
-            core::ChildExitDecision::Keep => {
-                if let Ok(mut state) = exit_state.try_borrow_mut() {
-                    state.sessions.clear_child_pid(id);
-                }
-            }
-            core::ChildExitDecision::Ask => {
-                if let Ok(mut state) = exit_state.try_borrow_mut() {
-                    state.sessions.clear_child_pid(id);
-                }
-                show_child_exit_prompt(&exit_state, id, status);
-            }
+            core::ChildExitDecision::Keep => {}
+            core::ChildExitDecision::Ask => show_child_exit_prompt(&exit_state, id, status),
         }
     });
     // Connect all lifecycle observers before spawning. A direct command such
     // as `/bin/true` can exit before the next main-loop turn; registering the
     // child-exited handler only after spawn would lose that event.
     let spawn_state = state.clone();
-    core::spawn_terminal(&terminal, &spawn_options, move |result| {
-        match result {
-            Ok(pid) => match spawn_state.try_borrow_mut() {
-                Ok(mut state) if state.sessions.tab(id).is_some() => {
-                    state.sessions.set_child_pid(id, Some(pid));
+    core::spawn_terminal(&terminal, &spawn_options, move |result| match result {
+        Ok(pid) => {
+            let mut state = spawn_state.borrow_mut();
+            let exited_before_callback = state.exited_before_spawn_callbacks.remove(&id.get());
+            let was_pending = state.pending_spawns.remove(&id.get());
+            let session_exists = state.sessions.tab(id).is_some();
+            match spawn_callback_action(
+                exited_before_callback,
+                state.closing,
+                session_exists,
+                was_pending,
+            ) {
+                SpawnCallbackAction::IgnoreExitedChild => {
+                    // VTE already emitted child-exited for this exact spawn.
+                    // The returned PID is stale lifecycle bookkeeping and
+                    // must never be resolved after the kernel can recycle it.
                 }
-                // The tab may have been closed, or a nested callback may
-                // still hold the model borrow. In either case never leave
-                // the newly spawned process orphaned.
-                _ => core::terminate_child(pid),
-            },
-            Err(error) => eprintln!("Core Terminal: failed to start tab {id:?}: {error}"),
+                SpawnCallbackAction::TerminateClosedTab => {
+                    drop(state);
+                    if let Some(identity) = core::child_process_identity(pid) {
+                        terminate_child_async(identity);
+                    }
+                    if std::env::var_os("CORE_TERMINAL_ACCEPTANCE").is_some() {
+                        ACCEPTANCE_CLOSED_SPAWN_RESOLUTIONS.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                SpawnCallbackAction::StoreLiveChild => {
+                    state.sessions.set_child_pid(id, Some(pid));
+                    if let Some(identity) = core::child_process_identity(pid) {
+                        state.child_process_identities.insert(id.get(), identity);
+                    }
+                }
+                SpawnCallbackAction::IgnoreLateCallback => {
+                    // A very short-lived command may emit child-exited before
+                    // an older profile reaches this callback. Never resurrect
+                    // its PID as a live process.
+                }
+            }
+        }
+        Err(error) => {
+            if let Ok(mut state) = spawn_state.try_borrow_mut() {
+                state.pending_spawns.remove(&id.get());
+                state.exited_before_spawn_callbacks.remove(&id.get());
+            }
+            eprintln!("Core Terminal: failed to start tab {id:?}: {error}");
         }
     });
 }
@@ -4869,6 +6053,7 @@ fn show_child_exit_prompt(state: &Rc<RefCell<UiState>>, id: SessionId, status: i
     let dialog = gtk::Window::builder()
         .title("Terminal process finished")
         .transient_for(&parent)
+        .destroy_with_parent(true)
         .modal(false)
         .default_width(420)
         .default_height(160)
@@ -5495,66 +6680,272 @@ fn copy_selection(terminal: &vte4::Terminal) {
 }
 
 fn close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
-    let should_prompt = {
+    let plan = {
         let state = state.borrow();
-        let Some(tab) = state.sessions.tab(id) else {
-            return;
-        };
-        if tab.child_pid.is_none() {
-            false
-        } else {
-            state
-                .profiles
-                .profile(&tab.profile_name)
-                .map(|profile| core::should_prompt_before_close(profile, None))
-                .unwrap_or(false)
-        }
+        close_plan_for(&state, CloseRequest::Tab(id))
     };
-    if should_prompt {
-        show_running_close_prompt(state, id);
-    } else {
+    if plan.targets.is_empty() {
+        return;
+    }
+    if plan.blockers.is_empty() {
         force_close_tab(state, id);
+        dispatch_pending_close(state);
+    } else if queue_or_reserve_close_prompt(state, CloseRequest::Tab(id)) {
+        present_close_confirmation(state, CloseRequest::Tab(id), plan);
     }
 }
 
-fn show_running_close_prompt(state: &Rc<RefCell<UiState>>, id: SessionId) {
+fn close_plan_for(state: &UiState, request: CloseRequest) -> core::ClosePlan {
+    let ids = match request {
+        CloseRequest::Tab(id) => vec![id],
+        CloseRequest::Window => state.sessions.tabs().iter().map(|tab| tab.id).collect(),
+    };
+    core::plan_close(ids.into_iter().filter_map(|id| {
+        let tab = state.sessions.tab(id)?;
+        let process = if state.pending_spawns.contains(&id.get()) {
+            Some(core::RunningProcessIdentity::pending())
+        } else {
+            tab.child_pid.map(|pid| {
+                state.child_process_identities.get(&id.get()).map_or_else(
+                    || core::RunningProcessIdentity::unverified(pid),
+                    |identity| {
+                        core::running_process_identity(state.terminals.get(&id.get()), identity)
+                    },
+                )
+            })
+        };
+        Some(core::CloseCandidate {
+            session_id: id,
+            process,
+            profile: state.profiles.profile(&tab.profile_name),
+            expected_login_shell: state.login_shell_identities.get(&id.get()),
+        })
+    }))
+}
+
+fn queue_or_reserve_close_prompt(state: &Rc<RefCell<UiState>>, request: CloseRequest) -> bool {
+    let Ok(mut state) = state.try_borrow_mut() else {
+        return false;
+    };
+    if state.close_prompt_open {
+        if state.active_close_request != Some(request) {
+            state.pending_close_request = Some(match (state.pending_close_request, request) {
+                (Some(CloseRequest::Window), _) | (_, CloseRequest::Window) => CloseRequest::Window,
+                (_, request) => request,
+            });
+        }
+        return false;
+    }
+    state.close_prompt_open = true;
+    state.active_close_request = Some(request);
+    true
+}
+
+fn reset_close_prompt(state: &Rc<RefCell<UiState>>) {
+    if let Ok(mut state) = state.try_borrow_mut() {
+        state.close_prompt_open = false;
+        state.active_close_request = None;
+    }
+}
+
+fn dispatch_pending_close(state: &Rc<RefCell<UiState>>) {
+    let pending = state
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut state| state.pending_close_request.take());
+    let Some(request) = pending else {
+        return;
+    };
+    let close_state = state.clone();
+    glib::idle_add_local_once(move || match request {
+        CloseRequest::Tab(id) => close_tab(&close_state, id),
+        CloseRequest::Window => {
+            let window = close_state.borrow().window.clone();
+            window.close();
+        }
+    });
+}
+
+fn present_close_confirmation(
+    state: &Rc<RefCell<UiState>>,
+    request: CloseRequest,
+    plan: core::ClosePlan,
+) {
     let parent = state.borrow().window.clone();
+    let (title, close_label, scope) = match request {
+        CloseRequest::Tab(_) => ("Close running terminal?", "Close Tab", "this tab"),
+        CloseRequest::Window => ("Close running terminals?", "Close Window", "this window"),
+    };
     let dialog = gtk::Window::builder()
-        .title("Close running terminal?")
+        .title(title)
         .transient_for(&parent)
+        .destroy_with_parent(true)
         .modal(false)
-        .default_width(430)
-        .default_height(160)
+        .default_width(460)
+        .default_height(260)
         .build();
+    dialog.set_widget_name("close-confirmation");
     enforce_non_modal(&dialog);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
     content.set_margin_start(20);
     content.set_margin_end(20);
     content.set_margin_top(20);
     content.set_margin_bottom(20);
-    let label = gtk::Label::new(Some(
-        "A process is still running in this tab. Close it and terminate the process?",
-    ));
+    let processes = plan
+        .blockers
+        .iter()
+        .map(|blocker| {
+            blocker.process.name.clone().unwrap_or_else(|| {
+                blocker.process.child_pid.map_or_else(
+                    || "a process that is starting".to_owned(),
+                    |pid| format!("unknown process (PID {pid})"),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let process_count = processes.len();
+    let process_word = if process_count == 1 {
+        "process"
+    } else {
+        "processes"
+    };
+    let requirement = if process_count == 1 {
+        "requires"
+    } else {
+        "require"
+    };
+    let label = gtk::Label::new(Some(&format!(
+        "{process_count} {process_word} still running in {scope} {requirement} confirmation. Closing will send termination signals to them."
+    )));
     label.set_wrap(true);
     label.set_xalign(0.0);
     content.append(&label);
+
+    let process_list = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    process_list.set_margin_end(8);
+    for process in processes {
+        let process_label = gtk::Label::new(Some(&format!("• {process}")));
+        process_label.set_wrap(true);
+        process_label.set_selectable(true);
+        process_label.set_xalign(0.0);
+        process_list.append(&process_label);
+    }
+    let process_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(160)
+        .child(&process_list)
+        .build();
+    process_scroller.set_widget_name("close-confirmation-processes");
+    content.append(&process_scroller);
+
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
     let cancel = gtk::Button::with_label("Cancel");
-    let close = gtk::Button::with_label("Close Tab");
+    cancel.set_widget_name("close-confirmation-cancel");
+    let close = gtk::Button::with_label(close_label);
+    close.set_widget_name("close-confirmation-accept");
     let cancel_dialog = dialog.clone();
     cancel.connect_clicked(move |_| cancel_dialog.close());
     let close_dialog = dialog.clone();
     let close_state = state.clone();
+    let confirmed = plan.clone();
+    let accepting = Rc::new(Cell::new(false));
+    let accepting_close = accepting.clone();
     close.connect_clicked(move |_| {
-        force_close_tab(&close_state, id);
+        accepting_close.set(true);
+        reset_close_prompt(&close_state);
         close_dialog.close();
+        confirm_close(&close_state, request, confirmed.clone());
     });
     actions.append(&cancel);
     actions.append(&close);
     content.append(&actions);
     dialog.set_child(Some(&content));
+    let close_state = state.clone();
+    dialog.connect_close_request(move |_| {
+        if !accepting.get() {
+            reset_close_prompt(&close_state);
+            dispatch_pending_close(&close_state);
+        }
+        glib::Propagation::Proceed
+    });
     dialog.present();
+}
+
+fn confirm_close(state: &Rc<RefCell<UiState>>, request: CloseRequest, confirmed: core::ClosePlan) {
+    let current = {
+        let state = state.borrow();
+        close_plan_for(&state, request)
+    };
+    if current.targets.is_empty() {
+        dispatch_pending_close(state);
+        return;
+    }
+    if !core::close_authorization_covers(&current, &confirmed) {
+        if current.blockers.is_empty() {
+            match request {
+                CloseRequest::Tab(id) => {
+                    force_close_tab(state, id);
+                    dispatch_pending_close(state);
+                }
+                CloseRequest::Window => {
+                    let window = state.borrow().window.clone();
+                    window.close();
+                }
+            }
+        } else if queue_or_reserve_close_prompt(state, request) {
+            present_close_confirmation(state, request, current);
+        }
+        return;
+    }
+    match request {
+        CloseRequest::Tab(id) => {
+            force_close_tab(state, id);
+            dispatch_pending_close(state);
+        }
+        CloseRequest::Window => {
+            let window = {
+                let mut state = state.borrow_mut();
+                state.window_close_authorization = Some(confirmed);
+                state.window.clone()
+            };
+            window.close();
+        }
+    }
+}
+
+fn finish_window_close(state: &Rc<RefCell<UiState>>) {
+    let child_identities = {
+        let mut state = state.borrow_mut();
+        state.closing = true;
+        state.close_prompt_open = false;
+        state.active_close_request = None;
+        state.pending_close_request = None;
+        state.settings.window_width = state.window.width().max(320);
+        state.settings.window_height = state.window.height().max(240);
+        let _ = state.settings.save_user();
+        let tab_ids = state
+            .sessions
+            .tabs()
+            .iter()
+            .map(|tab| tab.id.get())
+            .collect::<Vec<_>>();
+        let child_identities = tab_ids
+            .into_iter()
+            .filter_map(|id| state.child_process_identities.remove(&id))
+            .collect::<Vec<_>>();
+        state.sessions = SessionManager::empty();
+        state.terminals.clear();
+        state.pending_spawns.clear();
+        state.child_process_identities.clear();
+        state.login_shell_identities.clear();
+        child_identities
+    };
+    for identity in child_identities {
+        terminate_child_async(identity);
+    }
 }
 
 fn force_close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
@@ -5562,8 +6953,13 @@ fn force_close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
         return;
     };
     if let Some(tab) = state_mut.sessions.close_tab(id) {
-        if let Some(pid) = tab.child_pid {
-            core::terminate_child(pid);
+        state_mut.pending_spawns.remove(&id.get());
+        let child_identity = state_mut.child_process_identities.remove(&id.get());
+        state_mut.login_shell_identities.remove(&id.get());
+        if tab.child_pid.is_some() {
+            if let Some(identity) = child_identity {
+                terminate_child_async(identity);
+            }
         }
         if let Some(terminal) = state_mut.terminals.remove(&id.get()) {
             if let Some(page_child) = stack_page_child(&state_mut.stack, &terminal) {

@@ -87,10 +87,34 @@ marks a background tab when its VTE contents change.
 
 The page exposes a profile command, run-inside-shell choice, close-on-exit
 policies, close confirmation policy, exception names, and shell-exit behavior.
-Child exit handling receives the VTE wait status and can keep, close, or ask
-according to the selected policy. Unit tests cover clean, nonzero, and signaled
-exit decisions. The native lifecycle run confirms that closing the application
-terminates and reaps its login-shell process group.
+Child exit handling receives the VTE wait status. An automatic clean, error,
+or any-exit rule is evaluated first; the clearly labeled fallback can ask,
+keep the finished tab open, close the tab, or request a window close. Manual
+tab and window closure use one confirmation path and recheck every affected
+session before terminating a process. Native builds inspect the PTY foreground
+process group and the live executable identity. A login shell is considered
+idle only when its device and inode still match the executable that was
+launched and no other process remains in its Linux process session. Pending
+spawns, background jobs, replaced or same-named executables, and unverified
+processes remain protected. After an approved native close, every member of the
+tab's isolated Linux process session is re-enumerated while HUP, TERM, and a
+final KILL are sent, so known background jobs receive the same escalation as
+the foreground command. The work runs off the GTK thread, with 200 milliseconds
+after HUP and a full second after TERM for clean shutdown. Every signal uses a
+pidfd opened before a full PID, process-start, session, and process-group check,
+so the kernel handle cannot retarget a recycled PID. Native Linux deliberately
+does not use an unchecked fallback if that identity is unavailable. A sandboxed
+Flatpak cannot safely inspect the host process group, so an unknown foreground
+process prompts instead of silently closing. Its sandbox-side proxy receives
+the same pidfd check before each signal; `--watch-bus` ties the corresponding
+host command to that proxy. Unit tests cover every automatic/fallback
+combination, clean, error, and signaled statuses, legacy migration, disk
+round-trips, exception matching, pending spawns, and stale confirmations.
+Native acceptance covers non-modal prompts, queued requests, stale-plan
+revalidation, JSON reload, the real close-before-spawn cleanup path, and a
+three-process shell session whose foreground and background jobs must both be
+gone after confirmation. The probe uses per-run process names and verifies the
+shell, foreground group, and background group before accepting the prompt.
 
 ### Keyboard
 
