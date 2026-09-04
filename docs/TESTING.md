@@ -36,8 +36,12 @@ fatal. It creates an isolated XDG configuration directory, opens all four
 settings pages and all six profile pages, and checks the rendered settings
 allocation. The profile sidebar, names, labeled actions, and six profile tabs
 must remain visible without a horizontally scrolling outer page. Shell inputs
-must also expose GTK accessibility labels and descriptions. The harness edits
-a profile through the real Save button, reloads the JSON, checks
+must also expose GTK accessibility labels and descriptions. The harness
+requires the Text form itself to be attached and visible, poisons the legacy
+global snapshot, loads the active profile's font, cursor, scrollback, and TERM
+values, switches to another profile, then saves. It reloads the JSON and proves
+that editable values changed, unavailable imported values survived, and the
+compatibility snapshot still describes the active profile. It also checks
 applied VTE properties, creates and closes a tab, verifies non-modal settings,
 confirms pointer autohide is disabled, and exercises tab-close and shell-exit
 window confirmation with a protected sibling. It also closes a genuinely
@@ -73,7 +77,9 @@ the terminal's foreground process group. Residual-job cleanup and exit-status
 preservation are tested when the direct child exits normally. A low-descriptor
 test sets `RLIMIT_NOFILE` to 8, starts 40 signal-ignoring jobs, and proves that
 streaming pidfd cleanup does not depend on holding one descriptor per session
-member.
+member. A real PTY interaction test changes the terminal size and observes
+`SIGWINCH`, suspends a foreground job with Ctrl-Z, resumes the same bound
+process with `fg`, interrupts it with Ctrl-C, and requires Bash status 130.
 
 The harness cannot control GL.iNet Comet's browser Pointer Lock. A maintainer
 using that KVM must also take a macOS and GNOME screenshot, return focus to Core

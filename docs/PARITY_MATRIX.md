@@ -42,11 +42,15 @@ path. A custom command runs through the login shell when that mode is selected.
 
 The editor exposes the six requested pages and seven text-labeled profile
 actions. The profile list has its own vertical scroller; horizontal wheel input
-cannot shift the sidebar or editor tabs out of view. Built-in names remain
-protected from deletion. Import accepts bounded XML or binary plist data
+cannot shift the sidebar or editor tabs out of view. The Text form is required
+by native acceptance, including font, cursor, and scrollback controls. Switching
+profiles reloads every editable value while renderer-owned controls continue to
+show their effective state. Built-in names remain protected from deletion.
+Import accepts bounded XML or binary plist data
 and maps the supported Terminal profile fields. Export writes a deterministic
 plist containing the supported Core Terminal fields. Unknown or unsupported
-Apple fields are not executed and may be reported as fallbacks.
+Apple fields are not executed and may be reported as fallbacks. Saving does not
+replace preserved imported values for controls that VTE or Wayland cannot edit.
 
 Profile operations covered by unit or native acceptance tests are:
 
