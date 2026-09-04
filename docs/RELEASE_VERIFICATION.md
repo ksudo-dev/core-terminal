@@ -52,5 +52,3 @@ done
 A successful command exits zero and reports a verified attestation. These
 checks establish origin and integrity; they do not prove that an artifact is
 vulnerability-free. If any check fails, do not install the files.
-
-[releases]: https://github.com/ksudo-dev/core-terminal/releases
