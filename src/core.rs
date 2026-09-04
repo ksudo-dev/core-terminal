@@ -7,7 +7,7 @@ use crate::{
     settings::Settings,
 };
 use gtk::{gio, glib};
-use std::{env, os::fd::AsRawFd, time::Duration};
+use std::{env, fs::File, os::fd::AsRawFd, time::Duration};
 
 #[cfg(target_os = "linux")]
 use std::{
@@ -381,22 +381,46 @@ where
     F: FnOnce(Result<glib::Pid, glib::Error>) + 'static,
 {
     let envv_owned = child_environment(&options.terminal_type, options.locale.as_deref());
-    let (command, working_directory) = if running_in_flatpak() {
-        (
-            flatpak_host_argv(options, env::var("HOME").ok().as_deref()),
-            None,
-        )
-    } else {
-        let shell = options.shell.clone().unwrap_or_else(login_shell);
-        (
-            startup_argv(
-                &shell,
-                options.custom_command.as_deref(),
-                options.run_command_inside_shell,
-            ),
-            options.working_directory.clone(),
-        )
-    };
+    if running_in_flatpak() {
+        let supervisor = match File::open(FLATPAK_HOST_SUPERVISOR_PATH) {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                callback(Err(glib::Error::new(
+                    gio::IOErrorEnum::Failed,
+                    &format!("cannot open Flatpak host supervisor: {error}"),
+                )));
+                return;
+            }
+        };
+        let command = flatpak_host_argv(options, env::var("HOME").ok().as_deref());
+        let argv: Vec<&str> = command.iter().map(String::as_str).collect();
+        let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
+        // SAFETY: the one owned helper descriptor is deliberately mapped to
+        // fd 3, which matches flatpak-spawn's fixed --forward-fd option.
+        unsafe {
+            terminal.spawn_with_fds_async(
+                vte4::PtyFlags::DEFAULT,
+                None,
+                &argv,
+                &envv,
+                vec![supervisor.into()],
+                &[FLATPAK_HOST_SUPERVISOR_FD],
+                glib::SpawnFlags::DEFAULT,
+                || {},
+                -1,
+                None::<&gio::Cancellable>,
+                callback,
+            );
+        }
+        return;
+    }
+    let shell = options.shell.clone().unwrap_or_else(login_shell);
+    let command = startup_argv(
+        &shell,
+        options.custom_command.as_deref(),
+        options.run_command_inside_shell,
+    );
+    let working_directory = options.working_directory.clone();
     let argv: Vec<&str> = command.iter().map(String::as_str).collect();
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
     use vte4::prelude::TerminalExtManual;
@@ -413,9 +437,13 @@ where
     );
 }
 
-fn running_in_flatpak() -> bool {
+pub(crate) fn running_in_flatpak() -> bool {
     env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").is_file()
 }
+
+const FLATPAK_HOST_SUPERVISOR_PATH: &str = "/app/libexec/core-terminal-host-supervisor";
+const FLATPAK_HOST_SUPERVISOR_FD: i32 = 3;
+const FLATPAK_HOST_SUPERVISOR_EXEC: &str = "/proc/self/fd/3";
 
 /// Build the command that crosses the Flatpak boundary.
 ///
@@ -429,6 +457,7 @@ fn flatpak_host_argv(options: &SpawnOptions, sandbox_home: Option<&str>) -> Vec<
         "flatpak-spawn".into(),
         "--host".into(),
         "--watch-bus".into(),
+        format!("--forward-fd={FLATPAK_HOST_SUPERVISOR_FD}"),
     ];
     let directory = options
         .working_directory
@@ -453,6 +482,7 @@ fn flatpak_host_argv(options: &SpawnOptions, sandbox_home: Option<&str>) -> Vec<
         argv.push(format!("--env=LC_ALL={locale}"));
     }
     argv.push("--".into());
+    argv.push(FLATPAK_HOST_SUPERVISOR_EXEC.into());
     argv.extend(flatpak_host_command(options));
     argv
 }
@@ -1233,13 +1263,13 @@ pub fn terminate_child(child: ChildProcessIdentity) {
         };
         if child.brokered {
             // The sandbox-side `flatpak-spawn` proxy is the only process Core
-            // Terminal can identify directly. `--watch-bus` owns host cleanup.
-            // Reopen and validate a pidfd before each signal so neither signal
-            // can target a recycled proxy PID.
-            for signal in [libc::SIGHUP, libc::SIGTERM] {
-                if !signal_validated_process(&expected_child, signal) {
-                    return;
-                }
+            // Terminal can identify directly. Its host-side supervisor expands
+            // a proxy signal to the verified private host session. Give the
+            // synchronous supervisor time to consume HUP and begin cleanup
+            // before signalling the proxy again.
+            if signal_validated_process(&expected_child, libc::SIGHUP) {
+                std::thread::sleep(Duration::from_millis(200));
+                let _ = signal_validated_process(&expected_child, libc::SIGTERM);
             }
             return;
         }
@@ -1447,6 +1477,10 @@ mod tests {
             .any(|entry| entry == "--env=COLORTERM=truecolor"));
         assert!(argv.iter().any(|entry| entry == "--env=LANG=C.UTF-8"));
         assert!(argv.iter().any(|entry| entry == "--env=LC_ALL=C.UTF-8"));
+        assert!(argv.iter().any(|entry| entry == "--forward-fd=3"));
+        let separator = argv.iter().position(|entry| entry == "--").unwrap();
+        assert_eq!(argv[separator + 1], FLATPAK_HOST_SUPERVISOR_EXEC);
+        assert_eq!(&argv[separator + 2..separator + 4], ["/bin/bash", "-lc"]);
         assert_eq!(
             &argv[argv.len() - 3..],
             ["/bin/bash", "-lc", "printf '%s' \"$HOME\""]
@@ -1500,6 +1534,19 @@ mod tests {
             flatpak_host_command(&options),
             ["printf", "hello world", "$HOME"]
         );
+    }
+
+    #[test]
+    fn flatpak_host_command_executes_only_the_forwarded_supervisor() {
+        let options = SpawnOptions::new(None, Some("printf '%s' safe"), "xterm-256color")
+            .with_shell("/bin/bash", true);
+        let argv = flatpak_host_argv(&options, Some("/home/user"));
+        let separator = argv.iter().position(|entry| entry == "--").unwrap();
+        assert_eq!(argv[separator + 1], "/proc/self/fd/3");
+        assert_eq!(argv[separator + 2], "/bin/bash");
+        assert_eq!(argv[separator + 3], "-lc");
+        assert_eq!(argv[separator + 4], "printf '%s' safe");
+        assert!(!argv.iter().any(|entry| entry == "/bin/sh"));
     }
 
     #[test]

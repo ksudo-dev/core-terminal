@@ -63,8 +63,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libgtk-4-dev libvte-2.91-gtk4-dev
+          sudo apt-get install --no-install-recommends -y \
+            build-essential libgtk-4-dev libvte-2.91-gtk4-dev
       - run: cargo test --locked --all-targets --no-fail-fast
+      - run: scripts/check-flatpak-host-supervisor.py
 
   package:
     runs-on: ubuntu-26.04
@@ -129,6 +131,7 @@ jobs:
             -c '
               set -eu
               test -x /app/bin/core-terminal
+              test -x /app/libexec/core-terminal-host-supervisor
               test -r /app/share/core-terminal/default-profiles.json
               test -x /app/libexec/vte-urlencode-cwd
               test -r /app/etc/profile.d/vte.sh
@@ -143,19 +146,64 @@ jobs:
             --host --directory="$HOME" \
             "$PWD/scripts/check-flatpak-host-environment.sh" \
             "$expected_host_shell" "$HOME"
-          acceptance_root="$HOME/core-terminal-flatpak-acceptance"
+          acceptance_root="$RUNNER_TEMP/core-terminal-flatpak-acceptance"
+          rm -rf -- "$acceptance_root"
           install -d -m 0700 "$acceptance_root/config"
-          dbus-run-session -- xvfb-run -a flatpak run --user \
+          marker_suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          host_jobs_seen="$acceptance_root/host-jobs-seen"
+          scripts/check-flatpak-process-lifecycle.py \
+            "core-terminal-acceptance-bg-${marker_suffix}" 41.234 \
+            "core-terminal-acceptance-fg-${marker_suffix}" 40.234 \
+            "$host_jobs_seen" &
+          lifecycle_pid=$!
+          cleanup_lifecycle() {
+            if kill -0 "$lifecycle_pid" 2>/dev/null; then
+              kill "$lifecycle_pid" 2>/dev/null || true
+              wait "$lifecycle_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_lifecycle EXIT INT TERM
+          app_status=0
+          timeout --kill-after=15s 120s \
+            dbus-run-session -- xvfb-run -a flatpak run --user \
             --env=GDK_BACKEND=x11 \
             --env=XDG_CONFIG_HOME="$acceptance_root/config" \
             --env=CORE_TERMINAL_ACCEPTANCE=1 \
             --env=CORE_TERMINAL_ACCEPTANCE_REPORT="$acceptance_root/report.txt" \
-            io.github.ksudo_dev.CoreTerminal
-          grep -Fq 'status=PASS ' "$acceptance_root/report.txt"
+            --env=CORE_TERMINAL_ACCEPTANCE_MARKER_SUFFIX="$marker_suffix" \
+            --env=CORE_TERMINAL_ACCEPTANCE_HOST_JOBS_SEEN="$host_jobs_seen" \
+            io.github.ksudo_dev.CoreTerminal || app_status=$?
+          lifecycle_status=0
+          wait "$lifecycle_pid" || lifecycle_status=$?
+          trap - EXIT INT TERM
+          if test -r "$acceptance_root/report.txt"; then
+            cat "$acceptance_root/report.txt"
+          else
+            echo "Core Terminal did not write the Flatpak acceptance report" >&2
+          fi
+          printf 'Flatpak app status: %s\nHost lifecycle watcher status: %s\n' \
+            "$app_status" "$lifecycle_status"
+          acceptance_status=0
+          test "$app_status" -eq 0 || acceptance_status=1
+          test "$lifecycle_status" -eq 0 || acceptance_status=1
+          test -r "$acceptance_root/report.txt" || acceptance_status=1
+          if test -r "$acceptance_root/report.txt"; then
+            grep -Fq 'status=PASS ' "$acceptance_root/report.txt" || \
+              acceptance_status=1
+          fi
+          exit "$acceptance_status"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: core-terminal-flatpak
           path: dist/io.github.ksudo_dev.CoreTerminal.flatpak
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: flatpak-acceptance-diagnostics
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/core-terminal-flatpak-acceptance/report.txt
+            ${{ runner.temp }}/core-terminal-flatpak-acceptance/host-jobs-seen
 
   private-data:
     runs-on: ubuntu-26.04

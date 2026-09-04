@@ -18,6 +18,7 @@ scripts/check-private-data.sh
 scripts/check-doc-style.sh
 scripts/security-audit.sh
 scripts/check-flatpak-source.sh
+scripts/check-flatpak-host-supervisor.py
 ```
 
 ## Native Wayland acceptance
@@ -48,8 +49,27 @@ accepts any safely revalidated close prompt, and verifies that every captured
 process exits. Emergency probe cleanup also opens a pidfd before checking PID,
 start time, session, and process group, then sends the signal through that
 kernel-bound handle.
+
 The script prints one `status=PASS` line and removes the temporary configuration
 directory when it exits.
+
+The Flatpak CI run keeps the foreground/background probe but splits observation
+at the sandbox boundary. The app verifies the exact local proxy token, its
+`--host`, `--watch-bus`, and `--forward-fd=3` arguments, and the fixed
+`/proc/self/fd/3` executable. A host-side watcher binds pidfds to both exact
+marked job argument vectors, verifies their controlling-terminal foreground
+and background process-group roles, acknowledges that they are live before the
+app closes the tab, and then requires both pidfds to report exit. This prevents
+a sandbox-only process scan from producing a false pass.
+
+`scripts/check-flatpak-host-supervisor.py` compiles the C pidfd helper as a
+static PIE with warnings treated as errors. It runs the helper as a session
+leader on a pseudoterminal and verifies cleanup of distinct foreground and
+background process groups after HUP, INT, QUIT, TERM, USR1, and USR2. It also
+verifies residual-job cleanup plus exit-status preservation when the direct
+child exits normally. A low-descriptor test sets `RLIMIT_NOFILE` to 8, starts
+40 signal-ignoring jobs, and proves that streaming pidfd cleanup does not depend
+on holding one descriptor per session member.
 
 The harness cannot control GL.iNet Comet's browser Pointer Lock. A maintainer
 using that KVM must also take a macOS and GNOME screenshot, return focus to Core

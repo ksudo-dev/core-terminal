@@ -34,6 +34,9 @@ flatpak run io.github.ksudo_dev.CoreTerminal
 The Flatpak uses the GNOME runtime for GTK and VTE, but does not require the
 GNOME desktop. Because a terminal must run the user's host shell and commands,
 it has home-directory access and uses Flatpak's host-command interface.
+Its host-process supervisor requires Linux 5.3 or newer for pidfds. On an older
+kernel, Core Terminal rejects the Flatpak shell launch instead of falling back
+to numeric PID signaling.
 
 ## Native build dependencies
 

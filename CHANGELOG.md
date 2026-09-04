@@ -35,7 +35,12 @@
   non-blocking grace intervals, covering foreground and background jobs.
   Every signal uses a pidfd bound to a matching PID, start value, session, and
   process group, so PID reuse cannot redirect it. Sandboxed proxy children
-  receive the same pidfd validation before each narrow proxy signal.
+  receive the same pidfd validation before each narrow proxy signal. Flatpak
+  host commands now run under a static, fd-forwarded session supervisor that
+  pidfd-binds every revalidated host-session member, including residual jobs
+  after a normal child exit. It streams one pidfd at a time so large sessions
+  cannot exhaust its descriptor limit. Flatpak CI binds exact foreground and
+  background markers to host pidfds before accepting this behavior.
 
 ## 0.2.1
 

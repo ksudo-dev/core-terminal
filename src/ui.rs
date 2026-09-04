@@ -4104,11 +4104,27 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             }
         };
         let mut close_prompt_details_bounded = false;
-        let background_session_cleanup = {
+        let brokered_runtime = core::running_in_flatpak();
+        let process_cleanup = {
             let probe_name = "Acceptance Background Session";
-            let probe_suffix = std::process::id();
+            let probe_suffix = std::env::var("CORE_TERMINAL_ACCEPTANCE_MARKER_SUFFIX")
+                .ok()
+                .filter(|suffix| {
+                    !suffix.is_empty()
+                        && suffix.len() <= 96
+                        && suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+                .unwrap_or_else(|| std::process::id().to_string());
             let background_marker = format!("core-terminal-acceptance-bg-{probe_suffix}");
             let foreground_marker = format!("core-terminal-acceptance-fg-{probe_suffix}");
+            let probe_command = format!(
+                "set -m; (exec -a {background_marker} sleep 41.234) & \
+                 (exec -a {foreground_marker} sleep 40.234); wait"
+            );
+            let brokered_ready_path = std::env::var_os("CORE_TERMINAL_ACCEPTANCE_HOST_JOBS_SEEN")
+                .map(std::path::PathBuf::from);
             let original_selected = state
                 .try_borrow()
                 .map(|state| state.settings.selected_profile.clone())
@@ -4119,10 +4135,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 };
                 profile.name = probe_name.into();
                 profile.shell = "/bin/bash".into();
-                profile.shell_command = format!(
-                    "set -m; (exec -a {background_marker} sleep 41.234) & \
-                     (exec -a {foreground_marker} sleep 40.234); wait"
-                );
+                profile.shell_command = probe_command.clone();
                 profile.run_inside_shell = true;
                 profile.ask_before_close_policy = AskBeforeClosePolicy::Always;
                 state.profiles.add_profile(profile).is_ok()
@@ -4136,7 +4149,12 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 let captured_session_processes = Rc::new(RefCell::new(None));
                 let session_processes = probe_id.and_then(|id| {
                     let captured_session_processes = captured_session_processes.clone();
-                    wait_for_condition(Duration::from_secs(4), || {
+                    let observation_timeout = if brokered_runtime {
+                        Duration::from_secs(12)
+                    } else {
+                        Duration::from_secs(4)
+                    };
+                    wait_for_condition(observation_timeout, || {
                         let Ok(state) = state.try_borrow() else {
                             return false;
                         };
@@ -4147,8 +4165,72 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                         let Some(process) = process else {
                             return false;
                         };
+                        let Some(child_pid) = process.child_pid else {
+                            return false;
+                        };
+                        if brokered_runtime {
+                            let token_matches = state
+                                .child_process_identities
+                                .get(&id.get())
+                                .is_some_and(|identity| identity.pid().0 == child_pid);
+                            let Some(proxy) = acceptance_process(child_pid) else {
+                                return false;
+                            };
+                            let proxy_name_matches = proxy
+                                .arguments
+                                .first()
+                                .and_then(|argument| Path::new(argument).file_name())
+                                .and_then(|name| name.to_str())
+                                == Some("flatpak-spawn");
+                            let separators = proxy
+                                .arguments
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, argument)| (argument == "--").then_some(index))
+                                .collect::<Vec<_>>();
+                            let proxy_arguments_match =
+                                separators.first().is_some_and(|&separator| {
+                                    separators.len() == 1
+                                        && proxy.arguments[..separator]
+                                            .iter()
+                                            .filter(|argument| argument.as_str() == "--host")
+                                            .count()
+                                            == 1
+                                        && proxy.arguments[..separator]
+                                            .iter()
+                                            .filter(|argument| argument.as_str() == "--watch-bus")
+                                            .count()
+                                            == 1
+                                        && proxy.arguments[..separator]
+                                            .iter()
+                                            .filter(|argument| {
+                                                argument.as_str() == "--forward-fd=3"
+                                            })
+                                            .count()
+                                            == 1
+                                        && proxy.arguments[separator + 1..]
+                                            == [
+                                                "/proc/self/fd/3",
+                                                "/bin/bash",
+                                                "-lc",
+                                                probe_command.as_str(),
+                                            ]
+                                });
+                            let host_started = brokered_ready_path
+                                .as_ref()
+                                .is_some_and(|path| path.is_file());
+                            if token_matches
+                                && proxy_name_matches
+                                && proxy_arguments_match
+                                && host_started
+                            {
+                                *captured_session_processes.borrow_mut() = Some(vec![proxy]);
+                                return true;
+                            }
+                            return false;
+                        }
                         let (Some(child_pid), Some(foreground_pgid), Some(pids)) = (
-                            process.child_pid,
+                            Some(child_pid),
                             process.foreground_pgid,
                             process.session_processes,
                         ) else {
@@ -4280,6 +4362,8 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 false
             }
         };
+        let background_session_cleanup = !brokered_runtime && process_cleanup;
+        let brokered_proxy_cleanup = brokered_runtime && process_cleanup;
         let state_machine_probe = {
             let mut state = state.borrow_mut();
             let active = state.sessions.active().map(|tab| {
@@ -5355,7 +5439,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && group_launch_explicit
             && active_profile_synced_after_close
             && close_before_spawn_cleanup
-            && background_session_cleanup
+            && (background_session_cleanup || brokered_proxy_cleanup)
             && close_prompt_details_bounded
             && confirmation_accepted
             && stale_pending_revalidated
@@ -5369,11 +5453,8 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && exited_pid_cleared
             && protected_sibling_preserved
             && close_probe_cleanup;
-        let report_path = std::env::var_os("CORE_TERMINAL_ACCEPTANCE_REPORT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| Path::new("/tmp/core-terminal-acceptance.json").to_path_buf());
         let report = format!(
-            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
+            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
@@ -5411,6 +5492,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             active_profile_synced_after_close,
             close_before_spawn_cleanup,
             background_session_cleanup,
+            brokered_proxy_cleanup,
             close_prompt_details_bounded,
             confirmation_accepted,
             stale_pending_revalidated,
@@ -5425,7 +5507,23 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             protected_sibling_preserved,
             close_probe_cleanup,
         );
-        let _ = std::fs::write(report_path, report);
+        if let Some(report_path) =
+            std::env::var_os("CORE_TERMINAL_ACCEPTANCE_REPORT").map(std::path::PathBuf::from)
+        {
+            let write_result = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&report_path)
+                .and_then(|mut output| std::io::Write::write_all(&mut output, report.as_bytes()));
+            if let Err(error) = write_result {
+                eprintln!(
+                    "Core Terminal could not create acceptance report {}: {error}",
+                    report_path.display()
+                );
+            }
+        } else {
+            eprintln!("CORE_TERMINAL_ACCEPTANCE_REPORT is required in acceptance mode");
+        }
         settings.close();
         app.quit();
     });
