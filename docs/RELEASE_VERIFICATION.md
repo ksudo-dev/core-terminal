@@ -6,7 +6,7 @@ anything:
 
 ```sh
 set -eu
-release_tag=v0.2.1
+release_tag=v0.2.2
 repository=ksudo-dev/core-terminal
 release_dir=$(mktemp -d)
 
@@ -34,10 +34,10 @@ esac
 }
 
 for asset in \
-  core-terminal_0.2.1_amd64.deb \
+  core-terminal_0.2.2_amd64.deb \
   io.github.ksudo_dev.CoreTerminal.flatpak \
-  core-terminal-0.2.1.tar.gz \
-  core-terminal-0.2.1.cdx.json \
+  core-terminal-0.2.2.tar.gz \
+  core-terminal-0.2.2.cdx.json \
   SHA256SUMS
 do
   gh attestation verify "$release_dir/$asset" \
