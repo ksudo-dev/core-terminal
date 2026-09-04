@@ -11,16 +11,27 @@ import resource
 import select
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import termios
 import time
 from pathlib import Path
+from typing import Callable, NamedTuple
 
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "src" / "flatpak-host-supervisor.c"
+
+
+class ProcessIdentity(NamedTuple):
+    state: str
+    process_group: int
+    session: int
+    tty_number: int
+    terminal_group: int
+    start_time: int
 
 
 def process_arguments(pid: int) -> list[bytes] | None:
@@ -29,6 +40,29 @@ def process_arguments(pid: int) -> list[bytes] | None:
     except (FileNotFoundError, PermissionError, ProcessLookupError):
         return None
     return [argument for argument in data.split(b"\0") if argument]
+
+
+def process_identity(pid: int) -> ProcessIdentity | None:
+    try:
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+        fields = data.rsplit(b") ", 1)[1].split()
+        return ProcessIdentity(
+            fields[0].decode("ascii"),
+            int(fields[2]),
+            int(fields[3]),
+            int(fields[4]),
+            int(fields[5]),
+            int(fields[19]),
+        )
+    except (
+        FileNotFoundError,
+        IndexError,
+        PermissionError,
+        ProcessLookupError,
+        UnicodeDecodeError,
+        ValueError,
+    ):
+        return None
 
 
 def exact_processes(arguments: list[bytes]) -> list[int]:
@@ -49,13 +83,29 @@ def wait_for_exact(arguments: list[bytes], timeout: float = 4.0) -> tuple[int, i
             raise RuntimeError(f"multiple exact processes found for {arguments!r}: {matches}")
         if matches:
             pid = matches[0]
+            identity_before = process_identity(pid)
+            if identity_before is None or process_arguments(pid) != arguments:
+                continue
             try:
                 pidfd = os.pidfd_open(pid)
             except ProcessLookupError:
                 continue
-            if process_arguments(pid) == arguments:
-                return pid, pidfd
-            os.close(pidfd)
+            keep_open = False
+            try:
+                signal.pidfd_send_signal(pidfd, 0)
+                identity_after = process_identity(pid)
+                if (
+                    identity_after is not None
+                    and identity_before.start_time == identity_after.start_time
+                    and process_arguments(pid) == arguments
+                ):
+                    keep_open = True
+                    return pid, pidfd
+            except ProcessLookupError:
+                pass
+            finally:
+                if not keep_open:
+                    os.close(pidfd)
         time.sleep(0.01)
     raise TimeoutError(f"process did not appear with exact argv {arguments!r}")
 
@@ -190,6 +240,55 @@ def read_pty_output(master: int, timeout: float = 0.5) -> bytes:
     return bytes(output)
 
 
+def wait_pty_contains(master: int, marker: bytes, timeout: float = 4.0) -> bytes:
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    while marker not in output and time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([master], [], [], remaining)
+        if not ready:
+            break
+        try:
+            data = os.read(master, 4096)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not data:
+            break
+        output.extend(data)
+    if marker not in output:
+        raise TimeoutError(f"PTY output did not contain {marker!r}: {bytes(output)!r}")
+    return bytes(output)
+
+
+def wait_process_identity(
+    pid: int,
+    arguments: list[bytes],
+    start_time: int,
+    predicate: Callable[[ProcessIdentity], bool],
+    description: str,
+    timeout: float = 4.0,
+) -> ProcessIdentity:
+    deadline = time.monotonic() + timeout
+    last_identity = None
+    while time.monotonic() < deadline:
+        identity = process_identity(pid)
+        if (
+            identity is None
+            or identity.start_time != start_time
+            or process_arguments(pid) != arguments
+        ):
+            raise RuntimeError(f"process changed identity while waiting for {description}")
+        last_identity = identity
+        if predicate(identity):
+            return identity
+        time.sleep(0.01)
+    raise TimeoutError(
+        f"process did not reach {description}; last identity={last_identity!r}"
+    )
+
+
 def terminate_exact(arguments: list[bytes]) -> None:
     for pid in exact_processes(arguments):
         try:
@@ -305,6 +404,118 @@ def signal_cleanup_test(
             os.close(master)
         terminate_exact([os.fsencode(background), b"41.234"])
         terminate_exact([os.fsencode(foreground), b"40.234"])
+
+
+def terminal_interaction_test(helper: Path, suffix: str) -> None:
+    """Exercise signals generated by the terminal line discipline itself."""
+    shell_marker = f"core-terminal-helper-shell-{suffix}"
+    job_marker = f"core-terminal-helper-job-{suffix}"
+    prompt = f"core-terminal-prompt-{suffix}> "
+    shell_arguments = [
+        os.fsencode(shell_marker),
+        b"--noprofile",
+        b"--norc",
+        b"-i",
+    ]
+    job_arguments = [os.fsencode(job_marker), b"37.271"]
+    supervisor_pid = supervisor_pidfd = master = None
+    shell_pidfd = job_pidfd = None
+    try:
+        supervisor_pid, supervisor_pidfd, master = spawn_in_pty(
+            [
+                str(helper),
+                "/bin/bash",
+                "-c",
+                'PS1="$1" exec -a "$0" /bin/bash --noprofile --norc -i',
+                shell_marker,
+                prompt,
+            ]
+        )
+        shell_pid, shell_pidfd = wait_for_exact(shell_arguments)
+        shell_identity = process_identity(shell_pid)
+        if shell_identity is None:
+            raise RuntimeError("interactive shell disappeared after pidfd binding")
+        wait_pty_contains(master, os.fsencode(prompt))
+
+        # Discard the echoed trap command and wait for a fresh prompt before
+        # resizing. The marker observed below can then only come from SIGWINCH.
+        os.write(
+            master,
+            b"trap 'echo WINCH-DELIVERED:$(stty size)' WINCH\n",
+        )
+        wait_pty_contains(master, os.fsencode(prompt))
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 41, 123, 0, 0))
+        resize_output = wait_pty_contains(master, b"WINCH-DELIVERED:41 123")
+        if os.fsencode(prompt) not in resize_output:
+            wait_pty_contains(master, os.fsencode(prompt))
+
+        command = (
+            f"/bin/bash -c 'exec -a \"$0\" /bin/sleep 37.271' "
+            f"{job_marker}\n"
+        )
+        os.write(master, os.fsencode(command))
+        job_pid, job_pidfd = wait_for_exact(job_arguments)
+        job_identity = process_identity(job_pid)
+        if job_identity is None:
+            raise RuntimeError("foreground job disappeared after pidfd binding")
+        if (
+            job_identity.session != shell_identity.session
+            or job_identity.process_group == shell_identity.process_group
+            or job_identity.terminal_group != job_identity.process_group
+        ):
+            raise RuntimeError(
+                "interactive job did not acquire its own foreground process group: "
+                f"shell={shell_identity!r}; job={job_identity!r}"
+            )
+
+        os.write(master, b"\x1a")
+        stopped = wait_process_identity(
+            job_pid,
+            job_arguments,
+            job_identity.start_time,
+            lambda identity: identity.state in {"T", "t"}
+            and identity.terminal_group == shell_identity.process_group,
+            "terminal-generated SIGTSTP and shell foreground recovery",
+        )
+        wait_pty_contains(master, os.fsencode(prompt))
+
+        os.write(master, b"fg\n")
+        wait_process_identity(
+            job_pid,
+            job_arguments,
+            stopped.start_time,
+            lambda identity: identity.state not in {"T", "t"}
+            and identity.terminal_group == identity.process_group,
+            "foreground continue after the typed fg command",
+        )
+        os.write(master, b"\x03")
+        wait_pidfd(job_pidfd)
+        wait_pty_contains(master, os.fsencode(prompt))
+        os.write(master, b"printf 'INTERRUPT-STATUS:%s\\n' \"$?\"\n")
+        interrupt_output = wait_pty_contains(master, b"INTERRUPT-STATUS:130")
+        if os.fsencode(prompt) not in interrupt_output:
+            wait_pty_contains(master, os.fsencode(prompt))
+
+        os.write(master, b"exit 0\n")
+        status = wait_pid(supervisor_pid)
+        if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+            raise RuntimeError(
+                f"interactive supervisor did not preserve shell exit 0: {status}"
+            )
+    finally:
+        for pidfd in (job_pidfd, shell_pidfd):
+            if pidfd is not None:
+                os.close(pidfd)
+        if supervisor_pidfd is not None:
+            try:
+                signal.pidfd_send_signal(supervisor_pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.close(supervisor_pidfd)
+        if master is not None:
+            os.close(master)
+        terminate_exact(job_arguments)
+        terminate_exact(shell_arguments)
 
 
 def already_owned_terminal_test(helper: Path) -> None:
@@ -495,13 +706,14 @@ def main() -> int:
             signal.SIGUSR2,
         ):
             signal_cleanup_test(helper, work, suffix, signal_number)
+        terminal_interaction_test(helper, suffix)
         already_owned_terminal_test(helper)
         portal_preclaimed_terminal_rejection_test(helper, suffix)
         normal_exit_cleanup_test(helper, suffix)
         low_descriptor_limit_test(helper, suffix)
     print(
-        "Flatpak host supervisor PTY ownership, job control, signals, "
-        "and normal-exit cleanup passed"
+        "Flatpak host supervisor PTY ownership, terminal interaction, job control, "
+        "signals, and normal-exit cleanup passed"
     )
     return 0
 

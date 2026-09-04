@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Restored the missing Text-page form containing font, cursor, and scrollback
+  controls, and added native layout checks that require those controls to be
+  present and loaded from the active profile.
+- Kept renderer-owned controls truthful after profile switches and preserved
+  imported values for settings that VTE or Wayland cannot edit.
+- Kept legacy compatibility fields tied to the live session profile when a
+  different profile is visible in Settings at save time.
+- Added PTY-driven supervisor tests for terminal resize, `SIGWINCH`, foreground
+  job suspension, `fg` recovery, Ctrl-C, and shell exit-status preservation.
 - Separated startup, new-window, new-tab, and window-group launch policies so
   one path cannot silently override another.
 - Made same-profile tabs follow the active tab and preserve the chosen working

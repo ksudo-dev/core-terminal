@@ -34,6 +34,17 @@ const SETTINGS_PAGE_IDS: [&str; 4] = ["general", "profiles", "window-groups", "e
 const PROFILE_PAGE_IDS: [&str; 6] = ["text", "window", "tab", "shell", "keyboard", "advanced"];
 static ACCEPTANCE_CLOSED_SPAWN_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
 
+fn compatibility_profile<'a>(
+    profiles: &'a ProfileStore,
+    active_profile: &str,
+    startup_profile: &str,
+) -> &'a TerminalProfile {
+    profiles
+        .profile(active_profile)
+        .or_else(|| profiles.profile(startup_profile))
+        .unwrap_or_else(|| profiles.selected())
+}
+
 /// Run process-session escalation away from GTK's main thread. Holding the
 /// application until the worker finishes keeps last-window shutdown from
 /// abandoning a pending TERM/KILL sequence.
@@ -74,10 +85,11 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        resolve_new_tab_profile, resolve_window_profile, runtime_profile_requires_reapply,
-        runtime_terminal_settings_changed, settings_page_ids, spawn_callback_action,
-        startup_profile_after_deletion, window_group_entry_summary, ProfileStore, SessionManager,
-        Settings, SpawnCallbackAction, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        compatibility_profile, resolve_new_tab_profile, resolve_window_profile,
+        runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
+        spawn_callback_action, startup_profile_after_deletion, window_group_entry_summary,
+        ProfileStore, SessionManager, Settings, SpawnCallbackAction, WindowGroupEntry,
+        APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -246,6 +258,135 @@ mod structural_tests {
             startup_profile_after_deletion(Some("Custom"), "Custom", "Homebrew"),
             "Homebrew"
         );
+    }
+
+    #[test]
+    fn compatibility_profile_prefers_active_then_startup_then_default() {
+        let mut profiles = ProfileStore::defaults();
+        profiles.set_default("Pro").unwrap();
+        assert_eq!(
+            compatibility_profile(&profiles, "Ocean", "Homebrew").name,
+            "Ocean"
+        );
+        assert_eq!(
+            compatibility_profile(&profiles, "Missing", "Homebrew").name,
+            "Homebrew"
+        );
+        assert_eq!(
+            compatibility_profile(&profiles, "Missing", "Also missing").name,
+            "Pro"
+        );
+    }
+
+    #[test]
+    fn profile_reader_preserves_permanently_unavailable_fields() {
+        let source = include_str!("ui.rs");
+        let start = source
+            .rfind("fn read_profile_widgets(")
+            .expect("read_profile_widgets must remain present");
+        let end = source[start..]
+            .find("fn load_profile_widgets(")
+            .map(|offset| start + offset)
+            .expect("load_profile_widgets must follow read_profile_widgets");
+        let reader = &source[start..end];
+
+        let overwritten = [
+            "\"profile-antialias\"",
+            "\"profile-use-bold-fonts\"",
+            "\"profile-use-ansi\"",
+            "\"profile-dynamic-colors\"",
+            "\"profile-tab-show-ctrl-key\"",
+            "\"profile-title-show-tty\"",
+            "\"profile-title-show-ctrl-key\"",
+            "\"profile-smooth-resize\"",
+            "\"profile-restore-rows\"",
+            "\"profile-restore-rows-limit\"",
+            "\"profile-restore-bookmark\"",
+            "\"profile-alt-scroll\"",
+            "\"profile-keypad\"",
+        ]
+        .into_iter()
+        .filter(|name| reader.contains(name))
+        .collect::<Vec<_>>();
+        assert!(
+            overwritten.is_empty(),
+            "reading the forced UI state for {overwritten:?} would destroy imported profile \
+             metadata"
+        );
+    }
+
+    #[test]
+    fn initial_profile_controls_are_seeded_from_the_selected_profile() {
+        let source = include_str!("ui.rs");
+        let start = source
+            .rfind("impl SettingsControls {")
+            .expect("SettingsControls implementation must remain present");
+        let end = source[start..]
+            .find("fn named_check(")
+            .map(|offset| start + offset)
+            .expect("named_check must follow SettingsControls");
+        let constructor = &source[start..end];
+
+        for expected in [
+            "font.set_text(&selected_defaults.font);",
+            "font_size.set_value(selected_defaults.font_size);",
+            "cursor_shape.set_selected(match selected_defaults.cursor_shape",
+            "check(\"Blink cursor\", selected_defaults.cursor_blink)",
+            "scrollback.set_value(selected_defaults.scrollback_lines as f64);",
+            "terminal_type.set_text(&selected_defaults.terminal_type);",
+        ] {
+            assert!(
+                constructor.contains(expected),
+                "profile-owned initial control must use selected profile: {expected}"
+            );
+        }
+
+        for stale_global_seed in [
+            "font.set_text(&settings.font);",
+            "font_size.set_value(settings.font_size);",
+            "cursor_shape.set_selected(match settings.cursor_shape",
+            "check(\"Blink cursor\", settings.cursor_blink)",
+            "scrollback.set_value(settings.scrollback_lines as f64);",
+            "terminal_type.set_text(&settings.terminal_type);",
+        ] {
+            assert!(
+                !constructor.contains(stale_global_seed),
+                "profile editor must not seed a profile-owned control from the global snapshot: \
+                 {stale_global_seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_loader_keeps_fixed_controls_truthful() {
+        let source = include_str!("ui.rs");
+        let start = source
+            .rfind("fn load_profile_widgets(")
+            .expect("load_profile_widgets must remain present");
+        let end = source[start..]
+            .find("fn sync_profile_control_sensitivity(")
+            .map(|offset| start + offset)
+            .expect("sensitivity synchronization must follow profile loading");
+        let loader = &source[start..end];
+
+        for name in [
+            "\"profile-antialias\"",
+            "\"profile-use-bold-fonts\"",
+            "\"profile-use-ansi\"",
+            "\"profile-dynamic-colors\"",
+            "\"profile-smooth-resize\"",
+            "\"profile-alt-scroll\"",
+            "\"profile-keypad\"",
+            "\"profile-tab-show-ctrl-key\"",
+            "\"profile-title-show-tty\"",
+            "\"profile-title-show-ctrl-key\"",
+            "\"profile-restore-rows\"",
+        ] {
+            assert!(
+                !loader.contains(name),
+                "fixed control must keep its effective state after profile switches: {name}"
+            );
+        }
     }
 }
 
@@ -743,6 +884,15 @@ where
             // custom profiles accept both edits and deletion.
             let _ = edited_profiles.update_profile(profile);
         }
+        // These legacy fields remain in Settings for schema compatibility.
+        // Keep them aligned with the live session profile even when the user
+        // browses a different profile in the editor before pressing Save.
+        let compatibility_profile = compatibility_profile(
+            &edited_profiles,
+            &initial.selected_profile,
+            &startup_profile,
+        )
+        .clone();
         on_save(
             Settings {
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -761,11 +911,11 @@ where
                 new_window_profile: dropdown_value(&controls.new_window_profile, "Startup profile"),
                 new_tab_profile: dropdown_value(&controls.new_tab_profile, "Same as current tab"),
                 new_window_same_directory: controls.new_window_same_directory.is_active(),
-                font: controls.font.text().to_string(),
-                font_size: controls.font_size.value(),
-                cursor_shape,
-                cursor_blink: controls.cursor_blink.is_active(),
-                scrollback_lines: controls.scrollback.value() as u32,
+                font: compatibility_profile.font.clone(),
+                font_size: compatibility_profile.font_size,
+                cursor_shape: compatibility_profile.cursor_shape,
+                cursor_blink: compatibility_profile.cursor_blink,
+                scrollback_lines: compatibility_profile.scrollback_lines,
                 window_width: controls.window_width.value() as i32,
                 window_height: controls.window_height.value() as i32,
                 use_custom_command: controls.use_custom_command.is_active(),
@@ -789,7 +939,7 @@ where
                 // KVM-safe runtime policy always keeps the pointer visible.
                 mouse_autohide: false,
                 background_notifications: controls.background_notifications.is_active(),
-                terminal_type: controls.terminal_type.text().to_string(),
+                terminal_type: compatibility_profile.terminal_type,
             },
             edited_profiles,
         );
@@ -837,7 +987,6 @@ struct SettingsControls {
     // Pointer auto-hide intentionally has no settings control. All VTE
     // terminals are forced to keep the pointer visible for KVM safety.
     background_notifications: gtk::CheckButton,
-    terminal_type: gtk::Entry,
     profile_add: gtk::Button,
     profile_duplicate: gtk::Button,
     profile_delete: gtk::Button,
@@ -864,6 +1013,17 @@ impl SettingsControls {
         profile_store: Rc<RefCell<ProfileStore>>,
         on_launch_group: Rc<dyn Fn(WindowGroup)>,
     ) -> Self {
+        // Profile-owned controls must be seeded from the profile selected in
+        // the editor. The global Settings copy is a compatibility snapshot
+        // and can legitimately describe the previously active profile.
+        let selected_defaults = {
+            let store = profile_store.borrow();
+            store
+                .profile(&settings.selected_profile)
+                .cloned()
+                .unwrap_or_else(|| store.selected().clone())
+        };
+        let selected_profile_name = selected_defaults.name.clone();
         let general = gtk::Box::new(gtk::Orientation::Vertical, 18);
         general.add_css_class("core-settings-pane");
         general.set_margin_start(28);
@@ -1045,7 +1205,7 @@ impl SettingsControls {
         profile_list.set_vexpand(true);
         for (index, name) in profile_names.iter().enumerate() {
             profile_list.append(&profile_list_row(name));
-            if name == &settings.selected_profile {
+            if name == &selected_profile_name {
                 if let Some(row) = profile_list.row_at_index(index as i32) {
                     profile_list.select_row(Some(&row));
                 }
@@ -1114,7 +1274,7 @@ impl SettingsControls {
             };
             profile_actions.attach(&button, column, row, width, 1);
         }
-        let profile_selection = Rc::new(RefCell::new(settings.selected_profile.clone()));
+        let profile_selection = Rc::new(RefCell::new(selected_profile_name.clone()));
         let profile_selection_for_list = profile_selection.clone();
         profile_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
@@ -1153,14 +1313,14 @@ impl SettingsControls {
         appearance_grid.attach(&font_label, 0, 0, 1, 1);
         let font = gtk::Entry::new();
         font.set_widget_name("profile-font");
-        font.set_text(&settings.font);
+        font.set_text(&selected_defaults.font);
         font.set_hexpand(true);
         appearance_grid.attach(&font, 1, 0, 1, 1);
         let font_size_label = field_label("Font size");
         appearance_grid.attach(&font_size_label, 0, 1, 1, 1);
         let font_size = gtk::SpinButton::with_range(6.0, 96.0, 1.0);
         font_size.set_widget_name("profile-font-size");
-        font_size.set_value(settings.font_size);
+        font_size.set_value(selected_defaults.font_size);
         appearance_grid.attach(&font_size, 1, 1, 1, 1);
         let cursor_label = field_label("Cursor shape");
         appearance_grid.attach(&cursor_label, 0, 2, 1, 1);
@@ -1170,26 +1330,22 @@ impl SettingsControls {
             None::<&gtk::Expression>,
         );
         cursor_shape.set_widget_name("profile-cursor-shape");
-        cursor_shape.set_selected(match settings.cursor_shape {
+        cursor_shape.set_selected(match selected_defaults.cursor_shape {
             CursorShape::Block => 0,
             CursorShape::IBeam => 1,
             CursorShape::Underline => 2,
         });
         appearance_grid.attach(&cursor_shape, 1, 2, 1, 1);
-        let cursor_blink = check("Blink cursor", settings.cursor_blink);
+        let cursor_blink = check("Blink cursor", selected_defaults.cursor_blink);
         cursor_blink.set_widget_name("profile-cursor-blink");
         appearance_grid.attach(&cursor_blink, 1, 3, 1, 1);
         let scrollback_label = field_label("Scrollback lines");
         appearance_grid.attach(&scrollback_label, 0, 4, 1, 1);
         let scrollback = gtk::SpinButton::with_range(100.0, 1_000_000.0, 100.0);
         scrollback.set_widget_name("profile-scrollback");
-        scrollback.set_value(settings.scrollback_lines as f64);
+        scrollback.set_value(selected_defaults.scrollback_lines as f64);
         appearance_grid.attach(&scrollback, 1, 4, 1, 1);
-        let selected_defaults = profile_store
-            .borrow()
-            .profile(&settings.selected_profile)
-            .cloned()
-            .unwrap_or_else(|| profile_store.borrow().selected().clone());
+        appearance.append(&appearance_grid);
         let color_grid = form_grid();
         for (row, (label, value)) in [
             ("Background color", selected_defaults.background.as_str()),
@@ -1365,9 +1521,12 @@ impl SettingsControls {
         .into_iter()
         .enumerate()
         {
-            let button = named_check(label, active, name);
+            let button = if name == "profile-tab-show-ctrl-key" {
+                unavailable_check(label, name)
+            } else {
+                named_check(label, active, name)
+            };
             if name == "profile-tab-show-ctrl-key" {
-                button.set_sensitive(false);
                 button.set_tooltip_text(Some(
                     "The current VTE/Wayland API does not expose this macOS title component.",
                 ));
@@ -1543,9 +1702,14 @@ impl SettingsControls {
         .into_iter()
         .enumerate()
         {
-            let button = named_check(label, active, name);
-            if name == "profile-title-show-tty" || name == "profile-title-show-ctrl-key" {
-                button.set_sensitive(false);
+            let unavailable =
+                name == "profile-title-show-tty" || name == "profile-title-show-ctrl-key";
+            let button = if unavailable {
+                unavailable_check(label, name)
+            } else {
+                named_check(label, active, name)
+            };
+            if unavailable {
                 button.set_tooltip_text(Some(
                     "The current VTE/Wayland API does not expose this macOS title component.",
                 ));
@@ -1890,7 +2054,7 @@ impl SettingsControls {
         advanced_grid.attach(&terminal_type_label, 0, 0, 1, 1);
         let terminal_type = gtk::Entry::new();
         terminal_type.set_widget_name("advanced-terminal-type");
-        terminal_type.set_text(&settings.terminal_type);
+        terminal_type.set_text(&selected_defaults.terminal_type);
         terminal_type.set_placeholder_text(Some("xterm-256color"));
         terminal_type.set_hexpand(true);
         advanced_grid.attach(&terminal_type, 1, 0, 1, 1);
@@ -2001,7 +2165,7 @@ impl SettingsControls {
         profile_content.append(&profile_stack);
         let reload_stack = profile_stack.clone();
         let reload_store = profile_store.clone();
-        let editor_current = Rc::new(RefCell::new(settings.selected_profile.clone()));
+        let editor_current = Rc::new(RefCell::new(selected_profile_name));
         let editor_current_for_reload = editor_current.clone();
         let reload_mappings = mappings.clone();
         let reload_mapping_state = mapping_state.clone();
@@ -2684,7 +2848,6 @@ impl SettingsControls {
             audible_bell: legacy_audible_bell,
             bold_is_bright: legacy_bold_is_bright,
             background_notifications,
-            terminal_type,
             profile_add: profile_buttons[0].clone(),
             profile_duplicate: profile_buttons[1].clone(),
             profile_delete: profile_buttons[2].clone(),
@@ -2823,7 +2986,6 @@ fn read_profile_widgets(
             &mut profile.title_show_working_directory,
         ),
         ("profile-title-show-path", &mut profile.title_show_path),
-        ("profile-title-show-tty", &mut profile.title_show_tty),
         (
             "profile-title-show-process",
             &mut profile.title_show_process,
@@ -2837,10 +2999,6 @@ fn read_profile_widgets(
             &mut profile.title_show_dimensions,
         ),
         (
-            "profile-title-show-ctrl-key",
-            &mut profile.title_show_ctrl_key,
-        ),
-        (
             "profile-tab-show-process",
             &mut profile.tab_title_show_process,
         ),
@@ -2852,10 +3010,6 @@ fn read_profile_widgets(
         (
             "profile-tab-show-dimensions",
             &mut profile.tab_title_show_dimensions,
-        ),
-        (
-            "profile-tab-show-ctrl-key",
-            &mut profile.tab_title_show_ctrl_key,
         ),
         (
             "profile-tab-show-other-items",
@@ -2878,11 +3032,7 @@ fn read_profile_widgets(
     }
     profile.ansi_palette = palette;
     for (name, destination) in [
-        ("profile-antialias", &mut profile.antialias),
-        ("profile-use-bold-fonts", &mut profile.use_bold_fonts),
         ("profile-text-blink", &mut profile.text_blink),
-        ("profile-use-ansi", &mut profile.use_ansi_colors),
-        ("profile-dynamic-colors", &mut profile.dynamic_colors),
         ("profile-ansi-bright", &mut profile.bold_is_bright),
         (
             "profile-tab-show-profile",
@@ -2904,22 +3054,18 @@ fn read_profile_widgets(
             "profile-title-show-directory",
             &mut profile.title_show_directory,
         ),
-        ("profile-smooth-resize", &mut profile.smooth_resize),
         (
             "profile-unlimited-scrollback",
             &mut profile.scrollback_unlimited,
         ),
-        ("profile-restore-rows", &mut profile.restore_rows),
         ("profile-run-inside-shell", &mut profile.run_inside_shell),
         ("profile-option-meta", &mut profile.option_as_meta),
-        ("profile-alt-scroll", &mut profile.alternate_screen_scroll),
         (
             "profile-delete-control-h",
             &mut profile.delete_sends_control_h,
         ),
         ("profile-escape-nonascii", &mut profile.escape_non_ascii),
         ("profile-paste-cr", &mut profile.paste_newlines_as_cr),
-        ("profile-keypad", &mut profile.application_keypad),
         ("profile-scroll-input", &mut profile.scroll_on_input),
         ("profile-audible-bell", &mut profile.audible_bell),
         ("profile-visual-bell", &mut profile.visual_bell),
@@ -2979,12 +3125,6 @@ fn read_profile_widgets(
     }
     if let Some(value) = profile_spin(stack, "profile-rows") {
         profile.rows = value as u32;
-    }
-    if let Some(value) = profile_spin(stack, "profile-restore-rows-limit") {
-        profile.restore_rows_limit = value as u32;
-    }
-    if let Some(value) = profile_entry(stack, "profile-restore-bookmark") {
-        profile.restore_rows_bookmark = value;
     }
     if let Some(value) = profile_spin(stack, "profile-scrollback-limit") {
         profile.scrollback_limit = value as u32;
@@ -3194,11 +3334,7 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
         }
     }
     for (name, value) in [
-        ("profile-antialias", profile.antialias),
-        ("profile-use-bold-fonts", profile.use_bold_fonts),
         ("profile-text-blink", profile.text_blink),
-        ("profile-use-ansi", profile.use_ansi_colors),
-        ("profile-dynamic-colors", profile.dynamic_colors),
         ("profile-ansi-bright", profile.bold_is_bright),
         ("profile-tab-show-profile", profile.tab_title_show_profile),
         ("profile-tab-show-shell", profile.tab_title_show_shell),
@@ -3222,7 +3358,6 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
             "profile-tab-show-dimensions",
             profile.tab_title_show_dimensions,
         ),
-        ("profile-tab-show-ctrl-key", profile.tab_title_show_ctrl_key),
         (
             "profile-tab-show-other-items",
             profile.tab_title_show_other_items,
@@ -3235,24 +3370,18 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
             profile.title_show_working_directory,
         ),
         ("profile-title-show-path", profile.title_show_path),
-        ("profile-title-show-tty", profile.title_show_tty),
         ("profile-title-show-process", profile.title_show_process),
         ("profile-title-show-arguments", profile.title_show_arguments),
         (
             "profile-title-show-dimensions",
             profile.title_show_dimensions,
         ),
-        ("profile-title-show-ctrl-key", profile.title_show_ctrl_key),
-        ("profile-smooth-resize", profile.smooth_resize),
         ("profile-unlimited-scrollback", profile.scrollback_unlimited),
-        ("profile-restore-rows", profile.restore_rows),
         ("profile-run-inside-shell", profile.run_inside_shell),
         ("profile-option-meta", profile.option_as_meta),
-        ("profile-alt-scroll", profile.alternate_screen_scroll),
         ("profile-delete-control-h", profile.delete_sends_control_h),
         ("profile-escape-nonascii", profile.escape_non_ascii),
         ("profile-paste-cr", profile.paste_newlines_as_cr),
-        ("profile-keypad", profile.application_keypad),
         ("profile-scroll-input", profile.scroll_on_input),
         ("profile-audible-bell", profile.audible_bell),
         ("profile-visual-bell", profile.visual_bell),
@@ -3272,6 +3401,25 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
         {
             widget.set_active(value);
         }
+    }
+    sync_profile_control_sensitivity(stack, profile);
+}
+
+fn sync_profile_control_sensitivity(stack: &gtk::Stack, profile: &TerminalProfile) {
+    if let Some(widget) = profile_widget(stack, "profile-run-inside-shell")
+        .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok())
+    {
+        widget.set_sensitive(!profile.shell_command.trim().is_empty());
+    }
+    if let Some(widget) = profile_widget(stack, "profile-exceptions")
+        .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
+    {
+        widget.set_sensitive(profile.ask_before_close_policy == AskBeforeClosePolicy::NonExempt);
+    }
+    if let Some(widget) = profile_widget(stack, "shell-exit-policy")
+        .and_then(|widget| widget.downcast::<gtk::DropDown>().ok())
+    {
+        widget.set_sensitive(profile.close_on_exit != CloseOnExit::Always);
     }
 }
 
@@ -4811,7 +4959,48 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     .profiles
                     .duplicate_profile("Homebrew", "Acceptance Profile");
             }
+            // Keep the selected profile deliberately different from the global
+            // compatibility snapshot. This catches stale editor initialization
+            // and proves that fixed renderer/platform controls do not overwrite
+            // imported profile metadata when the settings window is saved.
+            if let Some(mut homebrew) = state.profiles.profile("Homebrew").cloned() {
+                homebrew.font = "DejaVu Sans Mono".into();
+                homebrew.font_size = 11.0;
+                homebrew.cursor_shape = CursorShape::Block;
+                homebrew.cursor_blink = true;
+                homebrew.scrollback_lines = 9_000;
+                homebrew.terminal_type = "homebrew-term".into();
+                let _ = state.profiles.update_profile(homebrew);
+            }
+            if let Some(mut acceptance) = state.profiles.profile("Acceptance Profile").cloned() {
+                acceptance.font = "Monospace".into();
+                acceptance.font_size = 13.0;
+                acceptance.cursor_shape = CursorShape::IBeam;
+                acceptance.cursor_blink = false;
+                acceptance.scrollback_lines = 20_000;
+                acceptance.terminal_type = "acceptance-term".into();
+                acceptance.antialias = false;
+                acceptance.use_bold_fonts = false;
+                acceptance.use_ansi_colors = false;
+                acceptance.dynamic_colors = false;
+                acceptance.smooth_resize = false;
+                acceptance.restore_rows = true;
+                acceptance.restore_rows_limit = 77_700;
+                acceptance.restore_rows_bookmark = "acceptance-bookmark".into();
+                acceptance.title_show_tty = true;
+                acceptance.title_show_ctrl_key = true;
+                acceptance.tab_title_show_ctrl_key = true;
+                acceptance.application_keypad = false;
+                acceptance.alternate_screen_scroll = false;
+                let _ = state.profiles.update_profile(acceptance);
+            }
             let _ = state.profiles.set_default("Pro");
+            state.settings.font = "Global Poison Font".into();
+            state.settings.font_size = 71.0;
+            state.settings.cursor_shape = CursorShape::Underline;
+            state.settings.cursor_blink = true;
+            state.settings.scrollback_lines = 12_345;
+            state.settings.terminal_type = "global-poison-term".into();
             state.settings.selected_profile = "Acceptance Profile".into();
             state.settings.startup_profile = "Acceptance Profile".into();
             if let Some(session) = state.sessions.active_mut() {
@@ -5057,8 +5246,55 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         if minimum_profile_action_width == i32::MAX {
             minimum_profile_action_width = 0;
         }
+        let profile_font_value = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-font"))
+            .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
+            .map(|widget| widget.text().to_string());
+        let profile_font_loaded = profile_font_value.as_deref() == Some("Monospace");
+        let profile_font_size_value = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-font-size"))
+            .and_then(|widget| widget.downcast::<gtk::SpinButton>().ok())
+            .map(|widget| widget.value());
+        let profile_font_size_loaded =
+            profile_font_size_value.is_some_and(|value| (value - 13.0).abs() < f64::EPSILON);
+        let profile_cursor_shape_value = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-cursor-shape"))
+            .and_then(|widget| widget.downcast::<gtk::DropDown>().ok())
+            .map(|widget| widget.selected());
+        let profile_cursor_shape_loaded = profile_cursor_shape_value == Some(1);
+        let profile_cursor_blink_value = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-cursor-blink"))
+            .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok())
+            .map(|widget| widget.is_active());
+        let profile_cursor_blink_loaded = profile_cursor_blink_value == Some(false);
+        let profile_scrollback_value = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-scrollback"))
+            .and_then(|widget| widget.downcast::<gtk::SpinButton>().ok())
+            .map(|widget| widget.value());
+        let profile_scrollback_loaded =
+            profile_scrollback_value.is_some_and(|value| (value - 20_000.0).abs() < f64::EPSILON);
+        let profile_terminal_type_loaded = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "advanced-terminal-type"))
+            .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
+            .is_some_and(|widget| widget.text() == "acceptance-term");
+        let profile_owned_values_loaded = profile_font_loaded
+            && profile_font_size_loaded
+            && profile_cursor_shape_loaded
+            && profile_cursor_blink_loaded
+            && profile_scrollback_loaded
+            && profile_terminal_type_loaded;
         let mut window_group_editor_interaction = false;
         let mut shell_sensitivity_logic = false;
+        let mut profile_editor_switch_before_save = false;
+        let mut profile_switch_values_loaded = false;
+        let mut renderer_owned_controls_truthful = false;
+        let mut unavailable_controls_truthful = false;
         let global_shell_mode_before_save = state
             .try_borrow()
             .map(|state| state.settings.run_command_inside_shell)
@@ -5228,6 +5464,76 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     }
                 }
             }
+            // Save while a non-active profile is visible. This exercises the
+            // editor transition, commits the profile we just changed, and
+            // proves the legacy Settings snapshot stays tied to the live
+            // Acceptance Profile rather than whichever row is visible.
+            profile_editor_switch_before_save = find_widget_by_name(root, "profile-list")
+                .and_then(|widget| widget.downcast::<gtk::ListBox>().ok())
+                .is_some_and(|list| {
+                    let mut child = list.first_child();
+                    while let Some(widget) = child {
+                        let next = widget.next_sibling();
+                        if let Some(row) = widget.downcast_ref::<gtk::ListBoxRow>() {
+                            if row
+                                .child()
+                                .and_downcast::<gtk::Label>()
+                                .is_some_and(|label| label.text() == "Homebrew")
+                            {
+                                list.select_row(Some(row));
+                                drain_pending_events();
+                                return true;
+                            }
+                        }
+                        child = next;
+                    }
+                    false
+                });
+            profile_switch_values_loaded = find_widget_by_name(root, "profile-font")
+                .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
+                .is_some_and(|widget| widget.text() == "DejaVu Sans Mono")
+                && find_widget_by_name(root, "profile-font-size")
+                    .and_then(|widget| widget.downcast::<gtk::SpinButton>().ok())
+                    .is_some_and(|widget| (widget.value() - 11.0).abs() < f64::EPSILON)
+                && find_widget_by_name(root, "profile-cursor-shape")
+                    .and_then(|widget| widget.downcast::<gtk::DropDown>().ok())
+                    .is_some_and(|widget| widget.selected() == 0)
+                && find_widget_by_name(root, "profile-cursor-blink")
+                    .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok())
+                    .is_some_and(|widget| widget.is_active())
+                && find_widget_by_name(root, "profile-scrollback")
+                    .and_then(|widget| widget.downcast::<gtk::SpinButton>().ok())
+                    .is_some_and(|widget| (widget.value() - 9_000.0).abs() < f64::EPSILON)
+                && find_widget_by_name(root, "advanced-terminal-type")
+                    .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
+                    .is_some_and(|widget| widget.text() == "homebrew-term");
+            renderer_owned_controls_truthful = [
+                "profile-antialias",
+                "profile-use-bold-fonts",
+                "profile-use-ansi",
+                "profile-dynamic-colors",
+                "profile-smooth-resize",
+                "profile-alt-scroll",
+                "profile-keypad",
+            ]
+            .into_iter()
+            .all(|name| {
+                find_widget_by_name(root, name)
+                    .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok())
+                    .is_some_and(|widget| widget.is_active() && !widget.is_sensitive())
+            });
+            unavailable_controls_truthful = [
+                "profile-tab-show-ctrl-key",
+                "profile-title-show-tty",
+                "profile-title-show-ctrl-key",
+                "profile-restore-rows",
+            ]
+            .into_iter()
+            .all(|name| {
+                find_widget_by_name(root, name)
+                    .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok())
+                    .is_some_and(|widget| !widget.is_active() && !widget.is_sensitive())
+            });
             if let Some(save) = find_widget_by_name(root, "settings-save")
                 .and_then(|widget| widget.downcast::<gtk::Button>().ok())
             {
@@ -5297,6 +5603,34 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     && profile.background == "#1a334dff"
             })
             .unwrap_or(false);
+        let non_editable_profile_values_preserved = restored_profiles
+            .as_ref()
+            .and_then(|store| store.profile("Acceptance Profile"))
+            .is_some_and(|profile| {
+                !profile.antialias
+                    && !profile.use_bold_fonts
+                    && !profile.use_ansi_colors
+                    && !profile.dynamic_colors
+                    && !profile.smooth_resize
+                    && profile.restore_rows
+                    && profile.restore_rows_limit == 77_700
+                    && profile.restore_rows_bookmark == "acceptance-bookmark"
+                    && profile.title_show_tty
+                    && profile.title_show_ctrl_key
+                    && profile.tab_title_show_ctrl_key
+                    && !profile.application_keypad
+                    && !profile.alternate_screen_scroll
+            });
+        let compatibility_fields_preserved = {
+            let saved = Settings::load_user();
+            saved.selected_profile == "Acceptance Profile"
+                && saved.font == "Monospace"
+                && (saved.font_size - 13.0).abs() < f64::EPSILON
+                && saved.cursor_shape == CursorShape::IBeam
+                && !saved.cursor_blink
+                && saved.scrollback_lines == 20_000
+                && saved.terminal_type == "acceptance-term"
+        };
         let shell_policy_consolidated = restored_profiles
             .as_ref()
             .and_then(|store| store.profile("Acceptance Profile"))
@@ -5433,6 +5767,13 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && profile_count > 0
             && profile_file_written
             && profile_round_trip
+            && profile_owned_values_loaded
+            && non_editable_profile_values_preserved
+            && profile_editor_switch_before_save
+            && profile_switch_values_loaded
+            && renderer_owned_controls_truthful
+            && unavailable_controls_truthful
+            && compatibility_fields_preserved
             && shell_policy_consolidated
             && global_shell_mode_preserved
             && shell_sensitivity_logic
@@ -5465,7 +5806,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && protected_sibling_preserved
             && close_probe_cleanup;
         let report = format!(
-            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
+            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
@@ -5485,6 +5826,24 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             profile_count,
             profile_file_written,
             profile_round_trip,
+            profile_owned_values_loaded,
+            profile_font_loaded,
+            profile_font_value,
+            profile_font_size_loaded,
+            profile_font_size_value,
+            profile_cursor_shape_loaded,
+            profile_cursor_shape_value,
+            profile_cursor_blink_loaded,
+            profile_cursor_blink_value,
+            profile_scrollback_loaded,
+            profile_scrollback_value,
+            profile_terminal_type_loaded,
+            non_editable_profile_values_preserved,
+            profile_editor_switch_before_save,
+            profile_switch_values_loaded,
+            renderer_owned_controls_truthful,
+            unavailable_controls_truthful,
+            compatibility_fields_preserved,
             shell_policy_consolidated,
             global_shell_mode_preserved,
             shell_sensitivity_logic,
