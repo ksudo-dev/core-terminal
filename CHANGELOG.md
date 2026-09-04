@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Separated startup, new-window, new-tab, and window-group launch policies so
+  one path cannot silently override another.
+- Made same-profile tabs follow the active tab and preserve the chosen working
+  directory in the session model.
+- Kept startup-profile changes independent from live tabs when Settings is
+  saved, and reapplied edited runtime profile properties to every matching tab.
+- Preserved the saved default profile while switching tabs, and kept unrelated
+  startup choices stable when custom profiles are removed.
+- Added the missing startup-profile choice to the new-window policy control.
+
 ## 0.2.1
 
 Released 2026-09-03.

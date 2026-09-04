@@ -39,8 +39,10 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        settings_page_ids, window_group_entry_summary, WindowGroupEntry, APPLICATION_ID,
-        PROFILE_PAGE_IDS,
+        resolve_new_tab_profile, resolve_window_profile, runtime_profile_requires_reapply,
+        runtime_terminal_settings_changed, settings_page_ids, startup_profile_after_deletion,
+        window_group_entry_summary, ProfileStore, SessionManager, Settings, WindowGroupEntry,
+        APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -76,6 +78,119 @@ mod structural_tests {
             window_group_entry_summary(1, &entry),
             "Tab 2: Homebrew — /srv/project — 100×32"
         );
+        let spec = super::TabLaunchSpec::from_window_group_entry(entry);
+        assert_eq!(spec.profile_name, "Homebrew");
+        assert_eq!(spec.working_directory.as_deref(), Some("/srv/project"));
+        assert_eq!(spec.size, Some((100, 32)));
+    }
+
+    #[test]
+    fn initial_window_profile_is_independent_from_new_tab_policy() {
+        let profiles = ProfileStore::defaults();
+        let settings = Settings {
+            startup_profile: "Homebrew".into(),
+            new_window_profile: "Pro".into(),
+            new_tab_profile: "Ocean".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            resolve_window_profile(&settings, &profiles, false),
+            "Homebrew"
+        );
+        assert_eq!(resolve_window_profile(&settings, &profiles, true), "Pro");
+    }
+
+    #[test]
+    fn default_new_window_policy_uses_startup_profile() {
+        let profiles = ProfileStore::defaults();
+        let settings = Settings {
+            startup_profile: "Ocean".into(),
+            new_window_profile: "default".into(),
+            ..Settings::default()
+        };
+        assert_eq!(resolve_window_profile(&settings, &profiles, true), "Ocean");
+    }
+
+    #[test]
+    fn missing_explicit_new_window_profile_falls_back_to_startup() {
+        let mut profiles = ProfileStore::defaults();
+        profiles.set_default("Pro").unwrap();
+        let settings = Settings {
+            selected_profile: "Homebrew".into(),
+            startup_profile: "Ocean".into(),
+            new_window_profile: "Missing profile".into(),
+            ..Settings::default()
+        };
+        assert_eq!(resolve_window_profile(&settings, &profiles, true), "Ocean");
+        assert_eq!(profiles.default_profile_name(), "Pro");
+    }
+
+    #[test]
+    fn same_new_tab_policy_uses_the_active_tabs_profile() {
+        let profiles = ProfileStore::defaults();
+        let settings = Settings {
+            selected_profile: "Homebrew".into(),
+            startup_profile: "Homebrew".into(),
+            new_tab_profile: "same".into(),
+            ..Settings::default()
+        };
+        let mut sessions = SessionManager::empty();
+        sessions.open_tab("Ocean", Some("/tmp/project"));
+        assert_eq!(
+            resolve_new_tab_profile(&settings, &sessions, &profiles),
+            "Ocean"
+        );
+    }
+
+    #[test]
+    fn explicit_new_tab_profile_wins_and_invalid_values_fall_back_to_active() {
+        let profiles = ProfileStore::defaults();
+        let mut sessions = SessionManager::empty();
+        sessions.open_tab("Ocean", None);
+        let mut settings = Settings {
+            new_tab_profile: "Pro".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            resolve_new_tab_profile(&settings, &sessions, &profiles),
+            "Pro"
+        );
+        settings.new_tab_profile = "Missing profile".into();
+        assert_eq!(
+            resolve_new_tab_profile(&settings, &sessions, &profiles),
+            "Ocean"
+        );
+    }
+
+    #[test]
+    fn startup_only_changes_do_not_require_live_terminal_reconfiguration() {
+        let before = Settings::default();
+        let mut after = before.clone();
+        after.startup_profile = "Ocean".into();
+        after.new_window_profile = "Pro".into();
+        assert!(!runtime_terminal_settings_changed(&before, &after));
+        after.scroll_on_input = !before.scroll_on_input;
+        assert!(runtime_terminal_settings_changed(&before, &after));
+    }
+
+    #[test]
+    fn reassigned_tabs_always_receive_their_fallback_profiles() {
+        assert!(runtime_profile_requires_reapply(false, false, true));
+        assert!(runtime_profile_requires_reapply(false, true, false));
+        assert!(runtime_profile_requires_reapply(true, false, false));
+        assert!(!runtime_profile_requires_reapply(false, false, false));
+    }
+
+    #[test]
+    fn deleting_profiles_preserves_an_unrelated_startup_choice() {
+        assert_eq!(
+            startup_profile_after_deletion(Some("Ocean"), "Custom", "Homebrew"),
+            "Ocean"
+        );
+        assert_eq!(
+            startup_profile_after_deletion(Some("Custom"), "Custom", "Homebrew"),
+            "Homebrew"
+        );
     }
 }
 
@@ -109,12 +224,12 @@ pub fn build_header_bar() -> gtk::HeaderBar {
     bar
 }
 
-pub fn profile_selector(store: &ProfileStore) -> gtk::DropDown {
+pub fn profile_selector(store: &ProfileStore, active_name: &str) -> gtk::DropDown {
     let names = store.names().collect::<Vec<_>>();
     let model = gtk::StringList::new(&names);
     let dropdown = gtk::DropDown::new(Some(model), None::<&gtk::Expression>);
     dropdown.add_css_class("core-profile-selector");
-    if let Some(index) = names.iter().position(|name| *name == store.selected_name()) {
+    if let Some(index) = names.iter().position(|name| *name == active_name) {
         dropdown.set_selected(index as u32);
     }
     dropdown
@@ -279,13 +394,6 @@ where
                                 model.append(&imported_name);
                             }
                         }
-                        if let Some(model) = &model {
-                            if let Some(index) = (0..model.n_items()).find(|index| {
-                                model.string(*index).as_deref() == Some(imported_name.as_str())
-                            }) {
-                                startup.set_selected(index);
-                            }
-                        }
                         append_dropdown_value(&new_window, &imported_name);
                         append_dropdown_value(&new_tab, &imported_name);
                         append_dropdown_value(&group_profile, &imported_name);
@@ -371,7 +479,6 @@ where
         if add_store.borrow_mut().add_profile(profile).is_ok() {
             if let Some(model) = add_startup.model().and_downcast::<gtk::StringList>() {
                 model.append(&name);
-                add_startup.set_selected(model.n_items().saturating_sub(1));
             }
             append_dropdown_value(&add_new_window, &name);
             append_dropdown_value(&add_new_tab, &name);
@@ -405,7 +512,6 @@ where
         {
             if let Some(model) = duplicate_startup.model().and_downcast::<gtk::StringList>() {
                 model.append(&name);
-                duplicate_startup.set_selected(model.n_items().saturating_sub(1));
             }
             append_dropdown_value(&duplicate_new_window, &name);
             append_dropdown_value(&duplicate_new_tab, &name);
@@ -441,14 +547,24 @@ where
             );
             return;
         }
+        let startup_before_delete = dropdown_text(&delete_startup);
         match delete_store.borrow_mut().delete_profile(&name) {
             Ok(_) => {
+                let default_after_delete = delete_store.borrow().selected_name().to_owned();
                 if let Some(model) = delete_startup.model().and_downcast::<gtk::StringList>() {
-                    if let Some(index) = (0..model.n_items())
-                        .find(|index| model.string(*index).as_deref() == Some(name.as_str()))
-                    {
+                    if let Some(index) = string_list_position(&model, &name) {
                         model.remove(index);
-                        delete_startup.set_selected(index.saturating_sub(1));
+                        let desired = startup_profile_after_deletion(
+                            startup_before_delete.as_deref(),
+                            &name,
+                            &default_after_delete,
+                        );
+                        let fallback_index = index
+                            .saturating_sub(1)
+                            .min(model.n_items().saturating_sub(1));
+                        delete_startup.set_selected(
+                            string_list_position(&model, &desired).unwrap_or(fallback_index),
+                        );
                         if let Some(row) = list_box_row_with_label(&delete_list, &name) {
                             delete_list.remove(&row);
                         }
@@ -517,7 +633,7 @@ where
             Some("Underline") => CursorShape::Underline,
             _ => CursorShape::Block,
         };
-        let selected_profile = controls
+        let startup_profile = controls
             .startup_profile
             .selected_item()
             .and_then(|item| item.downcast::<gtk::StringObject>().ok())
@@ -572,7 +688,7 @@ where
         on_save(
             Settings {
                 schema_version: CURRENT_SCHEMA_VERSION,
-                startup_profile: selected_profile.clone(),
+                startup_profile,
                 startup_window_group: if controls.use_startup_group.is_active() {
                     dropdown_text(&controls.startup_window_group)
                         .filter(|name| name != "No groups saved")
@@ -580,9 +696,12 @@ where
                 } else {
                     String::new()
                 },
-                selected_profile,
-                new_window_profile: dropdown_value(&controls.new_window_profile, "Default profile"),
-                new_tab_profile: dropdown_value(&controls.new_tab_profile, "Same as startup"),
+                // The settings profile editor and the startup picker are
+                // separate concerns. Saving startup preferences must never
+                // switch a live terminal session to that profile.
+                selected_profile: initial.selected_profile.clone(),
+                new_window_profile: dropdown_value(&controls.new_window_profile, "Startup profile"),
+                new_tab_profile: dropdown_value(&controls.new_tab_profile, "Same as current tab"),
                 new_window_same_directory: controls.new_window_same_directory.is_active(),
                 font: controls.font.text().to_string(),
                 font_size: controls.font_size.value(),
@@ -802,21 +921,28 @@ impl SettingsControls {
         let ctrl_number_tabs = check("Enable Ctrl+1–9 tab switching", settings.ctrl_number_tabs);
         ctrl_number_tabs.set_widget_name("ctrl-number-tabs");
         general_grid.attach(&ctrl_number_tabs, 1, 7, 1, 1);
-        let profile_policy_names = profile_names.iter().map(String::as_str).collect::<Vec<_>>();
+        let profile_policy_names = std::iter::once("Startup profile")
+            .chain(profile_names.iter().map(String::as_str))
+            .collect::<Vec<_>>();
         let new_window_profile = gtk::DropDown::new(
             Some(gtk::StringList::new(&profile_policy_names)),
             None::<&gtk::Expression>,
         );
         new_window_profile.set_widget_name("new-window-profile");
-        let new_window_index = profile_names
-            .iter()
-            .position(|name| name == &settings.new_window_profile)
-            .unwrap_or(0);
+        let new_window_index = if settings.new_window_profile == "default" {
+            0
+        } else {
+            profile_names
+                .iter()
+                .position(|name| name == &settings.new_window_profile)
+                .map(|index| index + 1)
+                .unwrap_or(0)
+        };
         new_window_profile.set_selected(new_window_index as u32);
         let new_window_label = field_label("New window profile");
         general_grid.attach(&new_window_label, 0, 8, 1, 1);
         general_grid.attach(&new_window_profile, 1, 8, 1, 1);
-        let new_tab_policy_names = std::iter::once("Same as startup")
+        let new_tab_policy_names = std::iter::once("Same as current tab")
             .chain(profile_names.iter().map(String::as_str))
             .collect::<Vec<_>>();
         let new_tab_profile = gtk::DropDown::new(
@@ -3099,8 +3225,8 @@ fn dropdown_value(dropdown: &gtk::DropDown, fallback: &str) -> String {
         .map(|item| item.string().to_string())
         .unwrap_or_else(|| fallback.to_owned());
     match value.as_str() {
-        "Default profile" => "default".into(),
-        "Same as startup" => "same".into(),
+        "Default profile" | "Startup profile" => "default".into(),
+        "Same as startup" | "Same as current tab" => "same".into(),
         _ => value,
     }
 }
@@ -3114,6 +3240,17 @@ fn dropdown_text(dropdown: &gtk::DropDown) -> Option<String> {
 
 fn string_list_position(model: &gtk::StringList, value: &str) -> Option<u32> {
     (0..model.n_items()).find(|index| model.string(*index).as_deref() == Some(value))
+}
+
+fn startup_profile_after_deletion(
+    startup_before_delete: Option<&str>,
+    deleted_profile: &str,
+    default_after_delete: &str,
+) -> String {
+    startup_before_delete
+        .filter(|name| *name != deleted_profile)
+        .unwrap_or(default_after_delete)
+        .to_owned()
 }
 
 fn append_dropdown_value(dropdown: &gtk::DropDown, value: &str) {
@@ -3299,7 +3436,81 @@ struct UiState {
     window: gtk::ApplicationWindow,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
-    pending_working_directory: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TabLaunchSpec {
+    profile_name: String,
+    working_directory: Option<String>,
+    size: Option<(u32, u32)>,
+}
+
+impl TabLaunchSpec {
+    fn new(profile_name: impl Into<String>, working_directory: Option<String>) -> Self {
+        Self {
+            profile_name: profile_name.into(),
+            working_directory,
+            size: None,
+        }
+    }
+
+    fn from_window_group_entry(entry: WindowGroupEntry) -> Self {
+        Self {
+            profile_name: entry.profile,
+            working_directory: entry.working_directory,
+            size: Some((entry.columns, entry.rows)),
+        }
+    }
+}
+
+fn resolve_window_profile(
+    settings: &Settings,
+    profiles: &ProfileStore,
+    new_window: bool,
+) -> String {
+    let requested = if new_window && settings.new_window_profile != "default" {
+        settings.new_window_profile.as_str()
+    } else {
+        settings.startup_profile.as_str()
+    };
+    [
+        requested,
+        settings.startup_profile.as_str(),
+        settings.selected_profile.as_str(),
+        profiles.selected_name(),
+    ]
+    .into_iter()
+    .find(|name| profiles.profile(name).is_some())
+    .unwrap_or(profiles.selected_name())
+    .to_owned()
+}
+
+fn resolve_new_tab_profile(
+    settings: &Settings,
+    sessions: &SessionManager,
+    profiles: &ProfileStore,
+) -> String {
+    let configured = (settings.new_tab_profile != "same")
+        .then_some(settings.new_tab_profile.as_str())
+        .filter(|name| profiles.profile(name).is_some());
+    let active = sessions
+        .active()
+        .map(|tab| tab.profile_name.as_str())
+        .filter(|name| profiles.profile(name).is_some());
+    configured
+        .or(active)
+        .or_else(|| {
+            profiles
+                .profile(&settings.selected_profile)
+                .map(|_| settings.selected_profile.as_str())
+        })
+        .or_else(|| {
+            profiles
+                .profile(&settings.startup_profile)
+                .map(|_| settings.startup_profile.as_str())
+        })
+        .unwrap_or(profiles.selected_name())
+        .to_owned()
 }
 
 /// Start the GTK application.  The application keeps terminal/session state
@@ -3330,23 +3541,15 @@ fn build_window_with_directory(
     pending_working_directory: Option<String>,
 ) {
     gtk::Window::set_default_icon_name(APPLICATION_ID);
-    let mut profiles = load_user_profiles();
+    let profiles = load_user_profiles();
     let mut settings = Settings::load_user();
-    let requested_profile = if new_window && settings.new_window_profile != "default" {
-        settings.new_window_profile.clone()
-    } else {
-        settings.startup_profile.clone()
-    };
-    if profiles.select(&requested_profile) {
-        settings.selected_profile = requested_profile;
-    } else if !profiles.select(&settings.selected_profile) {
-        settings.selected_profile = profiles.selected_name().to_owned();
-    }
+    let requested_profile = resolve_window_profile(&settings, &profiles, new_window);
+    settings.selected_profile = requested_profile.clone();
     // Materialize first-launch defaults so Homebrew and the initial window
     // geometry can be verified and restored even if the first session ends
     // unexpectedly.
     let _ = settings.save_user();
-    let profile_dropdown = profile_selector(&profiles);
+    let profile_dropdown = profile_selector(&profiles, &requested_profile);
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title(display_name)
@@ -3371,7 +3574,6 @@ fn build_window_with_directory(
         window: window.clone(),
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
-        pending_working_directory,
     }));
 
     let header = build_header_bar();
@@ -3424,9 +3626,6 @@ fn build_window_with_directory(
         let Ok(mut state) = profile_state.try_borrow_mut() else {
             return;
         };
-        if !state.profiles.select(&name) {
-            return;
-        }
         let width = state.settings.window_width;
         let height = state.settings.window_height;
         let Some(profile) = state.profiles.profile(&name).cloned() else {
@@ -3474,6 +3673,7 @@ fn build_window_with_directory(
         } else {
             None
         };
+        sync_active_profile_ui(&visible_state);
         if let Some(terminal) = terminal {
             if let Some(page_child) = stack_page_child(stack, &terminal) {
                 stack.page(&page_child).set_needs_attention(false);
@@ -3497,7 +3697,10 @@ fn build_window_with_directory(
     if let Some(group) = startup_group {
         launch_window_group(&state, group);
     } else {
-        open_tab(&state);
+        open_tab_with_spec(
+            &state,
+            TabLaunchSpec::new(requested_profile, pending_working_directory),
+        );
     }
 
     let close_state = state.clone();
@@ -3562,9 +3765,12 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     .profiles
                     .duplicate_profile("Homebrew", "Acceptance Profile");
             }
-            state.profiles.select("Acceptance Profile");
+            let _ = state.profiles.set_default("Pro");
             state.settings.selected_profile = "Acceptance Profile".into();
             state.settings.startup_profile = "Acceptance Profile".into();
+            if let Some(session) = state.sessions.active_mut() {
+                session.profile_name = "Acceptance Profile".into();
+            }
             if state.profiles.window_group("Acceptance Group").is_none() {
                 let _ = state.profiles.add_window_group(WindowGroup {
                     name: "Acceptance Group".into(),
@@ -3602,6 +3808,16 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             }
         }
         let settings = show_settings_for_state(&state);
+        let (active_before_settings_save, session_count_before_settings_save) = state
+            .try_borrow()
+            .map(|state| {
+                let active = state
+                    .sessions
+                    .active()
+                    .map(|tab| (tab.id, tab.profile_name.clone(), tab.child_pid));
+                (active, state.sessions.tabs().len())
+            })
+            .unwrap_or((None, 0));
         let mut missing = Vec::new();
         let root = settings.child();
         let top_stack = root.as_ref().and_then(|root| {
@@ -3872,12 +4088,57 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             {
                 toggle.set_active(!toggle.is_active());
             }
+            if let Some(startup) = find_widget_by_name(root, "startup-profile")
+                .and_then(|widget| widget.downcast::<gtk::DropDown>().ok())
+            {
+                if let Some(model) = startup.model().and_downcast::<gtk::StringList>() {
+                    if let Some(index) = string_list_position(&model, "Ocean") {
+                        startup.set_selected(index);
+                    }
+                }
+            }
             if let Some(save) = find_widget_by_name(root, "settings-save")
                 .and_then(|widget| widget.downcast::<gtk::Button>().ok())
             {
                 save.emit_clicked();
             }
         }
+        let (active_session_preserved, startup_profile_independent, profile_default_preserved) =
+            state
+                .try_borrow()
+                .map(|state| {
+                    let active_after = state
+                        .sessions
+                        .active()
+                        .map(|tab| (tab.id, tab.profile_name.clone(), tab.child_pid));
+                    let active_identity_preserved =
+                        match (&active_before_settings_save, &active_after) {
+                            (
+                                Some((before_id, before_profile, before_pid)),
+                                Some((after_id, after_profile, after_pid)),
+                            ) => {
+                                before_id == after_id
+                                    && before_profile == after_profile
+                                    && (before_pid.is_none() || before_pid == after_pid)
+                            }
+                            _ => false,
+                        };
+                    (
+                        active_identity_preserved
+                            && state.sessions.tabs().len() == session_count_before_settings_save,
+                        state.settings.startup_profile == "Ocean"
+                            && state.settings.selected_profile == "Acceptance Profile",
+                        state.profiles.default_profile_name() == "Pro",
+                    )
+                })
+                .unwrap_or((false, false, false));
+        open_tab(&state);
+        let same_profile_new_tab = state
+            .try_borrow()
+            .ok()
+            .and_then(|state| state.sessions.active().map(|tab| tab.profile_name.clone()))
+            .as_deref()
+            == Some("Acceptance Profile");
         let profile_file_written = ProfileStore::config_path()
             .map(|path| path.is_file())
             .unwrap_or(false);
@@ -3929,6 +4190,49 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     && terminal.cjk_ambiguous_width() == 2
                     && !terminal.is_mouse_autohide()
             });
+        let (group_to_launch, sessions_before_group) = state
+            .try_borrow_mut()
+            .map(|mut state| {
+                // Deliberately conflict with the group's profiles: explicit
+                // group entries must win over normal new-tab policy.
+                state.settings.new_tab_profile = "Ocean".into();
+                (
+                    state.profiles.window_group("Acceptance Group").cloned(),
+                    state.sessions.tabs().len(),
+                )
+            })
+            .unwrap_or((None, 0));
+        let group_launch_explicit = group_to_launch.is_some_and(|group| {
+            let expected = group.entries.clone();
+            launch_window_group(&state, group);
+            state.try_borrow().is_ok_and(|state| {
+                let launched = state.sessions.tabs().get(sessions_before_group..);
+                launched.is_some_and(|launched| {
+                    launched.len() == expected.len()
+                        && launched.iter().zip(&expected).all(|(tab, entry)| {
+                            tab.profile_name == entry.profile
+                                && tab.working_directory == entry.working_directory
+                        })
+                })
+            })
+        });
+        let active_profile_synced_after_close = state
+            .try_borrow()
+            .ok()
+            .and_then(|state| state.sessions.active().map(|tab| tab.id))
+            .is_some_and(|id| {
+                force_close_tab(&state, id);
+                state.try_borrow().is_ok_and(|state| {
+                    let Some(active_profile) =
+                        state.sessions.active().map(|tab| tab.profile_name.as_str())
+                    else {
+                        return false;
+                    };
+                    let selected_name = dropdown_text(&state.profile_dropdown);
+                    state.settings.selected_profile == active_profile
+                        && selected_name.as_deref() == Some(active_profile)
+                })
+            });
         let passed = missing.is_empty()
             && safe_terminals
             && non_modal
@@ -3945,12 +4249,18 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && window_group_round_trip
             && standard_mappings_present
             && encoding_rows_present
-            && runtime_profile_applied;
+            && runtime_profile_applied
+            && active_session_preserved
+            && startup_profile_independent
+            && profile_default_preserved
+            && same_profile_new_tab
+            && group_launch_explicit
+            && active_profile_synced_after_close;
         let report_path = std::env::var_os("CORE_TERMINAL_ACCEPTANCE_REPORT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| Path::new("/tmp/core-terminal-acceptance.json").to_path_buf());
         let report = format!(
-            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={}\n",
+            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
@@ -3975,6 +4285,12 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             standard_mappings_present,
             encoding_rows_present,
             runtime_profile_applied,
+            active_session_preserved,
+            startup_profile_independent,
+            profile_default_preserved,
+            same_profile_new_tab,
+            group_launch_explicit,
+            active_profile_synced_after_close,
         );
         let _ = std::fs::write(report_path, report);
         settings.close();
@@ -4100,7 +4416,7 @@ fn install_window_actions(
 }
 
 fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
-    let (parent, settings, profiles) = {
+    let (parent, mut settings, profiles) = {
         let state = state.borrow();
         (
             state.window.clone().upcast::<gtk::Window>(),
@@ -4108,6 +4424,15 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
             state.profiles.clone(),
         )
     };
+    if let Some(active_profile) = state
+        .borrow()
+        .sessions
+        .active()
+        .map(|tab| tab.profile_name.clone())
+        .filter(|name| profiles.profile(name).is_some())
+    {
+        settings.selected_profile = active_profile.clone();
+    }
     let save_state = state.clone();
     let launch_state = state.clone();
     show_settings(
@@ -4117,40 +4442,71 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
         move |new_settings, profiles| {
             let mut state = save_state.borrow_mut();
             let mut new_settings = new_settings.normalize();
+            let old_settings = state.settings.clone();
+            let old_profiles = state.profiles.clone();
+            let global_runtime_changed =
+                runtime_terminal_settings_changed(&old_settings, &new_settings);
             state.profiles = profiles;
-            if !state.profiles.select(&new_settings.selected_profile) {
-                new_settings.selected_profile = state.profiles.selected_name().to_owned();
+            let fallback_profile = if state
+                .profiles
+                .profile(&new_settings.startup_profile)
+                .is_some()
+            {
+                new_settings.startup_profile.clone()
+            } else {
+                state.profiles.selected_name().to_owned()
+            };
+            let assignments = state
+                .sessions
+                .tabs()
+                .iter()
+                .map(|tab| (tab.id, tab.profile_name.clone()))
+                .collect::<Vec<_>>();
+            let mut reassigned_sessions = Vec::new();
+            for (id, profile_name) in assignments {
+                if state.profiles.profile(&profile_name).is_none() {
+                    state.sessions.set_profile(id, fallback_profile.clone());
+                    reassigned_sessions.push(id.get());
+                }
             }
-            state.settings = new_settings;
-            let selected_profile = state.settings.selected_profile.clone();
-            if let Some(session) = state.sessions.active_mut() {
-                session.profile_name = selected_profile;
-            }
+            let active_profile = state
+                .sessions
+                .active()
+                .map(|tab| tab.profile_name.clone())
+                .filter(|name| state.profiles.profile(name).is_some())
+                .unwrap_or_else(|| fallback_profile.clone());
+            new_settings.selected_profile = active_profile.clone();
+            state.settings = new_settings.clone();
             if let Some(index) = state
                 .profiles
                 .names()
-                .position(|name| name == state.settings.selected_profile)
+                .position(|name| name == active_profile)
             {
                 state.profile_dropdown.set_selected(index as u32);
-            };
-            let profile = state
-                .profiles
-                .profile(&state.settings.selected_profile)
-                .cloned();
-            let active = state.sessions.active().and_then(|tab| {
-                state
-                    .terminals
-                    .get(&tab.id.get())
-                    .cloned()
-                    .map(|terminal| (tab.id, terminal))
-            });
-            if let (Some((_, terminal)), Some(profile)) = (&active, profile) {
-                apply_profile(terminal, &profile, &state.settings);
             }
             let _ = state.settings.save_user();
             save_user_profiles(&state.profiles);
+            let terminals = state
+                .sessions
+                .tabs()
+                .iter()
+                .filter_map(|tab| {
+                    let profile = state.profiles.profile(&tab.profile_name)?.clone();
+                    let profile_changed = old_profiles.profile(&tab.profile_name) != Some(&profile);
+                    let assignment_changed = reassigned_sessions.contains(&tab.id.get());
+                    if !runtime_profile_requires_reapply(
+                        global_runtime_changed,
+                        profile_changed,
+                        assignment_changed,
+                    ) {
+                        return None;
+                    }
+                    Some((tab.id, state.terminals.get(&tab.id.get())?.clone(), profile))
+                })
+                .collect::<Vec<_>>();
             drop(state);
-            if let Some((id, terminal)) = active {
+            for (id, terminal, profile) in terminals {
+                reapply_profile_without_resize(&terminal, &profile, &new_settings);
                 update_tab_title(&save_state, id, &terminal);
             }
         },
@@ -4158,52 +4514,15 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
     )
 }
 
-/// Launch every entry in a saved group through the normal tab/PTY path. The
-/// one-shot directory slot keeps group entries independent from the current
-/// tab-directory preference and is consumed by `open_tab` exactly once.
+/// Launch every entry in a saved group through the explicit tab/PTY path.
+/// Group entries never mutate or depend on normal new-tab preferences.
 fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
-    let (old_profile, old_new_tab_profile, old_same_directory) = {
-        let state = state.borrow();
-        (
-            state.settings.selected_profile.clone(),
-            state.settings.new_tab_profile.clone(),
-            state.settings.new_tab_same_directory,
-        )
-    };
     for entry in group.entries {
-        let valid = {
-            let mut state = state.borrow_mut();
-            if state.profiles.profile(&entry.profile).is_none() {
-                false
-            } else {
-                state.profiles.select(&entry.profile);
-                state.settings.selected_profile = entry.profile.clone();
-                state.settings.new_tab_profile = "same".to_owned();
-                state.settings.new_tab_same_directory = false;
-                state.pending_working_directory = entry.working_directory.clone();
-                true
-            }
-        };
-        if !valid {
+        if state.borrow().profiles.profile(&entry.profile).is_none() {
             continue;
         }
-        open_tab(state);
-        let mut state = state.borrow_mut();
-        if let Some(tab) = state.sessions.active() {
-            let id = tab.id;
-            state
-                .sessions
-                .set_working_directory(id, entry.working_directory.as_deref());
-            if let Some(terminal) = state.terminals.get(&id.get()) {
-                terminal.set_size(entry.columns as i64, entry.rows as i64);
-            }
-        }
+        open_tab_with_spec(state, TabLaunchSpec::from_window_group_entry(entry));
     }
-    let mut state = state.borrow_mut();
-    state.settings.selected_profile = old_profile.clone();
-    state.settings.new_tab_profile = old_new_tab_profile;
-    state.settings.new_tab_same_directory = old_same_directory;
-    state.profiles.select(&old_profile);
 }
 
 fn restore_default_profiles(state: &Rc<RefCell<UiState>>) {
@@ -4313,30 +4632,51 @@ fn active_terminal(state: &UiState) -> Option<vte4::Terminal> {
         .cloned()
 }
 
+fn sync_active_profile_ui(state: &Rc<RefCell<UiState>>) {
+    let Some((dropdown, index)) = (|| {
+        let mut state = state.try_borrow_mut().ok()?;
+        let profile_name = state.sessions.active()?.profile_name.clone();
+        state.profiles.profile(&profile_name)?;
+        state.settings.selected_profile = profile_name.clone();
+        let index = state
+            .profiles
+            .names()
+            .position(|name| name == profile_name)? as u32;
+        Some((state.profile_dropdown.clone(), index))
+    })() else {
+        return;
+    };
+    if dropdown.selected() != index {
+        dropdown.set_selected(index);
+    }
+}
+
 fn switch_tab(state: &Rc<RefCell<UiState>>, next: bool) {
-    let mut state = state.borrow_mut();
+    let mut state_mut = state.borrow_mut();
     let id = if next {
-        state.sessions.next_tab().map(|tab| tab.id)
+        state_mut.sessions.next_tab().map(|tab| tab.id)
     } else {
-        state.sessions.previous_tab().map(|tab| tab.id)
+        state_mut.sessions.previous_tab().map(|tab| tab.id)
     };
     if let Some(id) = id {
-        state
-            .stack
-            .set_visible_child_name(&format!("tab-{}", id.get()));
+        let stack = state_mut.stack.clone();
+        drop(state_mut);
+        stack.set_visible_child_name(&format!("tab-{}", id.get()));
+        sync_active_profile_ui(state);
     }
 }
 
 fn switch_tab_index(state: &Rc<RefCell<UiState>>, index: usize) {
-    let mut state = state.borrow_mut();
-    let Some(tab) = state.sessions.tabs().get(index) else {
+    let mut state_mut = state.borrow_mut();
+    let Some(tab) = state_mut.sessions.tabs().get(index) else {
         return;
     };
     let id = tab.id;
-    state.sessions.select_tab(index);
-    state
-        .stack
-        .set_visible_child_name(&format!("tab-{}", id.get()));
+    state_mut.sessions.select_tab(index);
+    let stack = state_mut.stack.clone();
+    drop(state_mut);
+    stack.set_visible_child_name(&format!("tab-{}", id.get()));
+    sync_active_profile_ui(state);
 }
 
 fn close_current_tab(state: &Rc<RefCell<UiState>>) {
@@ -4360,29 +4700,42 @@ fn tab_id(name: &str) -> Option<SessionId> {
 
 #[allow(deprecated)]
 fn open_tab(state: &Rc<RefCell<UiState>>) {
-    let (id, terminal, spawn_options) = {
-        let mut state_mut = state.borrow_mut();
-        let profile_name = if state_mut.settings.new_tab_profile != "same"
-            && state_mut
-                .profiles
-                .profile(&state_mut.settings.new_tab_profile)
-                .is_some()
-        {
-            state_mut.settings.new_tab_profile.clone()
-        } else {
-            state_mut.profiles.selected_name().to_owned()
-        };
-        let working_directory = state_mut.pending_working_directory.take().or_else(|| {
-            if state_mut.settings.new_tab_same_directory {
-                state_mut
+    let spec = {
+        let state = state.borrow();
+        let profile_name =
+            resolve_new_tab_profile(&state.settings, &state.sessions, &state.profiles);
+        let working_directory = state
+            .settings
+            .new_tab_same_directory
+            .then(|| {
+                state
                     .sessions
                     .active()
                     .and_then(|tab| tab.working_directory.clone())
-            } else {
-                None
-            }
-        });
-        let id = state_mut.sessions.open_tab(&profile_name, None);
+            })
+            .flatten();
+        TabLaunchSpec::new(profile_name, working_directory)
+    };
+    open_tab_with_spec(state, spec);
+}
+
+#[allow(deprecated)]
+fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
+    let (id, terminal, spawn_options) = {
+        let mut state_mut = state.borrow_mut();
+        let profile_name = if state_mut.profiles.profile(&spec.profile_name).is_some() {
+            spec.profile_name
+        } else {
+            resolve_new_tab_profile(
+                &state_mut.settings,
+                &state_mut.sessions,
+                &state_mut.profiles,
+            )
+        };
+        let working_directory = spec.working_directory;
+        let id = state_mut
+            .sessions
+            .open_tab(&profile_name, working_directory.as_deref());
         let terminal = vte4::Terminal::new();
         enforce_terminal_input_safety(&terminal);
         terminal.set_hexpand(true);
@@ -4390,6 +4743,9 @@ fn open_tab(state: &Rc<RefCell<UiState>>) {
         let profile = state_mut.profiles.profile(&profile_name).cloned();
         if let Some(profile) = &profile {
             apply_profile(&terminal, profile, &state_mut.settings);
+        }
+        if let Some((columns, rows)) = spec.size {
+            terminal.set_size(columns as i64, rows as i64);
         }
         // General settings provide the baseline. Profile-owned values take
         // precedence only when the profile actually specifies them, so the
@@ -4433,6 +4789,7 @@ fn open_tab(state: &Rc<RefCell<UiState>>) {
         state_mut.terminals.insert(id.get(), terminal.clone());
         (id, terminal, spawn_options)
     };
+    sync_active_profile_ui(state);
     connect_terminal_shortcuts(&terminal, state.clone(), id);
     let title_state = state.clone();
     terminal
@@ -4828,7 +5185,41 @@ fn terminal_surface(
 }
 
 fn apply_profile(terminal: &vte4::Terminal, profile: &TerminalProfile, settings: &Settings) {
-    terminal.set_size(profile.columns as i64, profile.rows as i64);
+    apply_profile_properties(terminal, profile, settings, true);
+}
+
+fn reapply_profile_without_resize(
+    terminal: &vte4::Terminal,
+    profile: &TerminalProfile,
+    settings: &Settings,
+) {
+    apply_profile_properties(terminal, profile, settings, false);
+}
+
+fn runtime_terminal_settings_changed(before: &Settings, after: &Settings) -> bool {
+    before.scroll_on_output != after.scroll_on_output
+        || before.scroll_on_input != after.scroll_on_input
+        || before.audible_bell != after.audible_bell
+        || before.bold_is_bright != after.bold_is_bright
+}
+
+fn runtime_profile_requires_reapply(
+    global_runtime_changed: bool,
+    profile_changed: bool,
+    assignment_changed: bool,
+) -> bool {
+    global_runtime_changed || profile_changed || assignment_changed
+}
+
+fn apply_profile_properties(
+    terminal: &vte4::Terminal,
+    profile: &TerminalProfile,
+    settings: &Settings,
+    apply_grid_size: bool,
+) {
+    if apply_grid_size {
+        terminal.set_size(profile.columns as i64, profile.rows as i64);
+    }
     let font = gtk::pango::FontDescription::from_string(&format!(
         "{} {}",
         profile.font, profile.font_size
@@ -5167,24 +5558,26 @@ fn show_running_close_prompt(state: &Rc<RefCell<UiState>>, id: SessionId) {
 }
 
 fn force_close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
-    let Ok(mut state) = state.try_borrow_mut() else {
+    let Ok(mut state_mut) = state.try_borrow_mut() else {
         return;
     };
-    if let Some(tab) = state.sessions.close_tab(id) {
+    if let Some(tab) = state_mut.sessions.close_tab(id) {
         if let Some(pid) = tab.child_pid {
             core::terminate_child(pid);
         }
-        if let Some(terminal) = state.terminals.remove(&id.get()) {
-            if let Some(page_child) = stack_page_child(&state.stack, &terminal) {
-                state.stack.remove(&page_child);
+        if let Some(terminal) = state_mut.terminals.remove(&id.get()) {
+            if let Some(page_child) = stack_page_child(&state_mut.stack, &terminal) {
+                state_mut.stack.remove(&page_child);
             }
         }
     }
-    let close_window = state.sessions.is_empty();
-    let window = state.window.clone();
-    drop(state);
+    let close_window = state_mut.sessions.is_empty();
+    let window = state_mut.window.clone();
+    drop(state_mut);
     if close_window {
         window.close();
+    } else {
+        sync_active_profile_ui(state);
     }
 }
 
