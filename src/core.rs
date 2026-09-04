@@ -146,6 +146,12 @@ impl SessionManager {
         }
     }
 
+    pub fn set_profile(&mut self, id: SessionId, profile_name: impl Into<String>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.profile_name = profile_name.into();
+        }
+    }
+
     pub fn set_child_pid(&mut self, id: SessionId, child_pid: Option<glib::Pid>) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
             tab.child_pid = child_pid;
@@ -917,6 +923,17 @@ mod tests {
             sessions.active().unwrap().working_directory.as_deref(),
             Some("/tmp/project")
         );
+    }
+
+    #[test]
+    fn changing_a_tabs_profile_preserves_its_session_identity_and_directory() {
+        let mut sessions = SessionManager::empty();
+        let id = sessions.open_tab("Homebrew", Some("/tmp/project"));
+        sessions.set_profile(id, "Ocean");
+        let tab = sessions.tab(id).unwrap();
+        assert_eq!(tab.id, id);
+        assert_eq!(tab.profile_name, "Ocean");
+        assert_eq!(tab.working_directory.as_deref(), Some("/tmp/project"));
     }
 
     #[test]
