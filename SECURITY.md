@@ -27,9 +27,10 @@ interface. Core Terminal uses that interface only to start the configured host
 shell and its requested working directory. This permission is intentional: a
 sandbox-only shell could not run the user's installed commands. Programs
 started through the Flatpak have the same user privileges as native terminal
-programs. The bridge clears the sandbox environment before reconstructing a
-small host-oriented allowlist; Flatpak-specific XDG paths and unrelated
-application variables are not forwarded to the host command.
+programs. The bridge relies on the host-command broker's host-session
+environment and overrides only `TERM`, `COLORTERM`, `VTE_VERSION`, and an
+explicitly configured locale. It does not copy the Flatpak process environment
+over the broker-provided host environment.
 
 JSON settings and profile documents are bounded to 4 MiB. `.terminal` imports
 are parsed as plist data; XML entity and unsupported document-type constructs
