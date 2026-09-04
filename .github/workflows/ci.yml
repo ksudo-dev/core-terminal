@@ -13,7 +13,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  PACKAGE_VERSION: 0.2.1
+  PACKAGE_VERSION: 0.2.2
 
 jobs:
   fmt:
@@ -260,7 +260,7 @@ jobs:
       - notices
       - sbom
       - cargo-audit
-    if: github.ref == 'refs/tags/v0.2.1'
+    if: github.ref == 'refs/tags/v0.2.2'
     runs-on: ubuntu-26.04
     permissions:
       actions: read
@@ -317,6 +317,6 @@ jobs:
           gh release create "$GITHUB_REF_NAME" release-assets/* \
             --verify-tag \
             --title "Core Terminal $PACKAGE_VERSION" \
-            --notes-file packaging/release-notes-0.2.1.md
+            --notes-file packaging/release-notes-0.2.2.md
         env:
           GH_TOKEN: ${{ github.token }}

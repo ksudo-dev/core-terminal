@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.2.2
+
+Released 2026-09-04.
+
 - Restored the missing Text-page form containing font, cursor, and scrollback
   controls, and added native layout checks that require those controls to be
   present and loaded from the active profile.

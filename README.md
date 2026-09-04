@@ -20,7 +20,7 @@ a downloaded artifact.
 The Debian package targets Ubuntu 26.04 and `amd64`:
 
 ```sh
-sudo apt install ./core-terminal_0.2.1_amd64.deb
+sudo apt install ./core-terminal_0.2.2_amd64.deb
 ```
 
 The published Flatpak bundle targets x86_64 Linux distributions with Flatpak
@@ -83,7 +83,7 @@ The script uses an isolated D-Bus session so an installed Core Terminal process
 cannot intercept the test activation. Weston is not a substitute for the
 Ubuntu GNOME Wayland test.
 
-## Features in 0.2.1
+## Features in 0.2.2
 
 Core Terminal currently includes:
 
@@ -123,12 +123,12 @@ depend on the desktop and are treated as optional Linux integrations.
 
 ## Debian package
 
-Build and inspect a local package. The script defaults to version 0.2.1:
+Build and inspect a local package. The script defaults to version 0.2.2:
 
 ```sh
 scripts/build-deb.sh
-scripts/check-deb.sh dist/core-terminal_0.2.1_$(dpkg --print-architecture).deb
-lintian --pedantic dist/core-terminal_0.2.1_$(dpkg --print-architecture).deb
+scripts/check-deb.sh dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
+lintian --pedantic dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
 ```
 
 Remove it with administrator permission:

@@ -29,6 +29,11 @@
   <url type="bugtracker">https://github.com/ksudo-dev/core-terminal/issues</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.2.2" date="2026-09-04">
+      <description>
+        <p>Restored complete profile controls and hardened terminal process cleanup.</p>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-09-03">
       <description>
         <p>Improved Window Group editing and Flatpak host-shell integration.</p>

@@ -1,6 +1,6 @@
 # Deferred compatibility and scope
 
-Core Terminal 0.2.1 is a Linux terminal emulator. The following items are
+Core Terminal 0.2.2 is a Linux terminal emulator. The following items are
 outside its current parity claim:
 
 - exact macOS Dock tile contents and Dock bounce

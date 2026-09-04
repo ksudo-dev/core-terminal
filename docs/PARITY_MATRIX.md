@@ -1,15 +1,15 @@
 # Core Terminal parity matrix
 
-Audit date: 2026-09-03
+Audit date: 2026-09-04
 
 This matrix compares the requested Terminal.app settings layout with Core
-Terminal 0.2.1 on Ubuntu GNOME Wayland. A control counts as implemented only
+Terminal 0.2.2 on Ubuntu GNOME Wayland. A control counts as implemented only
 when it has a GTK control, persists its value, and changes application or VTE
 behavior. A value that is only stored does not count.
 
 ## Current status
 
-| Area | Status in 0.2.1 |
+| Area | Status in 0.2.2 |
 | --- | --- |
 | Native terminal | GTK4 application with one VTE PTY per tab, login-shell startup, and child-process cleanup |
 | Windows and tabs | New window, new tab, close tab, tab navigation, and Ctrl+1 through Ctrl+9 switching |
@@ -240,9 +240,9 @@ cargo test --locked --all-targets --no-fail-fast
 cargo audit
 scripts/native-acceptance.sh target/release/core-terminal
 scripts/build-deb.sh
-scripts/check-deb.sh dist/core-terminal_0.2.1_$(dpkg --print-architecture).deb
-lintian --pedantic dist/core-terminal_0.2.1_$(dpkg --print-architecture).deb
-scripts/check-private-data.sh dist/core-terminal_0.2.1_$(dpkg --print-architecture).deb
+scripts/check-deb.sh dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
+lintian --pedantic dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
+scripts/check-private-data.sh dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
 ```
 
 Launch the installed package with `GDK_BACKEND=wayland` from the Ubuntu GNOME
