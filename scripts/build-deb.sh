@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-version=${1:-0.2.0}
+version=${1:-0.2.1}
 arch=$(dpkg --print-architecture)
 app_id=io.github.ksudo_dev.CoreTerminal
 build_root="$repo_root/target/debian/core-terminal"

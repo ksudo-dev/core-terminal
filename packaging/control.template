@@ -7,6 +7,7 @@ Maintainer: Kasey <211167966+ksudo-dev@users.noreply.github.com>
 Depends: __DEPENDS__
 Conflicts: replica-terminal
 Replaces: replica-terminal (<= 0.1.1)
-Description: GTK terminal inspired by macOS Terminal
- Core Terminal is a small native GTK4 terminal emulator using VTE for
- PTY integration, shell interaction, rendering, and terminal protocols.
+Description: terminal emulator with profiles and reusable window groups
+ Core Terminal is a native GTK4 and VTE terminal emulator. Profiles store
+ appearance and behavior, while window groups reopen ordered tabs with their
+ saved profiles, directories, and terminal dimensions.

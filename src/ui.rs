@@ -18,7 +18,7 @@ use crate::{
 };
 use gtk::{gio, glib, prelude::*};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     path::Path,
     rc::Rc,
@@ -38,7 +38,10 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
-    use super::{settings_page_ids, APPLICATION_ID, PROFILE_PAGE_IDS};
+    use super::{
+        settings_page_ids, window_group_entry_summary, WindowGroupEntry, APPLICATION_ID,
+        PROFILE_PAGE_IDS,
+    };
 
     #[test]
     fn settings_window_has_all_top_level_pages() {
@@ -59,6 +62,20 @@ mod structural_tests {
     #[test]
     fn gtk_icon_name_matches_the_packaged_application_id() {
         assert_eq!(APPLICATION_ID, "io.github.ksudo_dev.CoreTerminal");
+    }
+
+    #[test]
+    fn window_group_rows_explain_launch_order_and_saved_values() {
+        let entry = WindowGroupEntry {
+            profile: "Homebrew".into(),
+            working_directory: Some("/srv/project".into()),
+            columns: 100,
+            rows: 32,
+        };
+        assert_eq!(
+            window_group_entry_summary(1, &entry),
+            "Tab 2: Homebrew — /srv/project — 100×32"
+        );
     }
 }
 
@@ -208,6 +225,9 @@ where
     let import_parent = parent.clone();
     let import_store = profile_store.clone();
     let import_list = controls.profile_list.clone();
+    let import_new_window = controls.new_window_profile.clone();
+    let import_new_tab = controls.new_tab_profile.clone();
+    let import_group_profile = controls.window_group_profile.clone();
     import_button.connect_clicked(move |_| {
         let chooser = gtk::FileChooserNative::builder()
             .title("Import Profile")
@@ -223,6 +243,9 @@ where
         let startup = import_startup.clone();
         let import_store = import_store.clone();
         let import_list = import_list.clone();
+        let new_window = import_new_window.clone();
+        let new_tab = import_new_tab.clone();
+        let group_profile = import_group_profile.clone();
         let error_parent = import_parent.clone();
         chooser.connect_response(move |chooser, response| {
             if response == gtk::ResponseType::Accept {
@@ -242,7 +265,7 @@ where
                             show_settings_error(&error_parent, "Import failed", error.to_string());
                             return;
                         }
-                        import_list.append(&gtk::Label::new(Some(&imported_name)));
+                        import_list.append(&profile_list_row(&imported_name));
                         if let Some(row) = import_list
                             .row_at_index(import_list.observe_children().n_items() as i32 - 1)
                         {
@@ -263,6 +286,9 @@ where
                                 startup.set_selected(index);
                             }
                         }
+                        append_dropdown_value(&new_window, &imported_name);
+                        append_dropdown_value(&new_tab, &imported_name);
+                        append_dropdown_value(&group_profile, &imported_name);
                         if !imported.fallbacks.is_empty() {
                             show_settings_error(
                                 &error_parent,
@@ -333,18 +359,23 @@ where
     // directly from this editor without a hidden side channel.
     let add_button = controls.profile_add.clone();
     let add_startup = controls.startup_profile.clone();
+    let add_new_window = controls.new_window_profile.clone();
+    let add_new_tab = controls.new_tab_profile.clone();
+    let add_group_profile = controls.window_group_profile.clone();
     let add_store = controls.profile_store.clone();
     let add_list = controls.profile_list.clone();
     add_button.connect_clicked(move |_| {
-        let index = add_store.borrow().profiles().len() + 1;
         let mut profile = TerminalProfile::homebrew();
-        let name = format!("Custom Profile {index}");
+        let name = unique_profile_name(&add_store.borrow(), "Custom Profile");
         profile.name = name.clone();
         if add_store.borrow_mut().add_profile(profile).is_ok() {
             if let Some(model) = add_startup.model().and_downcast::<gtk::StringList>() {
                 model.append(&name);
                 add_startup.set_selected(model.n_items().saturating_sub(1));
             }
+            append_dropdown_value(&add_new_window, &name);
+            append_dropdown_value(&add_new_tab, &name);
+            append_dropdown_value(&add_group_profile, &name);
             add_list.append(&profile_list_row(&name));
             if let Some(row) =
                 add_list.row_at_index(add_list.observe_children().n_items() as i32 - 1)
@@ -355,6 +386,9 @@ where
     });
     let duplicate_button = controls.profile_duplicate.clone();
     let duplicate_startup = controls.startup_profile.clone();
+    let duplicate_new_window = controls.new_window_profile.clone();
+    let duplicate_new_tab = controls.new_tab_profile.clone();
+    let duplicate_group_profile = controls.window_group_profile.clone();
     let duplicate_selection = controls.profile_selection.clone();
     let duplicate_store = controls.profile_store.clone();
     let duplicate_list = controls.profile_list.clone();
@@ -363,8 +397,7 @@ where
         if source.is_empty() {
             return;
         }
-        let index = duplicate_store.borrow().profiles().len() + 1;
-        let name = format!("Copy of {source} {index}");
+        let name = unique_profile_name(&duplicate_store.borrow(), &format!("Copy of {source}"));
         if duplicate_store
             .borrow_mut()
             .duplicate_profile(&source, &name)
@@ -374,6 +407,9 @@ where
                 model.append(&name);
                 duplicate_startup.set_selected(model.n_items().saturating_sub(1));
             }
+            append_dropdown_value(&duplicate_new_window, &name);
+            append_dropdown_value(&duplicate_new_tab, &name);
+            append_dropdown_value(&duplicate_group_profile, &name);
             duplicate_list.append(&profile_list_row(&name));
             if let Some(row) =
                 duplicate_list.row_at_index(duplicate_list.observe_children().n_items() as i32 - 1)
@@ -384,25 +420,50 @@ where
     });
     let delete_button = controls.profile_delete.clone();
     let delete_startup = controls.startup_profile.clone();
+    let delete_new_window = controls.new_window_profile.clone();
+    let delete_new_tab = controls.new_tab_profile.clone();
+    let delete_group_profile = controls.window_group_profile.clone();
     let delete_selection = controls.profile_selection.clone();
     let delete_store = controls.profile_store.clone();
     let delete_list = controls.profile_list.clone();
+    let delete_commit_window_group = controls.commit_window_group.clone();
+    let delete_error_parent = parent.clone();
     delete_button.connect_clicked(move |_| {
         let name = delete_selection.borrow().clone();
         if name.is_empty() {
             return;
         }
-        if delete_store.borrow_mut().delete_profile(&name).is_ok() {
-            if let Some(model) = delete_startup.model().and_downcast::<gtk::StringList>() {
-                if let Some(index) = (0..model.n_items())
-                    .find(|index| model.string(*index).as_deref() == Some(name.as_str()))
-                {
-                    model.remove(index);
-                    delete_startup.set_selected(index.saturating_sub(1));
-                    if let Some(row) = delete_list.row_at_index(index as i32) {
-                        delete_list.remove(&row);
+        if let Err(error) = delete_commit_window_group() {
+            show_settings_error(
+                &delete_error_parent,
+                "Profile could not be deleted",
+                format!("Save or correct the current window-group draft first: {error}"),
+            );
+            return;
+        }
+        match delete_store.borrow_mut().delete_profile(&name) {
+            Ok(_) => {
+                if let Some(model) = delete_startup.model().and_downcast::<gtk::StringList>() {
+                    if let Some(index) = (0..model.n_items())
+                        .find(|index| model.string(*index).as_deref() == Some(name.as_str()))
+                    {
+                        model.remove(index);
+                        delete_startup.set_selected(index.saturating_sub(1));
+                        if let Some(row) = list_box_row_with_label(&delete_list, &name) {
+                            delete_list.remove(&row);
+                        }
                     }
                 }
+                remove_dropdown_value(&delete_new_window, &name);
+                remove_dropdown_value(&delete_new_tab, &name);
+                remove_dropdown_value(&delete_group_profile, &name);
+            }
+            Err(error) => {
+                show_settings_error(
+                    &delete_error_parent,
+                    "Profile could not be deleted",
+                    error.to_string(),
+                );
             }
         }
     });
@@ -441,6 +502,10 @@ where
     let cancel_button = controls.cancel_button.clone();
     let save_window = window.clone();
     save_button.connect_clicked(move |_| {
+        if let Err(error) = (controls.commit_window_group)() {
+            show_settings_error(&save_window, "Window group could not be saved", error);
+            return;
+        }
         let cursor_shape = match controls
             .cursor_shape
             .selected_item()
@@ -610,6 +675,8 @@ struct SettingsControls {
     /// is important because an encoded PTY action is not a human label.
     profile_mappings: Rc<RefCell<Vec<KeyMapping>>>,
     profile_list: gtk::ListBox,
+    window_group_profile: gtk::DropDown,
+    commit_window_group: Rc<dyn Fn() -> Result<(), String>>,
 }
 
 impl SettingsControls {
@@ -691,10 +758,12 @@ impl SettingsControls {
         general_grid.attach(&startup_window_group, 1, 1, 1, 1);
         let startup_for_mode = startup.clone();
         let group_for_mode = startup_window_group.clone();
-        let groups_available = !profile_store.borrow().window_groups().is_empty();
+        let group_model_for_mode = startup_group_model.clone();
         startup.set_sensitive(!use_startup_group.is_active());
         use_startup_group.connect_toggled(move |button| {
             startup_for_mode.set_sensitive(!button.is_active());
+            let groups_available = !(group_model_for_mode.n_items() == 1
+                && group_model_for_mode.string(0).as_deref() == Some("No groups saved"));
             group_for_mode.set_sensitive(button.is_active() && groups_available);
         });
 
@@ -1203,7 +1272,7 @@ impl SettingsControls {
         }
         window_page.0.append(&window_grid);
         window_page.0.append(&renderer_owned_check(
-            "Smooth window resizing (managed by GNOME Wayland)",
+            "Smooth window resizing (managed by the desktop compositor)",
             "profile-smooth-resize",
         ));
         window_page.0.append(&named_check(
@@ -1216,7 +1285,7 @@ impl SettingsControls {
             "profile-restore-rows",
         ));
         window_page.0.append(&unavailable_check(
-            "Show live terminal contents in the Dock (not exposed by GNOME Dock)",
+            "Show live terminal contents in the dock (not portable across Linux docks)",
             "profile-minimized-dock-contents",
         ));
         let restore_limit = gtk::SpinButton::with_range(1.0, 1_000_000.0, 100.0);
@@ -1619,12 +1688,12 @@ impl SettingsControls {
                 "profile-visual-bell-only-muted",
             ),
             (
-                "Badge app and window icons with a GNOME notification",
+                "Badge app and window icons with a desktop notification",
                 selected_defaults.background_notifications,
                 "profile-background-notifications",
             ),
             (
-                "Request urgent background attention with a GNOME notification",
+                "Request urgent background attention with a desktop notification",
                 selected_defaults.urgency_hint,
                 "profile-urgency",
             ),
@@ -1637,7 +1706,7 @@ impl SettingsControls {
             advanced.append(&button);
         }
         advanced.append(&unavailable_check(
-            "Continue requesting attention until focused (GNOME owns notification lifetime)",
+            "Continue requesting attention until focused (the desktop owns notification lifetime)",
             "profile-continue-urgency",
         ));
         let encoding_grid = form_grid();
@@ -1712,7 +1781,7 @@ impl SettingsControls {
         top_stack.add_titled(&profile_page, Some("profiles"), "Profiles");
 
         let window_groups = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        window_groups.set_widget_name("window-groups-list");
+        window_groups.set_widget_name("window-groups-page");
         window_groups.add_css_class("core-settings-pane");
         page_heading(
             &window_groups,
@@ -1738,6 +1807,8 @@ impl SettingsControls {
         window_groups.append(&background_notifications);
         let group_store = profile_store.clone();
         let selected_group = Rc::new(RefCell::new(None::<String>));
+        let group_entries = Rc::new(RefCell::new(Vec::<WindowGroupEntry>::new()));
+        let selected_group_entry = Rc::new(RefCell::new(None::<usize>));
         let group_form = form_grid();
         let group_name = gtk::Entry::new();
         group_name.set_widget_name("window-group-name");
@@ -1772,6 +1843,48 @@ impl SettingsControls {
         group_form.attach(&field_label("Rows"), 0, 4, 1, 1);
         group_form.attach(&group_rows, 1, 4, 1, 1);
         window_groups.append(&group_form);
+        let entry_heading = gtk::Label::new(Some("Tabs in selected group"));
+        entry_heading.add_css_class("core-settings-section");
+        entry_heading.set_halign(gtk::Align::Start);
+        window_groups.append(&entry_heading);
+        window_groups.append(&hint_label(
+            "Each row launches as one tab, in the order shown. Select a row to edit its profile, directory, and terminal size above.",
+        ));
+        let group_entry_list = gtk::ListBox::new();
+        group_entry_list.set_widget_name("window-group-entries");
+        group_entry_list.set_selection_mode(gtk::SelectionMode::Single);
+        group_entry_list.set_vexpand(true);
+        let group_entry_scroll = gtk::ScrolledWindow::new();
+        group_entry_scroll.set_widget_name("window-group-entries-scroll");
+        group_entry_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        group_entry_scroll.set_min_content_height(150);
+        group_entry_scroll.set_vexpand(true);
+        group_entry_scroll.set_child(Some(&group_entry_list));
+        window_groups.append(&group_entry_scroll);
+        let entry_actions = gtk::Grid::new();
+        entry_actions.set_widget_name("window-group-entry-actions");
+        entry_actions.set_column_homogeneous(true);
+        entry_actions.set_column_spacing(8);
+        let add_entry = gtk::Button::with_label("Add tab");
+        add_entry.set_widget_name("window-group-entry-add");
+        let remove_entry = gtk::Button::with_label("Remove tab");
+        remove_entry.set_widget_name("window-group-entry-remove");
+        let move_entry_up = gtk::Button::with_label("Move up");
+        move_entry_up.set_widget_name("window-group-entry-up");
+        let move_entry_down = gtk::Button::with_label("Move down");
+        move_entry_down.set_widget_name("window-group-entry-down");
+        for (index, button) in [&add_entry, &remove_entry, &move_entry_up, &move_entry_down]
+            .into_iter()
+            .enumerate()
+        {
+            button.set_hexpand(true);
+            entry_actions.attach(button, index as i32, 0, 1, 1);
+        }
+        window_groups.append(&entry_actions);
+        let saved_group_heading = gtk::Label::new(Some("Saved groups"));
+        saved_group_heading.add_css_class("core-settings-section");
+        saved_group_heading.set_halign(gtk::Align::Start);
+        window_groups.append(&saved_group_heading);
         let groups = gtk::ListBox::new();
         groups.set_widget_name("window-groups-list");
         groups.set_selection_mode(gtk::SelectionMode::Single);
@@ -1784,81 +1897,300 @@ impl SettingsControls {
         group_actions.set_column_spacing(8);
         group_actions.set_row_spacing(8);
         let add_group = gtk::Button::with_label("Add group");
+        add_group.set_widget_name("window-group-add");
         let remove_group = gtk::Button::with_label("Remove group");
-        let save_groups = gtk::Button::with_label("Save groups");
+        remove_group.set_widget_name("window-group-remove");
         let launch_group = gtk::Button::with_label("Launch selected group");
-        for (index, button) in [&add_group, &remove_group, &save_groups, &launch_group]
+        launch_group.set_widget_name("window-group-launch");
+        for (index, button) in [&add_group, &remove_group, &launch_group]
             .into_iter()
             .enumerate()
         {
             button.set_hexpand(true);
             group_actions.attach(button, (index % 2) as i32, (index / 2) as i32, 1, 1);
         }
-        let group_list_for_select = groups.clone();
+        let group_status = hint_label(
+            "Settings Save persists every group edit. Switching groups keeps the current draft in this Settings session.",
+        );
+        group_status.set_widget_name("window-group-status");
+
+        let commit_window_group: Rc<dyn Fn() -> Result<(), String>> = {
+            let store = group_store.clone();
+            let selected_group = selected_group.clone();
+            let entries = group_entries.clone();
+            let selected_entry = selected_group_entry.clone();
+            let name = group_name.clone();
+            let profile = group_profile.clone();
+            let directory = group_directory.clone();
+            let columns = group_columns.clone();
+            let rows = group_rows.clone();
+            let list = groups.clone();
+            let startup_model = startup_group_model.clone();
+            Rc::new(move || {
+                let Some(old_name) = selected_group.borrow().clone() else {
+                    return Ok(());
+                };
+                let new_name = name.text().trim().to_owned();
+                if new_name.is_empty() {
+                    return Err("Window group name cannot be empty.".into());
+                }
+                let mut edited_entries = entries.borrow().clone();
+                if let Some(index) = *selected_entry.borrow() {
+                    let current =
+                        window_group_entry_from_widgets(&profile, &directory, &columns, &rows)
+                            .ok_or_else(|| "Select a profile for this group entry.".to_owned())?;
+                    if let Some(entry) = edited_entries.get_mut(index) {
+                        *entry = current;
+                    }
+                }
+                if edited_entries.is_empty() {
+                    return Err("A window group must contain at least one tab.".into());
+                }
+                let group = WindowGroup {
+                    name: new_name.clone(),
+                    entries: edited_entries,
+                };
+                let result = store.borrow_mut().rename_window_group(&old_name, group);
+                result.map_err(|error| error.to_string())?;
+                if old_name != new_name {
+                    if let Some(row) = list_box_row_with_label(&list, &old_name) {
+                        row.set_child(Some(&gtk::Label::new(Some(&new_name))));
+                    }
+                    if let Some(index) = string_list_position(&startup_model, &old_name) {
+                        startup_model.splice(index, 1, &[new_name.as_str()]);
+                    }
+                }
+                *selected_group.borrow_mut() = Some(new_name);
+                Ok(())
+            })
+        };
+
+        let entries_for_select = group_entries.clone();
+        let selected_entry_for_select = selected_group_entry.clone();
+        let profile_for_entry_select = group_profile.clone();
+        let directory_for_entry_select = group_directory.clone();
+        let columns_for_entry_select = group_columns.clone();
+        let rows_for_entry_select = group_rows.clone();
+        group_entry_list.connect_row_selected(move |_, row| {
+            let Some(row) = row else {
+                *selected_entry_for_select.borrow_mut() = None;
+                return;
+            };
+            let index = row.index().max(0) as usize;
+            let Some(entry) = entries_for_select.borrow().get(index).cloned() else {
+                *selected_entry_for_select.borrow_mut() = None;
+                return;
+            };
+            *selected_entry_for_select.borrow_mut() = Some(index);
+            if let Some(model) = profile_for_entry_select
+                .model()
+                .and_downcast::<gtk::StringList>()
+            {
+                if let Some(profile_index) = string_list_position(&model, &entry.profile) {
+                    profile_for_entry_select.set_selected(profile_index);
+                }
+            }
+            directory_for_entry_select.set_text(entry.working_directory.as_deref().unwrap_or(""));
+            columns_for_entry_select.set_value(entry.columns as f64);
+            rows_for_entry_select.set_value(entry.rows as f64);
+        });
+
+        let sync_selected_entry: Rc<dyn Fn()> = {
+            let entries = group_entries.clone();
+            let selected_entry = selected_group_entry.clone();
+            let list = group_entry_list.clone();
+            let profile = group_profile.clone();
+            let directory = group_directory.clone();
+            let columns = group_columns.clone();
+            let rows = group_rows.clone();
+            Rc::new(move || {
+                let Some(index) = *selected_entry.borrow() else {
+                    return;
+                };
+                let Some(entry) =
+                    window_group_entry_from_widgets(&profile, &directory, &columns, &rows)
+                else {
+                    return;
+                };
+                let mut entries = entries.borrow_mut();
+                let Some(current) = entries.get_mut(index) else {
+                    return;
+                };
+                *current = entry.clone();
+                replace_window_group_entry_summary(&list, index, &entry);
+            })
+        };
+        let sync_for_profile = sync_selected_entry.clone();
+        group_profile.connect_selected_item_notify(move |_| sync_for_profile());
+        let sync_for_directory = sync_selected_entry.clone();
+        group_directory.connect_changed(move |_| sync_for_directory());
+        let sync_for_columns = sync_selected_entry.clone();
+        group_columns.connect_value_changed(move |_| sync_for_columns());
+        let sync_for_rows = sync_selected_entry.clone();
+        group_rows.connect_value_changed(move |_| sync_for_rows());
+
+        let selected_group_for_add_entry = selected_group.clone();
+        let entries_for_add_entry = group_entries.clone();
+        let selected_for_add_entry = selected_group_entry.clone();
+        let entry_list_for_add_entry = group_entry_list.clone();
+        let profile_for_add_entry = group_profile.clone();
+        let directory_for_add_entry = group_directory.clone();
+        let columns_for_add_entry = group_columns.clone();
+        let rows_for_add_entry = group_rows.clone();
+        add_entry.connect_clicked(move |_| {
+            if selected_group_for_add_entry.borrow().is_none() {
+                return;
+            }
+            let Some(entry) = window_group_entry_from_widgets(
+                &profile_for_add_entry,
+                &directory_for_add_entry,
+                &columns_for_add_entry,
+                &rows_for_add_entry,
+            ) else {
+                return;
+            };
+            let selected = {
+                let mut entries = entries_for_add_entry.borrow_mut();
+                entries.push(entry);
+                entries.len() - 1
+            };
+            *selected_for_add_entry.borrow_mut() = Some(selected);
+            let entries = entries_for_add_entry.borrow().clone();
+            rebuild_window_group_entry_list(&entry_list_for_add_entry, &entries, Some(selected));
+        });
+
+        let entries_for_remove_entry = group_entries.clone();
+        let selected_for_remove_entry = selected_group_entry.clone();
+        let entry_list_for_remove_entry = group_entry_list.clone();
+        remove_entry.connect_clicked(move |_| {
+            let Some(index) = *selected_for_remove_entry.borrow() else {
+                return;
+            };
+            let next = {
+                let mut entries = entries_for_remove_entry.borrow_mut();
+                if entries.len() <= 1 || index >= entries.len() {
+                    return;
+                }
+                entries.remove(index);
+                index.min(entries.len() - 1)
+            };
+            *selected_for_remove_entry.borrow_mut() = Some(next);
+            let entries = entries_for_remove_entry.borrow().clone();
+            rebuild_window_group_entry_list(&entry_list_for_remove_entry, &entries, Some(next));
+        });
+
+        let entries_for_move_up = group_entries.clone();
+        let selected_for_move_up = selected_group_entry.clone();
+        let entry_list_for_move_up = group_entry_list.clone();
+        move_entry_up.connect_clicked(move |_| {
+            let Some(index) = *selected_for_move_up.borrow() else {
+                return;
+            };
+            if index == 0 {
+                return;
+            }
+            entries_for_move_up.borrow_mut().swap(index, index - 1);
+            *selected_for_move_up.borrow_mut() = Some(index - 1);
+            let entries = entries_for_move_up.borrow().clone();
+            rebuild_window_group_entry_list(&entry_list_for_move_up, &entries, Some(index - 1));
+        });
+
+        let entries_for_move_down = group_entries.clone();
+        let selected_for_move_down = selected_group_entry.clone();
+        let entry_list_for_move_down = group_entry_list.clone();
+        move_entry_down.connect_clicked(move |_| {
+            let Some(index) = *selected_for_move_down.borrow() else {
+                return;
+            };
+            let len = entries_for_move_down.borrow().len();
+            if index + 1 >= len {
+                return;
+            }
+            entries_for_move_down.borrow_mut().swap(index, index + 1);
+            *selected_for_move_down.borrow_mut() = Some(index + 1);
+            let entries = entries_for_move_down.borrow().clone();
+            rebuild_window_group_entry_list(&entry_list_for_move_down, &entries, Some(index + 1));
+        });
+
         let group_store_for_select = group_store.clone();
         let selected_group_for_select = selected_group.clone();
-        let profile_names_for_select = profile_names.to_vec();
         let name_for_select = group_name.clone();
-        let profile_for_select = group_profile.clone();
-        let directory_for_select = group_directory.clone();
-        let columns_for_select = group_columns.clone();
-        let rows_for_select = group_rows.clone();
-        groups.connect_row_selected(move |_, row| {
+        let entries_for_group_select = group_entries.clone();
+        let selected_entry_for_group_select = selected_group_entry.clone();
+        let entry_list_for_group_select = group_entry_list.clone();
+        let commit_for_group_select = commit_window_group.clone();
+        let status_for_group_select = group_status.clone();
+        let reverting_group_selection = Rc::new(Cell::new(false));
+        let reverting_for_group_select = reverting_group_selection.clone();
+        groups.connect_row_selected(move |list, row| {
             let Some(label) = row.and_then(|row| row.child().and_downcast::<gtk::Label>()) else {
                 return;
             };
             let name = label.text().to_string();
+            let old_name = selected_group_for_select.borrow().clone();
+            let reverting = reverting_for_group_select.replace(false);
+            if !reverting && old_name.as_deref().is_some_and(|old| old != name) {
+                if let Err(error) = commit_for_group_select() {
+                    status_for_group_select.set_text(&error);
+                    if let Some(old_row) = old_name
+                        .as_deref()
+                        .and_then(|old| list_box_row_with_label(list, old))
+                    {
+                        reverting_for_group_select.set(true);
+                        list.select_row(Some(&old_row));
+                    }
+                    return;
+                }
+            }
             let Some(group) = group_store_for_select.borrow().window_group(&name).cloned() else {
-                return;
-            };
-            let Some(entry) = group.entries.first() else {
                 return;
             };
             *selected_group_for_select.borrow_mut() = Some(name);
             name_for_select.set_text(&group.name);
-            directory_for_select.set_text(entry.working_directory.as_deref().unwrap_or(""));
-            columns_for_select.set_value(entry.columns as f64);
-            rows_for_select.set_value(entry.rows as f64);
-            if let Some(index) = profile_names_for_select
-                .iter()
-                .position(|candidate| candidate == &entry.profile)
-            {
-                profile_for_select.set_selected(index as u32);
-            }
-            group_list_for_select.grab_focus();
+            *selected_entry_for_group_select.borrow_mut() = None;
+            *entries_for_group_select.borrow_mut() = group.entries;
+            let entries = entries_for_group_select.borrow().clone();
+            rebuild_window_group_entry_list(&entry_list_for_group_select, &entries, Some(0));
+            status_for_group_select.set_text(
+                "Settings Save persists every group edit. Switching groups keeps the current draft in this Settings session.",
+            );
         });
         if let Some(row) = groups.row_at_index(0) {
             groups.select_row(Some(&row));
         }
         let group_list_for_add = groups.clone();
         let group_store_for_add = group_store.clone();
-        let name_for_add = group_name.clone();
-        let profile_for_add = group_profile.clone();
-        let directory_for_add = group_directory.clone();
-        let columns_for_add = group_columns.clone();
-        let rows_for_add = group_rows.clone();
-        let selected_for_add = selected_group.clone();
+        let profile_selection_for_add = profile_selection.clone();
+        let commit_for_add = commit_window_group.clone();
+        let status_for_add = group_status.clone();
         let startup_model_for_add = startup_group_model.clone();
         let startup_toggle_for_add = use_startup_group.clone();
         let startup_dropdown_for_add = startup_window_group.clone();
         add_group.connect_clicked(move |_| {
-            let index = group_store_for_add.borrow().window_groups().len() + 1;
-            let name = if name_for_add.text().trim().is_empty() {
-                format!("Window Group {index}")
-            } else {
-                name_for_add.text().trim().to_owned()
+            if let Err(error) = commit_for_add() {
+                status_for_add.set_text(&error);
+                return;
+            }
+            let mut index = group_store_for_add.borrow().window_groups().len() + 1;
+            let name = loop {
+                let candidate = format!("Window Group {index}");
+                if group_store_for_add
+                    .borrow()
+                    .window_group(&candidate)
+                    .is_none()
+                {
+                    break candidate;
+                }
+                index += 1;
             };
-            let profile = dropdown_text(&profile_for_add)
-                .or_else(|| Some(group_store_for_add.borrow().selected_name().to_owned()))
-                .unwrap_or_default();
+            let profile = profile_selection_for_add.borrow().clone();
             let group = WindowGroup {
                 name: name.clone(),
                 entries: vec![WindowGroupEntry {
                     profile,
-                    working_directory: (!directory_for_add.text().trim().is_empty())
-                        .then(|| directory_for_add.text().trim().to_owned()),
-                    columns: columns_for_add.value() as u32,
-                    rows: rows_for_add.value() as u32,
+                    working_directory: None,
+                    columns: 80,
+                    rows: 24,
                 }],
             };
             if group_store_for_add
@@ -1867,7 +2199,6 @@ impl SettingsControls {
                 .is_ok()
             {
                 group_list_for_add.append(&gtk::Label::new(Some(&name)));
-                *selected_for_add.borrow_mut() = Some(name.clone());
                 if startup_model_for_add.n_items() == 1
                     && startup_model_for_add.string(0).as_deref() == Some("No groups saved")
                 {
@@ -1887,110 +2218,64 @@ impl SettingsControls {
         let group_list_for_remove = groups.clone();
         let group_store_for_remove = group_store.clone();
         let selected_for_remove = selected_group.clone();
+        let entries_for_remove_group = group_entries.clone();
+        let selected_entry_for_remove_group = selected_group_entry.clone();
+        let entry_list_for_remove_group = group_entry_list.clone();
         let startup_model_for_remove = startup_group_model.clone();
         let startup_toggle_for_remove = use_startup_group.clone();
         let startup_dropdown_for_remove = startup_window_group.clone();
+        let commit_for_remove = commit_window_group.clone();
+        let status_for_remove = group_status.clone();
         remove_group.connect_clicked(move |_| {
-            let Some(row) = group_list_for_remove.selected_row() else {
+            if let Err(error) = commit_for_remove() {
+                status_for_remove.set_text(&error);
+                return;
+            }
+            let Some(removed_name) = selected_for_remove.borrow().clone() else {
                 return;
             };
-            let Some(label) = row.child().and_downcast::<gtk::Label>() else {
+            let Some(row) = list_box_row_with_label(&group_list_for_remove, &removed_name) else {
+                status_for_remove.set_text("The selected window group is no longer available.");
                 return;
             };
+            let removed_startup_group = dropdown_text(&startup_dropdown_for_remove).as_deref()
+                == Some(removed_name.as_str());
             if group_store_for_remove
                 .borrow_mut()
-                .delete_window_group(label.text().as_str())
+                .delete_window_group(&removed_name)
                 .is_ok()
             {
-                if let Some(index) =
-                    string_list_position(&startup_model_for_remove, label.text().as_str())
+                *selected_for_remove.borrow_mut() = None;
+                *selected_entry_for_remove_group.borrow_mut() = None;
+                entries_for_remove_group.borrow_mut().clear();
+                rebuild_window_group_entry_list(&entry_list_for_remove_group, &[], None);
+                if let Some(index) = string_list_position(&startup_model_for_remove, &removed_name)
                 {
                     startup_model_for_remove.remove(index);
                 }
-                if startup_model_for_remove.n_items() == 0 {
-                    startup_model_for_remove.append("No groups saved");
+                if removed_startup_group || startup_model_for_remove.n_items() == 0 {
                     startup_toggle_for_remove.set_active(false);
                     startup_dropdown_for_remove.set_sensitive(false);
                 }
+                if startup_model_for_remove.n_items() == 0 {
+                    startup_model_for_remove.append("No groups saved");
+                }
                 group_list_for_remove.remove(&row);
-                *selected_for_remove.borrow_mut() = None;
-            }
-        });
-        let group_store_for_save = group_store.clone();
-        let selected_for_save = selected_group.clone();
-        let name_for_save = group_name.clone();
-        let profile_for_save = group_profile.clone();
-        let directory_for_save = group_directory.clone();
-        let columns_for_save = group_columns.clone();
-        let rows_for_save = group_rows.clone();
-        let list_for_save = groups.clone();
-        let startup_model_for_save = startup_group_model.clone();
-        save_groups.connect_clicked(move |_| {
-            let Some(old_name) = selected_for_save.borrow().clone() else {
-                save_user_profiles(&group_store_for_save.borrow());
-                return;
-            };
-            let new_name = name_for_save.text().trim().to_owned();
-            let Some(profile) = dropdown_text(&profile_for_save) else {
-                return;
-            };
-            if new_name.is_empty() {
-                return;
-            }
-            let entry = WindowGroupEntry {
-                profile,
-                working_directory: (!directory_for_save.text().trim().is_empty())
-                    .then(|| directory_for_save.text().trim().to_owned()),
-                columns: columns_for_save.value() as u32,
-                rows: rows_for_save.value() as u32,
-            };
-            // Keep additional entries loaded from the profile document. The
-            // editor controls the first entry and never silently discards
-            // the remaining launch targets.
-            let mut entries = group_store_for_save
-                .borrow()
-                .window_group(&old_name)
-                .map(|group| group.entries.clone())
-                .unwrap_or_default();
-            if entries.is_empty() {
-                entries.push(entry);
-            } else {
-                entries[0] = entry;
-            }
-            let group = WindowGroup {
-                name: new_name.clone(),
-                entries,
-            };
-            let result = if old_name == new_name {
-                group_store_for_save.borrow_mut().update_window_group(group)
-            } else {
-                // ProfileStore intentionally has no implicit rename operation:
-                // add the validated new record first, then remove the old one.
-                let added = group_store_for_save.borrow_mut().add_window_group(group);
-                if added.is_ok() {
-                    let _ = group_store_for_save
-                        .borrow_mut()
-                        .delete_window_group(&old_name);
+                if let Some(next) = group_list_for_remove.row_at_index(0) {
+                    group_list_for_remove.select_row(Some(&next));
                 }
-                added
-            };
-            if result.is_ok() {
-                if let Some(row) = list_for_save.selected_row() {
-                    row.set_child(Some(&gtk::Label::new(Some(&new_name))));
-                }
-                if old_name != new_name {
-                    if let Some(index) = string_list_position(&startup_model_for_save, &old_name) {
-                        startup_model_for_save.splice(index, 1, &[new_name.as_str()]);
-                    }
-                }
-                *selected_for_save.borrow_mut() = Some(new_name);
             }
-            save_user_profiles(&group_store_for_save.borrow());
         });
         let launch_callback = on_launch_group.clone();
         let launch_store = group_store.clone();
         let launch_selection = selected_group.clone();
+        let commit_for_launch = commit_window_group.clone();
+        let status_for_launch = group_status.clone();
         launch_group.connect_clicked(move |_| {
+            if let Err(error) = commit_for_launch() {
+                status_for_launch.set_text(&error);
+                return;
+            }
             let Some(name) = launch_selection.borrow().clone() else {
                 return;
             };
@@ -1998,8 +2283,14 @@ impl SettingsControls {
                 launch_callback(group);
             }
         });
-        window_groups.append(&groups);
+        let groups_scroll = gtk::ScrolledWindow::new();
+        groups_scroll.set_widget_name("window-groups-scroll");
+        groups_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        groups_scroll.set_min_content_height(120);
+        groups_scroll.set_child(Some(&groups));
+        window_groups.append(&groups_scroll);
         window_groups.append(&group_actions);
+        window_groups.append(&group_status);
         window_groups.append(&hint_label("Core Terminal stores each group's profile, directory, and grid geometry. Launch opens one tab per entry; the Linux compositor owns final window placement and grouping."));
         top_stack.add_titled(
             &scroll_page(&window_groups),
@@ -2160,6 +2451,8 @@ impl SettingsControls {
             profile_stack,
             profile_mappings: mapping_state,
             profile_list,
+            window_group_profile: group_profile,
+            commit_window_group,
         }
     }
 }
@@ -2769,6 +3062,24 @@ fn profile_list_row_name(row: &gtk::ListBoxRow) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+fn list_box_row_with_label(list: &gtk::ListBox, text: &str) -> Option<gtk::ListBoxRow> {
+    let mut child = list.first_child();
+    while let Some(widget) = child {
+        let next = widget.next_sibling();
+        if let Some(row) = widget.downcast_ref::<gtk::ListBoxRow>() {
+            if row
+                .child()
+                .and_downcast::<gtk::Label>()
+                .is_some_and(|label| label.text() == text)
+            {
+                return Some(row.clone());
+            }
+        }
+        child = next;
+    }
+    None
+}
+
 fn scroll_page<W: IsA<gtk::Widget>>(child: &W) -> gtk::ScrolledWindow {
     let scroller = gtk::ScrolledWindow::new();
     // Settings pages may grow vertically, but horizontal wheel input must
@@ -2803,6 +3114,106 @@ fn dropdown_text(dropdown: &gtk::DropDown) -> Option<String> {
 
 fn string_list_position(model: &gtk::StringList, value: &str) -> Option<u32> {
     (0..model.n_items()).find(|index| model.string(*index).as_deref() == Some(value))
+}
+
+fn append_dropdown_value(dropdown: &gtk::DropDown, value: &str) {
+    let Some(model) = dropdown.model().and_downcast::<gtk::StringList>() else {
+        return;
+    };
+    if string_list_position(&model, value).is_none() {
+        model.append(value);
+    }
+}
+
+fn unique_profile_name(store: &ProfileStore, prefix: &str) -> String {
+    (1_u32..)
+        .map(|index| format!("{prefix} {index}"))
+        .find(|candidate| store.profile(candidate).is_none())
+        .expect("a unique generated profile name is available")
+}
+
+fn remove_dropdown_value(dropdown: &gtk::DropDown, value: &str) {
+    let Some(model) = dropdown.model().and_downcast::<gtk::StringList>() else {
+        return;
+    };
+    let Some(index) = string_list_position(&model, value) else {
+        return;
+    };
+    let was_selected = dropdown.selected() == index;
+    model.remove(index);
+    if was_selected {
+        dropdown.set_selected(0);
+    }
+}
+
+fn window_group_entry_from_widgets(
+    profile: &gtk::DropDown,
+    directory: &gtk::Entry,
+    columns: &gtk::SpinButton,
+    rows: &gtk::SpinButton,
+) -> Option<WindowGroupEntry> {
+    Some(WindowGroupEntry {
+        profile: dropdown_text(profile)?,
+        working_directory: (!directory.text().trim().is_empty())
+            .then(|| directory.text().trim().to_owned()),
+        columns: columns.value() as u32,
+        rows: rows.value() as u32,
+    })
+}
+
+fn window_group_entry_summary(index: usize, entry: &WindowGroupEntry) -> String {
+    let directory = entry
+        .working_directory
+        .as_deref()
+        .unwrap_or("Home directory");
+    format!(
+        "Tab {}: {} — {} — {}×{}",
+        index + 1,
+        entry.profile,
+        directory,
+        entry.columns,
+        entry.rows
+    )
+}
+
+fn window_group_entry_row(index: usize, entry: &WindowGroupEntry) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.set_selectable(true);
+    row.set_activatable(true);
+    let label = gtk::Label::new(Some(&window_group_entry_summary(index, entry)));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    label.set_tooltip_text(Some(&window_group_entry_summary(index, entry)));
+    row.set_child(Some(&label));
+    row
+}
+
+fn rebuild_window_group_entry_list(
+    list: &gtk::ListBox,
+    entries: &[WindowGroupEntry],
+    selected: Option<usize>,
+) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        list.append(&window_group_entry_row(index, entry));
+    }
+    if let Some(row) = selected.and_then(|index| list.row_at_index(index as i32)) {
+        list.select_row(Some(&row));
+    }
+}
+
+fn replace_window_group_entry_summary(list: &gtk::ListBox, index: usize, entry: &WindowGroupEntry) {
+    if let Some(row) = list.row_at_index(index as i32) {
+        let label = gtk::Label::new(Some(&window_group_entry_summary(index, entry)));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        label.set_tooltip_text(Some(&window_group_entry_summary(index, entry)));
+        row.set_child(Some(&label));
+    }
 }
 
 fn field_label(text: &str) -> gtk::Label {
@@ -3154,6 +3565,25 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             state.profiles.select("Acceptance Profile");
             state.settings.selected_profile = "Acceptance Profile".into();
             state.settings.startup_profile = "Acceptance Profile".into();
+            if state.profiles.window_group("Acceptance Group").is_none() {
+                let _ = state.profiles.add_window_group(WindowGroup {
+                    name: "Acceptance Group".into(),
+                    entries: vec![
+                        WindowGroupEntry {
+                            profile: "Homebrew".into(),
+                            working_directory: Some("/tmp".into()),
+                            columns: 80,
+                            rows: 24,
+                        },
+                        WindowGroupEntry {
+                            profile: "Acceptance Profile".into(),
+                            working_directory: None,
+                            columns: 100,
+                            rows: 30,
+                        },
+                    ],
+                });
+            }
             if let Some(model) = state
                 .profile_dropdown
                 .model()
@@ -3239,6 +3669,11 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             "profile-encoding",
             "profile-ambiguous-width",
             "window-groups-list",
+            "window-group-entries",
+            "window-group-entry-add",
+            "window-group-entry-remove",
+            "window-group-entry-up",
+            "window-group-entry-down",
             "encoding-compatibility-list",
             "encoding-options",
             "settings-save",
@@ -3336,9 +3771,62 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         if minimum_profile_action_width == i32::MAX {
             minimum_profile_action_width = 0;
         }
+        let mut window_group_editor_interaction = false;
         // A changed value followed by the actual Save button proves the
         // callback path is live; the callback normalizes and persists it.
         if let Some(root) = &root {
+            let selected_acceptance_group = find_widget_by_name(root, "window-groups-list")
+                .and_then(|widget| widget.downcast::<gtk::ListBox>().ok())
+                .is_some_and(|list| {
+                    let mut child = list.first_child();
+                    while let Some(widget) = child {
+                        let next = widget.next_sibling();
+                        if let Some(row) = widget.downcast_ref::<gtk::ListBoxRow>() {
+                            if row
+                                .child()
+                                .and_downcast::<gtk::Label>()
+                                .is_some_and(|label| label.text() == "Acceptance Group")
+                            {
+                                list.select_row(Some(row));
+                                return true;
+                            }
+                        }
+                        child = next;
+                    }
+                    false
+                });
+            if selected_acceptance_group {
+                let entry_list = find_widget_by_name(root, "window-group-entries")
+                    .and_then(|widget| widget.downcast::<gtk::ListBox>().ok());
+                let had_two_entries = entry_list
+                    .as_ref()
+                    .is_some_and(|list| list.observe_children().n_items() == 2);
+                if let Some(add) = find_widget_by_name(root, "window-group-entry-add")
+                    .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+                {
+                    add.emit_clicked();
+                }
+                if let Some(directory) = find_widget_by_name(root, "window-group-directory")
+                    .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
+                {
+                    directory.set_text("/tmp/core-terminal-third");
+                }
+                if let Some(move_up) = find_widget_by_name(root, "window-group-entry-up")
+                    .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+                {
+                    move_up.emit_clicked();
+                }
+                let now_has_three_entries = entry_list
+                    .as_ref()
+                    .is_some_and(|list| list.observe_children().n_items() == 3);
+                let moved_entry_is_second = entry_list
+                    .as_ref()
+                    .and_then(|list| list.row_at_index(1))
+                    .and_then(|row| row.child().and_downcast::<gtk::Label>())
+                    .is_some_and(|label| label.text().contains("/tmp/core-terminal-third"));
+                window_group_editor_interaction =
+                    had_two_entries && now_has_three_entries && moved_entry_is_second;
+            }
             if let Some(color) = find_widget_by_name(root, "profile-background-color")
                 .and_then(|widget| widget.downcast::<gtk::ColorDialogButton>().ok())
             {
@@ -3411,6 +3899,15 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     && profile.background == "#1a334dff"
             })
             .unwrap_or(false);
+        let window_group_round_trip = state
+            .try_borrow()
+            .ok()
+            .and_then(|state| state.profiles.window_group("Acceptance Group").cloned())
+            .is_some_and(|group| {
+                group.entries.len() == 3
+                    && group.entries[1].working_directory.as_deref()
+                        == Some("/tmp/core-terminal-third")
+            });
         let standard_mappings_present = root
             .as_ref()
             .and_then(|root| find_widget_by_name(root, "keyboard-mappings"))
@@ -3444,6 +3941,8 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && profile_count > 0
             && profile_file_written
             && profile_round_trip
+            && window_group_editor_interaction
+            && window_group_round_trip
             && standard_mappings_present
             && encoding_rows_present
             && runtime_profile_applied;
@@ -3451,7 +3950,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| Path::new("/tmp/core-terminal-acceptance.json").to_path_buf());
         let report = format!(
-            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={}\n",
+            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
@@ -3471,6 +3970,8 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             profile_count,
             profile_file_written,
             profile_round_trip,
+            window_group_editor_interaction,
+            window_group_round_trip,
             standard_mappings_present,
             encoding_rows_present,
             runtime_profile_applied,

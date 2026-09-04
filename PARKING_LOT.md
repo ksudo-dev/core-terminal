@@ -1,6 +1,6 @@
 # Deferred compatibility and scope
 
-Core Terminal 0.2.0 is a Linux terminal emulator. The following items are
+Core Terminal 0.2.1 is a Linux terminal emulator. The following items are
 outside its current parity claim:
 
 - exact macOS Dock tile contents and Dock bounce
@@ -15,10 +15,9 @@ outside its current parity claim:
 - AppleScript compatibility
 
 Window Groups persist ordered profile, directory, and terminal-size entries.
-A startup group launches those entries as tabs. The current editor changes the
-first entry while preserving extra entries loaded from disk. A later editor can
-add entry-by-entry controls, separate top-level windows, and saved window state.
-GNOME chooses placement.
+A startup group launches those entries as tabs, and the editor can add, remove,
+edit, or reorder every entry. Separate top-level group windows and saved window
+placement remain deferred; the desktop compositor chooses placement.
 
 The Encodings page identifies UTF-8 as active and labels legacy encodings as
 unavailable. It does not pretend that disabled entries work.

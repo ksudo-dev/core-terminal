@@ -1,9 +1,9 @@
 [package]
 name = "core-terminal"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "A small GTK4/VTE terminal modeled on macOS Terminal"
+description = "A GTK4 terminal with Terminal.app-style profiles and reusable window groups"
 publish = false
 
 [dependencies]

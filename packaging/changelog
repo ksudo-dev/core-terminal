@@ -1,3 +1,13 @@
+core-terminal (0.2.1) unstable; urgency=medium
+
+  * Make the bottom Settings Save action authoritative for Window Groups.
+  * Add, remove, edit, and reorder every tab in a saved Window Group.
+  * Protect profiles referenced by groups and validate saved directories.
+  * Preserve the host login shell and desktop session environment in Flatpak.
+  * Remove Flatpak development files and expand release checks.
+
+ -- Kasey <211167966+ksudo-dev@users.noreply.github.com>  Thu, 03 Sep 2026 17:45:00 -0700
+
 core-terminal (0.2.0) unstable; urgency=medium
 
   * Add the GTK4/VTE settings panes and profile editor paths.

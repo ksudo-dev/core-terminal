@@ -2,7 +2,7 @@
 Type=Application
 Name=Core Terminal
 GenericName=Terminal Emulator
-Comment=A small GTK terminal inspired by macOS Terminal
+Comment=A GTK4 terminal with profiles and reusable window groups
 Exec=core-terminal
 TryExec=core-terminal
 Icon=io.github.ksudo_dev.CoreTerminal

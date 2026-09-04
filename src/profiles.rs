@@ -624,6 +624,8 @@ pub enum ProfileMutationError {
     Protected(String),
     #[error("at least one profile must remain")]
     LastProfile,
+    #[error("profile `{profile}` is used by window group `{group}`")]
+    ProfileUsedByWindowGroup { profile: String, group: String },
     #[error("window group name cannot be empty")]
     EmptyWindowGroupName,
     #[error("window group must contain at least one entry")]
@@ -636,6 +638,8 @@ pub enum ProfileMutationError {
     MissingWindowGroupProfile(String),
     #[error("window group entry dimensions must be between 1 and 1000 columns/rows")]
     InvalidWindowGroupDimensions,
+    #[error("window group working directories must be absolute, bounded paths without control characters")]
+    InvalidWindowGroupDirectory,
 }
 
 #[derive(Clone, Debug)]
@@ -661,7 +665,24 @@ fn validate_window_group_shape(group: &WindowGroup) -> Result<(), ProfileMutatio
     {
         return Err(ProfileMutationError::InvalidWindowGroupDimensions);
     }
+    if group.entries.iter().any(|entry| {
+        entry
+            .working_directory
+            .as_deref()
+            .is_some_and(|path| !valid_window_group_directory(path))
+    }) {
+        return Err(ProfileMutationError::InvalidWindowGroupDirectory);
+    }
     Ok(())
+}
+
+fn valid_window_group_directory(path: &str) -> bool {
+    const MAX_DIRECTORY_BYTES: usize = 4096;
+    let path = path.trim();
+    path.is_empty()
+        || (path.len() <= MAX_DIRECTORY_BYTES
+            && Path::new(path).is_absolute()
+            && !path.chars().any(char::is_control))
 }
 
 impl ProfileStore {
@@ -709,6 +730,10 @@ impl ProfileStore {
                         profile_names.contains(entry.profile.as_str())
                             && (1..=1_000).contains(&entry.columns)
                             && (1..=1_000).contains(&entry.rows)
+                            && entry
+                                .working_directory
+                                .as_deref()
+                                .is_none_or(valid_window_group_directory)
                     })
             })
             .collect();
@@ -892,6 +917,37 @@ impl ProfileStore {
         Ok(())
     }
 
+    /// Replace a window group in place, including an optional name change.
+    /// Validation completes before the stored group is mutated, so a failed
+    /// rename cannot leave both the old and new names behind.
+    pub fn rename_window_group(
+        &mut self,
+        old_name: &str,
+        group: WindowGroup,
+    ) -> Result<(), ProfileMutationError> {
+        validate_window_group_shape(&group)?;
+        let group = group.normalized();
+        self.validate_window_group(&group)?;
+        let index = self
+            .window_groups
+            .iter()
+            .position(|candidate| candidate.name == old_name)
+            .ok_or_else(|| ProfileMutationError::MissingWindowGroup(old_name.to_owned()))?;
+        if group.name != old_name
+            && self
+                .window_groups
+                .iter()
+                .enumerate()
+                .any(|(candidate_index, candidate)| {
+                    candidate_index != index && candidate.name == group.name
+                })
+        {
+            return Err(ProfileMutationError::DuplicateWindowGroup(group.name));
+        }
+        self.window_groups[index] = group;
+        Ok(())
+    }
+
     pub fn delete_window_group(&mut self, name: &str) -> Result<WindowGroup, ProfileMutationError> {
         let index = self
             .window_groups
@@ -1004,6 +1060,16 @@ impl ProfileStore {
         }
         if self.profiles.len() == 1 {
             return Err(ProfileMutationError::LastProfile);
+        }
+        if let Some(group) = self
+            .window_groups
+            .iter()
+            .find(|group| group.entries.iter().any(|entry| entry.profile == name))
+        {
+            return Err(ProfileMutationError::ProfileUsedByWindowGroup {
+                profile: name.to_owned(),
+                group: group.name.clone(),
+            });
         }
         let index = self
             .profiles
@@ -1879,6 +1945,88 @@ mod tests {
             }),
             Err(ProfileMutationError::InvalidWindowGroupDimensions)
         );
+        assert_eq!(
+            store.add_window_group(WindowGroup {
+                name: "bad-directory".into(),
+                entries: vec![WindowGroupEntry {
+                    profile: DEFAULT_PROFILE_NAME.into(),
+                    working_directory: Some("relative/path".into()),
+                    columns: 80,
+                    rows: 24,
+                }],
+            }),
+            Err(ProfileMutationError::InvalidWindowGroupDirectory)
+        );
+        for directory in [
+            "relative/path".to_owned(),
+            "/tmp/with\ncontrol".to_owned(),
+            format!("/{}", "x".repeat(4096)),
+        ] {
+            assert_eq!(
+                store.add_window_group(WindowGroup {
+                    name: "invalid-directory".into(),
+                    entries: vec![WindowGroupEntry {
+                        profile: DEFAULT_PROFILE_NAME.into(),
+                        working_directory: Some(directory),
+                        columns: 80,
+                        rows: 24,
+                    }],
+                }),
+                Err(ProfileMutationError::InvalidWindowGroupDirectory)
+            );
+        }
+        store
+            .add_window_group(WindowGroup {
+                name: "Whitespace directory".into(),
+                entries: vec![WindowGroupEntry {
+                    profile: DEFAULT_PROFILE_NAME.into(),
+                    working_directory: Some("   ".into()),
+                    columns: 80,
+                    rows: 24,
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            store.window_group("Whitespace directory").unwrap().entries[0].working_directory,
+            None
+        );
+        store
+            .rename_window_group(
+                "Whitespace directory",
+                WindowGroup {
+                    name: "Renamed group".into(),
+                    entries: vec![WindowGroupEntry {
+                        profile: DEFAULT_PROFILE_NAME.into(),
+                        working_directory: Some(format!("/{}", "x".repeat(4095))),
+                        columns: 81,
+                        rows: 25,
+                    }],
+                },
+            )
+            .unwrap();
+        assert!(store.window_group("Whitespace directory").is_none());
+        assert_eq!(
+            store.window_group("Renamed group").unwrap().entries[0].columns,
+            81
+        );
+        assert_eq!(
+            store.rename_window_group(
+                "Renamed group",
+                WindowGroup {
+                    name: "Development".into(),
+                    entries: vec![WindowGroupEntry {
+                        profile: DEFAULT_PROFILE_NAME.into(),
+                        working_directory: None,
+                        columns: 80,
+                        rows: 24,
+                    }],
+                }
+            ),
+            Err(ProfileMutationError::DuplicateWindowGroup(
+                "Development".into()
+            ))
+        );
+        assert!(store.window_group("Renamed group").is_some());
         let path = std::env::temp_dir().join(format!(
             "core-terminal-window-groups-{}-{}.json",
             std::process::id(),
@@ -1898,6 +2046,38 @@ mod tests {
             store.delete_window_group("Development").unwrap().name,
             "Development"
         );
+        assert_eq!(
+            store.delete_window_group("Renamed group").unwrap().name,
+            "Renamed group"
+        );
         assert!(store.window_groups().is_empty());
+    }
+
+    #[test]
+    fn profiles_referenced_by_window_groups_cannot_be_deleted() {
+        let mut store = ProfileStore::defaults();
+        let mut profile = TerminalProfile::homebrew();
+        profile.name = "Project".into();
+        store.add_profile(profile).unwrap();
+        store
+            .add_window_group(WindowGroup {
+                name: "Development".into(),
+                entries: vec![WindowGroupEntry {
+                    profile: "Project".into(),
+                    working_directory: None,
+                    columns: 80,
+                    rows: 24,
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.delete_profile("Project"),
+            Err(ProfileMutationError::ProfileUsedByWindowGroup {
+                profile: "Project".into(),
+                group: "Development".into(),
+            })
+        );
+        assert!(store.profile("Project").is_some());
     }
 }

@@ -19,6 +19,10 @@ scripts/security-audit.sh
 Changes that affect a Debian payload should also run `scripts/build-deb.sh`,
 `scripts/check-deb.sh`, and `scripts/check-private-data.sh`.
 
+Release packaging changes should also follow
+[`docs/RELEASE_VERIFICATION.md`](docs/RELEASE_VERIFICATION.md) so published
+files have both matching checksums and verifiable build provenance.
+
 GTK, VTE, lifecycle, or settings changes also need a native run:
 
 ```sh
@@ -43,3 +47,5 @@ Use a focused title, list the checks you ran, and call out Linux or Wayland
 limits. Don't claim a check passed when it wasn't run. Maintainers review
 security-sensitive changes to shell spawning, profile import, process signals,
 URI handling, and package contents before merge.
+
+Please read [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) before participating.
