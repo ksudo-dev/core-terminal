@@ -174,3 +174,16 @@ The last command checks the host-shell bridge without replacing the host
 session environment. CI also launches the installed Flatpak under X11 and
 runs the real GTK/VTE acceptance harness. A native desktop acceptance run
 remains required for GTK, VTE, Wayland, tabs, settings, and pointer behavior.
+
+Remove a user-installed bundle with:
+
+```sh
+flatpak uninstall --user io.github.ksudo_dev.CoreTerminal
+```
+
+## GitHub release order
+
+The release workflow publishes only from a `v0.2.2` tag whose commit is already
+reachable from `main`. Merge the reviewed release branch into `main`, verify
+the commit on `main`, then create and push the tag. Do not tag an unmerged
+release branch: the workflow rejects it before publishing artifacts.

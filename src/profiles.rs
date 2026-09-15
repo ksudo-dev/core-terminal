@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
-    io::{Cursor, Write},
+    io::{self, Cursor, Read, Write},
     path::Path,
 };
 
@@ -19,6 +19,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub const DEFAULT_PROFILE_NAME: &str = "Homebrew";
 pub const PROFILE_SETTINGS_FILENAME: &str = "profiles.json";
+const MAX_PERSISTED_INPUT_BYTES: usize = 4 * 1024 * 1024;
 pub const BUILTIN_PROFILE_NAMES: [&str; 10] = [
     "Basic",
     "Grass",
@@ -31,6 +32,37 @@ pub const BUILTIN_PROFILE_NAMES: [&str; 10] = [
     "Silver Aerogel",
     "Solid Colors",
 ];
+
+/// Read a regular file from one handle, limiting the returned data to `limit`
+/// bytes. Opening nonblocking first prevents a selected FIFO from stalling the
+/// UI, while checking the opened handle (rather than the path) closes the
+/// metadata/read race for files that are replaced or grow while being read.
+///
+/// Symlinks intentionally remain supported: the opened target must simply be
+/// a regular file, matching the existing user-config compatibility behavior.
+pub(crate) fn read_bounded_file(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(limit as u64).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(crate) fn read_bounded_text_file(path: &Path, limit: usize) -> io::Result<String> {
+    String::from_utf8(read_bounded_file(path, limit)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -359,6 +391,13 @@ struct LegacyCloseFieldPresence {
     ask_before_close_policy: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct LegacyScrollbackFieldPresence {
+    scrollback_lines: bool,
+    scrollback_limit: bool,
+    scrollback_unlimited: bool,
+}
+
 impl TerminalProfile {
     pub fn homebrew() -> Self {
         Self {
@@ -368,7 +407,7 @@ impl TerminalProfile {
             cursor: "#00ff00ff".into(),
             selection: "#14532dff".into(),
             bold_color: "#ffffffff".into(),
-            font: "Monospace 12".into(),
+            font: "Monospace".into(),
             font_size: 12.0,
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
@@ -460,6 +499,26 @@ impl TerminalProfile {
         }
     }
 
+    fn migrate_legacy_scrollback(&mut self, presence: LegacyScrollbackFieldPresence) {
+        // Older profile documents called the editable value `scrollback_limit`.
+        // Only use that alias when the canonical Text-page field is absent;
+        // otherwise a stale compatibility value must never raise the user's
+        // chosen lower limit.
+        if !presence.scrollback_lines && presence.scrollback_limit {
+            if self.scrollback_limit == 0 && !presence.scrollback_unlimited {
+                self.scrollback_unlimited = true;
+            } else if self.scrollback_limit != 0 {
+                self.scrollback_lines = self.scrollback_limit;
+            }
+        }
+        // Keep the old serialized field as a compatibility mirror. It is not
+        // an independent runtime setting and must not override scrollback_lines.
+        self.scrollback_limit = self.scrollback_lines;
+        if !presence.scrollback_unlimited && self.scrollback_limit == 0 {
+            self.scrollback_unlimited = true;
+        }
+    }
+
     /// Return a usable profile even when a field is missing from a hand-edited
     /// project JSON file.
     pub fn normalized(mut self) -> Self {
@@ -490,7 +549,8 @@ impl TerminalProfile {
         }
         self.columns = self.columns.clamp(1, 1_000);
         self.rows = self.rows.clamp(1, 1_000);
-        self.scrollback_limit = self.scrollback_limit.clamp(100, 1_000_000);
+        self.scrollback_lines = self.scrollback_lines.clamp(1, 1_000_000);
+        self.scrollback_limit = self.scrollback_lines;
         self.terminal_type = sanitize_terminal_type(&self.terminal_type);
         self.shell_command = self.shell_command.trim().to_owned();
         self.shell = self.shell.trim().to_owned();
@@ -548,6 +608,16 @@ impl TerminalProfile {
             .filter(|process| !process.is_empty())
             .collect();
         self
+    }
+
+    /// Return the single scrollback value that the renderer should use.
+    /// `-1` is VTE's explicit unlimited-scrollback representation.
+    pub fn effective_scrollback_lines(&self) -> i64 {
+        if self.scrollback_unlimited {
+            -1
+        } else {
+            self.scrollback_lines.clamp(1, 1_000_000) as i64
+        }
     }
 }
 
@@ -783,28 +853,10 @@ impl ProfileStore {
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ProfileError> {
-        Self::load_from_path_with_permissions(path, true)
-    }
-
-    fn load_from_path_with_permissions(
-        path: impl AsRef<Path>,
-        repair_private_permissions: bool,
-    ) -> Result<Self, ProfileError> {
-        const MAX_PROFILE_BYTES: u64 = 4 * 1024 * 1024;
         let path = path.as_ref();
-        if fs::metadata(path)?.len() > MAX_PROFILE_BYTES {
+        let content = read_bounded_text_file(path, MAX_PERSISTED_INPUT_BYTES + 1)?;
+        if content.len() > MAX_PERSISTED_INPUT_BYTES {
             return Err(ProfileError::TooLarge);
-        }
-        let content = fs::read_to_string(path)?;
-        #[cfg(unix)]
-        {
-            if repair_private_permissions
-                && fs::symlink_metadata(path)
-                    .map(|metadata| !metadata.file_type().is_symlink())
-                    .unwrap_or(false)
-            {
-                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-            }
         }
         Self::load_from_str(&content)
     }
@@ -825,7 +877,7 @@ impl ProfileStore {
         candidates.push(Path::new("data/default-profiles.json").to_path_buf());
         candidates
             .into_iter()
-            .find_map(|path| Self::load_from_path_with_permissions(path, false).ok())
+            .find_map(|path| Self::load_from_path(path).ok())
             .unwrap_or_else(Self::defaults)
     }
 
@@ -905,6 +957,21 @@ impl ProfileStore {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let scrollback_field_presence = value
+            .get("profiles")
+            .and_then(serde_json::Value::as_array)
+            .map(|profiles| {
+                profiles
+                    .iter()
+                    .map(|profile| LegacyScrollbackFieldPresence {
+                        scrollback_lines: profile.get("scrollback_lines").is_some(),
+                        scrollback_limit: profile.get("scrollback_limit").is_some(),
+                        scrollback_unlimited: profile.get("scrollback_unlimited").is_some()
+                            || profile.get("scrollback_is_unlimited").is_some(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut document: ProfileDocument = serde_json::from_value(value)?;
         for (profile, presence) in document
             .profiles
@@ -912,6 +979,13 @@ impl ProfileStore {
             .zip(close_field_presence.into_iter())
         {
             profile.migrate_legacy_close_fields(presence);
+        }
+        for (profile, presence) in document
+            .profiles
+            .iter_mut()
+            .zip(scrollback_field_presence.into_iter())
+        {
+            profile.migrate_legacy_scrollback(presence);
         }
         let mut store = Self::new_with_window_groups(document.profiles, document.window_groups)?;
         if let Some(default_profile) = document.default_profile {
@@ -928,6 +1002,22 @@ impl ProfileStore {
 
     pub fn profiles(&self) -> &[TerminalProfile] {
         &self.profiles
+    }
+
+    /// Fold the pre-profile global flags into every profile using the exact
+    /// runtime formulas used before schema 6. After this one-time migration,
+    /// the visible profile controls are the sole source of these behaviors.
+    pub fn migrate_legacy_runtime_flags(
+        &mut self,
+        global_scroll_on_input: bool,
+        global_audible_bell: bool,
+        global_bold_is_bright: bool,
+    ) {
+        for profile in &mut self.profiles {
+            profile.scroll_on_input &= global_scroll_on_input;
+            profile.audible_bell |= global_audible_bell;
+            profile.bold_is_bright &= global_bold_is_bright;
+        }
     }
 
     pub fn window_groups(&self) -> &[WindowGroup] {
@@ -1228,12 +1318,11 @@ pub fn import_terminal_plist(xml: &str) -> Result<TerminalProfile, ProfilePlistE
 pub fn import_terminal_plist_from_path(
     path: impl AsRef<Path>,
 ) -> Result<PlistImport, ProfilePlistError> {
-    const MAX_PLIST_BYTES: u64 = 4 * 1024 * 1024;
     let path = path.as_ref();
-    if fs::metadata(path)?.len() > MAX_PLIST_BYTES {
+    let bytes = read_bounded_file(path, MAX_PERSISTED_INPUT_BYTES + 1)?;
+    if bytes.len() > MAX_PERSISTED_INPUT_BYTES {
         return Err(ProfilePlistError::TooLarge);
     }
-    let bytes = fs::read(path)?;
     import_terminal_plist_bytes_with_report(&bytes)
 }
 
@@ -1242,8 +1331,7 @@ pub fn import_terminal_plist_with_report(xml: &str) -> Result<PlistImport, Profi
 }
 
 fn import_terminal_plist_bytes_with_report(bytes: &[u8]) -> Result<PlistImport, ProfilePlistError> {
-    const MAX_PLIST_BYTES: usize = 4 * 1024 * 1024;
-    if bytes.len() > MAX_PLIST_BYTES {
+    if bytes.len() > MAX_PERSISTED_INPUT_BYTES {
         return Err(ProfilePlistError::TooLarge);
     }
     // plist's XML reader does not resolve external entities, but reject these
@@ -1732,6 +1820,8 @@ mod tests {
     #[test]
     fn profile_defaults_cover_terminal_behavior_surface() {
         let profile = TerminalProfile::homebrew();
+        assert_eq!(profile.font, "Monospace");
+        assert_eq!(profile.font_size, 12.0);
         assert_eq!(profile.ansi_palette.len(), 16);
         assert_eq!(profile.columns, 80);
         assert_eq!(profile.rows, 24);
@@ -1744,6 +1834,104 @@ mod tests {
         assert!(profile.smooth_resize);
         assert_eq!(profile.key_mappings.len(), 20);
         assert_eq!(profile.key_mappings[0].action, r"\eOP");
+    }
+
+    #[test]
+    fn project_man_page_profile_keeps_its_48_line_scrollback() {
+        let store =
+            ProfileStore::load_from_str(include_str!("../data/default-profiles.json")).unwrap();
+        let profile = store.profile("Man Page").unwrap();
+        assert_eq!(profile.scrollback_lines, 48);
+        assert_eq!(profile.scrollback_limit, 48);
+        assert_eq!(profile.effective_scrollback_lines(), 48);
+    }
+
+    #[test]
+    fn legacy_scrollback_alias_never_overrides_an_explicit_canonical_value() {
+        let mut value = serde_json::to_value(ProfileDocument {
+            default_profile: Some(DEFAULT_PROFILE_NAME.into()),
+            profiles: vec![TerminalProfile::homebrew()],
+            window_groups: Vec::new(),
+        })
+        .unwrap();
+        let profile = value["profiles"][0].as_object_mut().unwrap();
+        profile.insert("scrollback_lines".into(), 48.into());
+        profile.insert("scrollback_limit".into(), 10_000.into());
+        let store = ProfileStore::load_from_str(&value.to_string()).unwrap();
+        let profile = store.profile(DEFAULT_PROFILE_NAME).unwrap();
+        assert_eq!(profile.scrollback_lines, 48);
+        assert_eq!(profile.scrollback_limit, 48);
+        assert_eq!(profile.effective_scrollback_lines(), 48);
+
+        let profile = value["profiles"][0].as_object_mut().unwrap();
+        profile.remove("scrollback_lines");
+        profile.insert("scrollback_limit".into(), 250.into());
+        let store = ProfileStore::load_from_str(&value.to_string()).unwrap();
+        let profile = store.profile(DEFAULT_PROFILE_NAME).unwrap();
+        assert_eq!(profile.scrollback_lines, 250);
+        assert_eq!(profile.scrollback_limit, 250);
+    }
+
+    #[test]
+    fn explicit_bounded_scrollback_wins_over_a_zero_legacy_alias() {
+        let mut value = serde_json::to_value(ProfileDocument {
+            default_profile: Some(DEFAULT_PROFILE_NAME.into()),
+            profiles: vec![TerminalProfile::homebrew()],
+            window_groups: Vec::new(),
+        })
+        .unwrap();
+        let profile = value["profiles"][0].as_object_mut().unwrap();
+        profile.remove("scrollback_lines");
+        profile.insert("scrollback_limit".into(), 0.into());
+        profile.insert("scrollback_unlimited".into(), false.into());
+        let store = ProfileStore::load_from_str(&value.to_string()).unwrap();
+        let profile = store.profile(DEFAULT_PROFILE_NAME).unwrap();
+        assert!(!profile.scrollback_unlimited);
+        assert_eq!(profile.effective_scrollback_lines(), 10_000);
+    }
+
+    #[test]
+    fn legacy_runtime_flags_preserve_old_effective_behavior_across_reloads() {
+        let mut store = ProfileStore::defaults();
+        store
+            .duplicate_profile(DEFAULT_PROFILE_NAME, "Custom")
+            .unwrap();
+        let run_inside_before = store
+            .profiles()
+            .iter()
+            .map(|profile| (profile.name.clone(), profile.run_inside_shell))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        store.migrate_legacy_runtime_flags(false, true, false);
+        for profile in store.profiles() {
+            assert!(!profile.scroll_on_input);
+            assert!(profile.audible_bell);
+            assert!(!profile.bold_is_bright);
+            assert_eq!(
+                profile.run_inside_shell,
+                run_inside_before[profile.name.as_str()]
+            );
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "core-terminal-runtime-migration-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        store.save_to_path(&path).unwrap();
+        let once = ProfileStore::load_from_path(&path).unwrap();
+        once.save_to_path(&path).unwrap();
+        let twice = ProfileStore::load_from_path(&path).unwrap();
+        assert_eq!(once.profiles(), twice.profiles());
+        for profile in twice.profiles() {
+            assert!(!profile.scroll_on_input);
+            assert!(profile.audible_bell);
+            assert!(!profile.bold_is_bright);
+        }
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2055,6 +2243,110 @@ mod tests {
         assert_eq!(imported.profile.name, "Binary Profile");
         assert!(!imported.profile.cursor_blink);
         assert_eq!(imported.profile.cursor_shape, CursorShape::Underline);
+    }
+
+    #[test]
+    fn path_imports_reject_oversized_regular_files() {
+        let path = std::env::temp_dir().join(format!(
+            "core-terminal-profile-oversized-{}-{}.terminal",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, vec![b'x'; MAX_PERSISTED_INPUT_BYTES + 1]).unwrap();
+
+        assert!(matches!(
+            ProfileStore::load_from_path(&path),
+            Err(ProfileError::TooLarge)
+        ));
+        assert!(matches!(
+            import_terminal_plist_from_path(&path),
+            Err(ProfilePlistError::TooLarge)
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bounded_reader_rejects_non_regular_inputs() {
+        let error = read_bounded_file(Path::new("/tmp"), 64).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let path = std::env::temp_dir().join(format!(
+            "core-terminal-profile-fifo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_bytes = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+
+        let error = read_bounded_file(&path, 64).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_loaders_preserve_regular_file_symlink_compatibility() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile_target = std::env::temp_dir().join(format!(
+            "core-terminal-profile-target-{}-{nonce}.json",
+            std::process::id()
+        ));
+        let profile_link = std::env::temp_dir().join(format!(
+            "core-terminal-profile-link-{}-{nonce}.json",
+            std::process::id()
+        ));
+        ProfileStore::defaults()
+            .save_to_path(&profile_target)
+            .unwrap();
+        symlink(&profile_target, &profile_link).unwrap();
+        assert!(!ProfileStore::load_from_path(&profile_link)
+            .unwrap()
+            .profiles()
+            .is_empty());
+
+        let plist_target = std::env::temp_dir().join(format!(
+            "core-terminal-plist-target-{}-{nonce}.terminal",
+            std::process::id()
+        ));
+        let plist_link = std::env::temp_dir().join(format!(
+            "core-terminal-plist-link-{}-{nonce}.terminal",
+            std::process::id()
+        ));
+        fs::write(
+            &plist_target,
+            r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>name</key><string>Linked</string></dict></plist>"#,
+        )
+        .unwrap();
+        symlink(&plist_target, &plist_link).unwrap();
+        assert_eq!(
+            import_terminal_plist_from_path(&plist_link)
+                .unwrap()
+                .profile
+                .name,
+            "Linked"
+        );
+
+        let _ = fs::remove_file(profile_link);
+        let _ = fs::remove_file(profile_target);
+        let _ = fs::remove_file(plist_link);
+        let _ = fs::remove_file(plist_target);
     }
 
     #[test]

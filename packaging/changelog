@@ -2,11 +2,22 @@ core-terminal (0.2.2) unstable; urgency=medium
 
   * Restore the Text profile form and load its controls from the active
     profile.
+  * Make Text-page scrollback the canonical per-profile value, preserve
+    unlimited and low values, and keep the Window-page field read-only.
+  * Migrate legacy global input-scroll, bell, and bright-bold flags into all
+    profiles once during upgrade.
+  * Store Homebrew's font family and size as separate values.
   * Preserve imported values for unavailable and renderer-owned settings.
   * Keep startup, tab, window, and Window Group launch policies independent.
   * Revalidate close requests and clean complete native and Flatpak sessions.
   * Exercise job control, terminal resizing, signals, and exit status over a
     PTY.
+  * Add a standard menubar and terminal context menu, and keep titlebar
+    controls compositor-owned.
+  * Make the profile editor responsive instead of enforcing a desktop-sized
+    minimum allocation.
+  * Disable ThinLTO in the release profile to avoid the observed Ubuntu
+    Rust/LLVM compiler crash.
 
  -- Kasey <211167966+ksudo-dev@users.noreply.github.com>  Fri, 04 Sep 2026 01:17:22 -0700
 
