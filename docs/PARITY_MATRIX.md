@@ -12,11 +12,11 @@ behavior. A value that is only stored does not count.
 | Area | Status in 0.2.2 |
 | --- | --- |
 | Native terminal | GTK4 application with one VTE PTY per tab, login-shell startup, and child-process cleanup |
-| Windows and tabs | New window, new tab, close tab, tab navigation, and Ctrl+1 through Ctrl+9 switching |
-| Settings window | Non-modal General, Profiles, Window Groups, and Encodings pages with a fixed profile sidebar and no outer horizontal scroll |
+| Windows and tabs | New window, new tab, close tab, tab navigation, Ctrl+1 through Ctrl+9 switching, a standard menubar, and a terminal right-click menu |
+| Settings window | Non-modal General, Profiles, Window Groups, and Encodings pages with responsive profile navigation and independently scrollable editor content |
 | Profile pages | Text, Window, Tab, Shell, Keyboard, and Advanced pages are scrollable and keyboard reachable |
 | Profiles | Ten project-owned defaults, profile selection, add, duplicate, delete, reset, default selection, import, and export |
-| Persistence | User settings and profile overrides use JSON under the XDG configuration directory and are written atomically with mode 0600 |
+| Persistence | User settings and profile overrides use JSON under the XDG configuration directory and are written atomically with mode 0600; legacy global runtime flags migrate into every profile once |
 | Pointer behavior | VTE pointer autohide is disabled for every terminal; Core Terminal does not request browser Pointer Lock |
 | Encodings | UTF-8 is active. Legacy entries are labeled unavailable because the current VTE wrapper does not expose a safe per-session selector |
 | Window Groups | Logical groups can be added, removed, renamed, saved, selected for startup, and launched as ordered tabs |
@@ -24,10 +24,12 @@ behavior. A value that is only stored does not count.
 The release binary passed the built-in GTK/VTE acceptance harness on the native
 GNOME Wayland socket `wayland-0`. The harness opened every settings page,
 activated the real Save callback, reloaded the saved profile, checked VTE
-runtime properties, exercised tab creation and closure, and verified that VTE
-pointer autohide remained disabled. It also checked the settings allocation,
-readable profile labels, labeled profile actions, and unclipped profile tabs. A
-browser-based KVM can still add a Pointer Lock layer outside this process.
+runtime properties, checked the canonical profile scrollback value and its
+read-only compatibility mirror, exercised tab creation and closure, and
+verified that VTE pointer autohide remained disabled. It also checked the
+settings allocation, readable profile labels, labeled profile actions, and
+unclipped profile tabs. A browser-based KVM can still add a Pointer Lock layer
+outside this process.
 
 ## Settings coverage
 
@@ -41,11 +43,13 @@ path. A custom command runs through the login shell when that mode is selected.
 ### Profiles
 
 The editor exposes the six requested pages and seven text-labeled profile
-actions. The profile list has its own vertical scroller; horizontal wheel input
-cannot shift the sidebar or editor tabs out of view. The Text form is required
-by native acceptance, including font, cursor, and scrollback controls. Switching
-profiles reloads every editable value while renderer-owned controls continue to
-show their effective state. Built-in names remain protected from deletion.
+actions. The profile list has its own vertical scroller, while the page selector
+and page content scroll independently when the settings window is narrow. The
+window has no hard desktop-sized minimum, so it can be resized without hiding
+profile names or editor pages. The Text form is required by native acceptance,
+including font, cursor, and scrollback controls. Switching profiles reloads
+every editable value while renderer-owned controls continue to show their
+effective state. Built-in names remain protected from deletion.
 Import accepts bounded XML or binary plist data
 and maps the supported Terminal profile fields. Export writes a deterministic
 plist containing the supported Core Terminal fields. Unknown or unsupported
@@ -65,19 +69,24 @@ Profile operations covered by unit or native acceptance tests are:
 The page exposes font family and size, foreground, background, bold, selection,
 and cursor colors, opacity, antialiasing, bold-font use, text blinking, ANSI
 color use, bright ANSI colors, the 16-color palette, cursor blink, and
-scrollback. VTE applies the font, colors, palette, cursor, text-blink mode, and
-scrollback. Antialiasing, ANSI interpretation, bold font selection, and dynamic
+scrollback. The Text-page scrollback value is canonical; unlimited is an
+explicit state, and project values below the usual 100-line default are kept.
+The Window-page scrollback field is a disabled compatibility mirror. VTE applies
+the font, colors, palette, cursor, text-blink mode, and scrollback.
+Antialiasing, ANSI interpretation, bold font selection, and dynamic
 color escape handling are disabled and labeled as VTE-owned.
 
 ### Window
 
 The page exposes title text, optional background image and placement mode,
-title components, columns, rows, resize behavior, scrollback limits, restored
-rows, and a bookmark field. VTE receives the requested columns and rows.
-Profile, shell, directory, process-reported title, and dimensions feed the
-window title. TTY and Ctrl-key title components are disabled because VTE does
-not report them. The desktop compositor controls pixel geometry and top-level
-placement.
+title components, columns, rows, resize behavior, a read-only scrollback mirror,
+restored rows, and a bookmark field. VTE receives the requested columns and
+rows.
+Profile, shell, directory, process-reported title, and dimensions feed each tab
+title. The top-level window title remains `Core Terminal` so the compositor
+titlebar stays stable and uncluttered. TTY and Ctrl-key title components are
+disabled because VTE does not report them. The desktop compositor controls pixel
+geometry and top-level placement.
 
 ### Tab
 
@@ -161,7 +170,9 @@ conversion, application keypad mode, input scrolling, bells, notifications,
 urgency, UTF-8, locale, locale environment setup, and ambiguous-width choice.
 Core Terminal wires Delete binding, Control-V escaping, carriage-return paste,
 scroll-on-input, audible and visual bells, notifications, urgency, locale, and
-CJK ambiguous width to the input or VTE runtime. TERM and locale values are
+CJK ambiguous width to the input or VTE runtime. During upgrade, legacy global
+input-scroll, bell, and bright-bold flags are copied into every profile once;
+new runtime reads use those visible profile values. TERM and locale values are
 validated before entering the child environment. VTE owns application keypad
 mode and UTF-8 decoding, so those controls are disabled and labeled. Visual
 bell output can be limited to profiles where the app's audible bell is off.
@@ -185,8 +196,9 @@ per-session legacy encoding selector.
 
 ## Behavior outside Settings
 
-The current release provides search, selection, clipboard actions, tab
-navigation, and a terminal menu. It does not claim parity for split panes,
+The current release provides a standard menubar, a terminal right-click menu,
+search, selection, clipboard actions, and tab navigation. It does not claim
+parity for split panes,
 Inspector, marks and bookmarks, print or content export, hyperlink workflows,
 dragged-file quoting, remote-connection browsing, or a D-Bus automation API.
 These belong in a later feature plan rather than a release claim.

@@ -4,7 +4,7 @@
 //! baselines live in project data, while this file stores the user's selected
 //! profile and window preferences under the normal XDG config path.
 
-use crate::profiles::{CursorShape, TerminalProfile, DEFAULT_PROFILE_NAME};
+use crate::profiles::{read_bounded_text_file, CursorShape, TerminalProfile, DEFAULT_PROFILE_NAME};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -18,7 +18,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub const APP_CONFIG_DIR: &str = "core-terminal";
 pub const SETTINGS_FILENAME: &str = "settings.json";
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -85,6 +85,11 @@ pub struct Settings {
     pub locale: String,
     #[serde(default)]
     pub set_locale_environment: bool,
+    /// Set after the pre-profile settings flags have been copied into the
+    /// selected profile. This marker makes that compatibility migration one
+    /// time while retaining the old fields for schema compatibility.
+    #[serde(default)]
+    pub legacy_profile_flags_migrated: bool,
 }
 
 fn default_selected_profile() -> String {
@@ -159,6 +164,7 @@ impl Default for Settings {
             terminal_type: default_terminal_type(),
             locale: String::new(),
             set_locale_environment: false,
+            legacy_profile_flags_migrated: true,
         }
     }
 }
@@ -179,6 +185,7 @@ impl Settings {
 
     pub fn normalize(mut self) -> Self {
         if self.schema_version < CURRENT_SCHEMA_VERSION {
+            self.legacy_profile_flags_migrated = false;
             if self.startup_profile == default_selected_profile()
                 && self.selected_profile != default_selected_profile()
             {
@@ -272,19 +279,11 @@ impl Settings {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, SettingsError> {
+        const MAX_SETTINGS_BYTES: usize = 4 * 1024 * 1024;
         let path = path.as_ref();
-        if fs::metadata(path)?.len() > 4 * 1024 * 1024 {
+        let content = read_bounded_text_file(path, MAX_SETTINGS_BYTES + 1)?;
+        if content.len() > MAX_SETTINGS_BYTES {
             return Err(SettingsError::TooLarge);
-        }
-        let content = fs::read_to_string(path)?;
-        #[cfg(unix)]
-        {
-            if fs::symlink_metadata(path)
-                .map(|metadata| !metadata.file_type().is_symlink())
-                .unwrap_or(false)
-            {
-                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-            }
         }
         Ok(serde_json::from_str::<Self>(&content)?.normalize())
     }
@@ -370,6 +369,7 @@ mod tests {
     fn defaults_start_with_homebrew() {
         assert_eq!(Settings::default().selected_profile, DEFAULT_PROFILE_NAME);
         assert_eq!(Settings::default().schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(Settings::default().legacy_profile_flags_migrated);
         assert!(!Settings::default().mouse_autohide);
     }
 
@@ -431,6 +431,53 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_an_oversized_file_after_a_bounded_read() {
+        let path = std::env::temp_dir().join(format!(
+            "core-terminal-settings-oversized-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, vec![b' '; 4 * 1024 * 1024 + 1]).unwrap();
+        assert!(matches!(
+            Settings::load(&path),
+            Err(SettingsError::TooLarge)
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_preserves_regular_file_symlink_compatibility() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let target = std::env::temp_dir().join(format!(
+            "core-terminal-settings-target-{}-{nonce}.json",
+            std::process::id()
+        ));
+        let link = std::env::temp_dir().join(format!(
+            "core-terminal-settings-link-{}-{nonce}.json",
+            std::process::id()
+        ));
+        let settings = Settings {
+            selected_profile: "Ocean".into(),
+            ..Settings::default()
+        };
+        settings.save(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(Settings::load(&link).unwrap().selected_profile, "Ocean");
+        let _ = fs::remove_file(link);
+        let _ = fs::remove_file(target);
+    }
+
+    #[test]
     fn old_settings_json_deserializes_with_new_defaults() {
         let old = r#"{
             "selected_profile":"Ocean",
@@ -450,6 +497,7 @@ mod tests {
         assert_eq!(settings.schema_version, 0);
         let migrated = settings.normalize();
         assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(!migrated.legacy_profile_flags_migrated);
         assert!(!migrated.mouse_autohide);
         assert_eq!(migrated.startup_profile, "Ocean");
     }
@@ -513,8 +561,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_through_v4_settings_upgrade_to_v5_without_mouse_hiding() {
-        for version in [0, 1, 2, 3, 4] {
+    fn schema_v1_through_v5_settings_upgrade_to_v6_without_mouse_hiding() {
+        for version in [0, 1, 2, 3, 4, 5] {
             let settings = Settings {
                 schema_version: version,
                 mouse_autohide: true,
@@ -522,6 +570,7 @@ mod tests {
             }
             .normalize();
             assert_eq!(settings.schema_version, CURRENT_SCHEMA_VERSION);
+            assert!(!settings.legacy_profile_flags_migrated);
             assert!(!settings.mouse_autohide);
         }
         let old = r#"{"selected_profile":"Homebrew"}"#;

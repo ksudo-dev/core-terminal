@@ -17,6 +17,14 @@ Verify the checksums and GitHub build provenance using
 [`docs/RELEASE_VERIFICATION.md`](docs/RELEASE_VERIFICATION.md) before installing
 a downloaded artifact.
 
+Choose one package format. Installing both creates two launchers for the same
+application and makes it unclear which build is running. Before changing an
+existing installation, list both formats:
+
+```sh
+dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 'core-terminal*' 'replica-terminal*' 2>/dev/null || true && flatpak list --app --columns=application,name,version,installation 2>/dev/null | grep -Ei 'core|terminal' || true
+```
+
 The Debian package targets Ubuntu 26.04 and `amd64`:
 
 ```sh
@@ -27,8 +35,7 @@ The published Flatpak bundle targets x86_64 Linux distributions with Flatpak
 support. It is a release bundle rather than a Flathub listing:
 
 ```sh
-flatpak install --user ./io.github.ksudo_dev.CoreTerminal.flatpak
-flatpak run io.github.ksudo_dev.CoreTerminal
+flatpak install --user ./io.github.ksudo_dev.CoreTerminal.flatpak && flatpak run --user io.github.ksudo_dev.CoreTerminal
 ```
 
 The Flatpak uses the GNOME runtime for GTK and VTE, but does not require the
@@ -95,6 +102,8 @@ Core Terminal currently includes:
   terminal dimensions
 - VTE-backed PTY tabs and windows with login-shell startup and an optional
   custom command
+- A standard File, Edit, View, Profiles, and Help menubar plus a terminal
+  right-click menu for copy, paste, selection, search, and tab actions
 - Search, selection-aware clipboard actions, tab navigation, and Ctrl+1 through
   Ctrl+9 tab switching
 - XML and binary plist import for supported `.terminal` fields, with
@@ -103,8 +112,11 @@ Core Terminal currently includes:
   indicators where the desktop provides the required integration
 - JSON persistence under the user's XDG configuration directory
 
-The settings window is non-modal. GTK and the compositor own window controls,
-focus, placement, and pointer behavior outside the application window.
+The settings window is non-modal and can shrink below the profile's initial
+terminal geometry. Profile names, settings pages, and editor content scroll
+independently instead of forcing an outer horizontal settings scroller. GTK
+and the compositor own window controls, focus, placement, and pointer behavior
+outside the application window.
 
 ## Linux limits
 
@@ -126,15 +138,20 @@ depend on the desktop and are treated as optional Linux integrations.
 Build and inspect a local package. The script defaults to version 0.2.2:
 
 ```sh
-scripts/build-deb.sh
-scripts/check-deb.sh dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
-lintian --pedantic dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
+scripts/build-deb.sh && scripts/check-deb.sh dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb && lintian --pedantic dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
 ```
 
 Remove it with administrator permission:
 
 ```sh
 sudo apt remove core-terminal
+```
+
+Remove the Flatpak separately; its application ID is
+`io.github.ksudo_dev.CoreTerminal`:
+
+```sh
+flatpak uninstall --user io.github.ksudo_dev.CoreTerminal
 ```
 
 The package contains the release binary, desktop entry, ten project-owned
@@ -156,14 +173,15 @@ To build the bundle locally, install `flatpak` and `flatpak-builder`, add the
 Flathub remote for the current user, and run:
 
 ```sh
-flatpak remote-add --if-not-exists --user flathub \
-  https://flathub.org/repo/flathub.flatpakrepo
-scripts/check-flatpak-source.sh
-scripts/build-flatpak.sh
+flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo && scripts/check-flatpak-source.sh && scripts/build-flatpak.sh
 ```
 
 The build downloads the GNOME 50 SDK and runtime on first use. Cargo crates are
 resolved offline from checksummed entries generated from `Cargo.lock`.
+
+The full local Flatpak acceptance suite also needs `elfutils` and `xvfb`; the
+CI workflow installs those tools when it runs the bundle under an isolated X11
+server.
 
 See [`docs/TESTING.md`](docs/TESTING.md) for the release checklist and
 [`docs/PARITY_MATRIX.md`](docs/PARITY_MATRIX.md) for control-by-control scope.

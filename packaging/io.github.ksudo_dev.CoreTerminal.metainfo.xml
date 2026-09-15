@@ -31,7 +31,9 @@
   <releases>
     <release version="0.2.2" date="2026-09-04">
       <description>
-        <p>Restored complete profile controls and hardened terminal process cleanup.</p>
+        <p>Profile scrollback is canonical on the Text page, legacy global
+        runtime flags migrate into profiles once, and the Homebrew font family
+        and size are stored separately.</p>
       </description>
     </release>
     <release version="0.2.1" date="2026-09-03">

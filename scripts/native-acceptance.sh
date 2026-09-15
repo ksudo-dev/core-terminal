@@ -43,4 +43,17 @@ if [[ ! -f "$report" ]]; then
   exit 1
 fi
 cat "$report"
-grep -Fq 'status=PASS ' "$report"
+
+require_report_field() {
+  local field=$1
+  local expected=$2
+  if ! grep -Eq "(^|[[:space:]])${field}=${expected}([[:space:]]|$)" "$report"; then
+    printf 'acceptance report did not contain %s=%s\n' "$field" "$expected" >&2
+    exit 1
+  fi
+}
+
+require_report_field status PASS
+require_report_field scrollback_mirror_read_only true
+require_report_field scrollback_unlimited_sensitivity true
+require_report_field scrollback_profile_canonical true

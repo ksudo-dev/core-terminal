@@ -17,5 +17,8 @@ plist = "1.10"
 
 [profile.release]
 codegen-units = 1
-lto = "thin"
+# ThinLTO crashes in the Ubuntu Rust/LLVM 21.1.8 toolchain used for our
+# release packages. Keep normal optimized release builds reproducible until
+# that compiler defect is fixed upstream.
+lto = false
 strip = true

@@ -85,11 +85,11 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        compatibility_profile, resolve_new_tab_profile, resolve_window_profile,
-        runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
-        spawn_callback_action, startup_profile_after_deletion, window_group_entry_summary,
-        ProfileStore, SessionManager, Settings, SpawnCallbackAction, WindowGroupEntry,
-        APPLICATION_ID, PROFILE_PAGE_IDS,
+        compatibility_profile, migrate_legacy_profile_flags, resolve_new_tab_profile,
+        resolve_window_profile, runtime_profile_requires_reapply,
+        runtime_terminal_settings_changed, settings_page_ids, spawn_callback_action,
+        startup_profile_after_deletion, window_group_entry_summary, ProfileStore, SessionManager,
+        Settings, SpawnCallbackAction, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -237,7 +237,44 @@ mod structural_tests {
         after.new_window_profile = "Pro".into();
         assert!(!runtime_terminal_settings_changed(&before, &after));
         after.scroll_on_input = !before.scroll_on_input;
+        assert!(!runtime_terminal_settings_changed(&before, &after));
+        after.scroll_on_output = !before.scroll_on_output;
         assert!(runtime_terminal_settings_changed(&before, &after));
+    }
+
+    #[test]
+    fn legacy_global_runtime_flags_fold_into_every_profile_once() {
+        let mut profiles = ProfileStore::defaults();
+        profiles.duplicate_profile("Homebrew", "Custom").unwrap();
+        let run_inside_before = profiles
+            .profiles()
+            .iter()
+            .map(|profile| (profile.name.to_owned(), profile.run_inside_shell))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut settings = Settings {
+            schema_version: 5,
+            scroll_on_input: false,
+            audible_bell: true,
+            bold_is_bright: false,
+            run_command_inside_shell: false,
+            legacy_profile_flags_migrated: false,
+            ..Settings::default()
+        };
+
+        assert!(migrate_legacy_profile_flags(&mut settings, &mut profiles));
+        assert!(settings.legacy_profile_flags_migrated);
+        for profile in profiles.profiles() {
+            assert!(!profile.scroll_on_input);
+            assert!(profile.audible_bell);
+            assert!(!profile.bold_is_bright);
+            assert_eq!(
+                profile.run_inside_shell,
+                run_inside_before[profile.name.as_str()]
+            );
+        }
+        let snapshot = profiles.profiles().to_vec();
+        assert!(!migrate_legacy_profile_flags(&mut settings, &mut profiles));
+        assert_eq!(profiles.profiles(), snapshot);
     }
 
     #[test]
@@ -394,15 +431,17 @@ pub fn install_style(display: &gtk::gdk::Display) {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
         ".core-profile-selector { min-width: 150px; }\
+         .core-terminal-menubar { padding: 0 8px; }\
+         .core-terminal-toolbar { padding: 6px 10px; border-bottom: 1px solid alpha(currentColor, 0.12); }\
          .core-settings-sidebar { background: alpha(currentColor, 0.04); padding: 12px; }\
          .core-profile-row { min-height: 40px; }\
          .core-profile-row-label { padding: 8px 10px; }\
          .core-profile-action { min-width: 0; min-height: 36px; padding: 4px 8px; }\
-         .core-settings-pane { padding: 24px; }\
+         .core-settings-pane { padding: 18px; }\
          .core-settings-title { font-size: 1.35em; font-weight: 700; }\
          .core-settings-section { font-weight: 700; margin-top: 8px; }\
          .core-settings-action { min-width: 96px; min-height: 36px; }\
-         .core-settings-tab { min-height: 34px; padding: 0 14px; }\
+         .core-settings-tab { min-height: 34px; padding: 0 10px; }\
          vte.core-visual-bell { background-color: alpha(@warning_color, 0.28); }",
     );
     gtk::style_context_add_provider_for_display(
@@ -418,6 +457,56 @@ pub fn build_header_bar() -> gtk::HeaderBar {
     let bar = gtk::HeaderBar::new();
     bar.set_show_title_buttons(true);
     bar
+}
+
+fn terminal_menu_model() -> gio::Menu {
+    let menu = gio::Menu::new();
+    let file = gio::Menu::new();
+    file.append(Some("New Window"), Some("win.new-window"));
+    file.append(Some("New Tab"), Some("win.new-tab"));
+    file.append(Some("Close Tab"), Some("win.close-tab"));
+    file.append(Some("Quit"), Some("win.quit"));
+    let edit = gio::Menu::new();
+    edit.append(Some("Copy"), Some("win.copy"));
+    edit.append(Some("Paste"), Some("win.paste"));
+    edit.append(Some("Select All"), Some("win.select-all"));
+    edit.append(Some("Find"), Some("win.search"));
+    let view = gio::Menu::new();
+    view.append(Some("Next Tab"), Some("win.next-tab"));
+    view.append(Some("Previous Tab"), Some("win.previous-tab"));
+    let profiles = gio::Menu::new();
+    profiles.append(Some("Settings"), Some("win.settings"));
+    profiles.append(
+        Some("Restore Default Profiles"),
+        Some("win.restore-profiles"),
+    );
+    let help = gio::Menu::new();
+    help.append(Some("About Core Terminal"), Some("win.about"));
+    menu.append_submenu(Some("File"), &file);
+    menu.append_submenu(Some("Edit"), &edit);
+    menu.append_submenu(Some("View"), &view);
+    menu.append_submenu(Some("Profiles"), &profiles);
+    menu.append_submenu(Some("Help"), &help);
+    menu
+}
+
+fn install_terminal_context_menu(terminal: &vte4::Terminal) {
+    let menu = gio::Menu::new();
+    menu.append(Some("Copy"), Some("win.copy"));
+    menu.append(Some("Paste"), Some("win.paste"));
+    menu.append(Some("Select All"), Some("win.select-all"));
+    menu.append(Some("Find"), Some("win.search"));
+    menu.append(Some("New Tab"), Some("win.new-tab"));
+    menu.append(Some("Close Tab"), Some("win.close-tab"));
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_widget_name("terminal-context-menu");
+    popover.set_parent(terminal);
+    let click = gtk::GestureClick::builder().button(3).build();
+    click.connect_pressed(move |_, _, x, y| {
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.popup();
+    });
+    terminal.add_controller(click);
 }
 
 pub fn profile_selector(store: &ProfileStore, active_name: &str) -> gtk::DropDown {
@@ -436,13 +525,32 @@ fn load_user_profiles() -> ProfileStore {
     ProfileStore::load_user_or_defaults()
 }
 
-fn save_user_profiles(store: &ProfileStore) {
+/// Fold settings fields that predate profile-owned runtime controls into every
+/// profile once. This preserves the old effective behavior while making the
+/// visible profile controls authoritative after migration.
+fn migrate_legacy_profile_flags(settings: &mut Settings, profiles: &mut ProfileStore) -> bool {
+    if settings.legacy_profile_flags_migrated {
+        return false;
+    }
+    profiles.migrate_legacy_runtime_flags(
+        settings.scroll_on_input,
+        settings.audible_bell,
+        settings.bold_is_bright,
+    );
+    settings.legacy_profile_flags_migrated = true;
+    true
+}
+
+fn save_user_profiles(store: &ProfileStore) -> bool {
     if let Some(path) = ProfileStore::config_path() {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if std::fs::create_dir_all(parent).is_err() {
+                return false;
+            }
         }
-        let _ = store.save_to_path(path);
+        return store.save_to_path(path).is_ok();
     }
+    false
 }
 
 pub fn connect_profile_selector<F>(dropdown: &gtk::DropDown, on_changed: F)
@@ -482,13 +590,13 @@ where
         // from settings without becoming stranded in this window.
         .modal(false)
         .transient_for(parent)
-        .default_width(1120)
-        .default_height(780)
+        .destroy_with_parent(true)
+        .default_width(1024)
+        .default_height(720)
         .build();
-    // The Profiles page has a fixed navigation column and six visible tabs.
-    // Keep enough room for both instead of allowing GTK to collapse either
-    // side into an unusable sliver on first launch.
-    window.set_size_request(960, 680);
+    // This is a usable floor, not a fixed layout. The profile controls scroll
+    // independently below this size instead of clipping profile names or tabs.
+    window.set_size_request(720, 480);
     enforce_non_modal(&window);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
@@ -529,24 +637,42 @@ where
     root.append(&controls.footer);
     window.set_child(Some(&root));
 
+    // Native file choosers are not widgets in this window's tree. Track the
+    // one active chooser explicitly so repeated clicks cannot stack portal
+    // dialogs and closing Settings cannot leave an orphaned chooser behind.
+    let active_profile_chooser = Rc::new(RefCell::new(None::<gtk::FileChooserNative>));
+    let close_profile_chooser = active_profile_chooser.clone();
+    window.connect_close_request(move |_| {
+        let chooser = close_profile_chooser.borrow_mut().take();
+        if let Some(chooser) = chooser {
+            chooser.hide();
+        }
+        glib::Propagation::Proceed
+    });
+
     let initial = settings.clone();
     let initial_focus = controls.startup_profile.clone();
     let import_button = controls.profile_import.clone();
     let import_startup = controls.startup_profile.clone();
-    let import_parent = parent.clone();
+    let import_parent = window.clone();
+    let import_chooser = active_profile_chooser.clone();
     let import_store = profile_store.clone();
     let import_list = controls.profile_list.clone();
     let import_new_window = controls.new_window_profile.clone();
     let import_new_tab = controls.new_tab_profile.clone();
     let import_group_profile = controls.window_group_profile.clone();
     import_button.connect_clicked(move |_| {
-        let chooser = gtk::FileChooserNative::builder()
-            .title("Import Profile")
-            .accept_label("Import")
-            .cancel_label("Cancel")
-            .transient_for(&import_parent)
-            .action(gtk::FileChooserAction::Open)
-            .build();
+        let existing = import_chooser.borrow().as_ref().cloned();
+        if let Some(chooser) = existing {
+            chooser.show();
+            return;
+        }
+        let chooser = profile_file_chooser(
+            &import_parent,
+            "Import Profile",
+            "Import",
+            gtk::FileChooserAction::Open,
+        );
         let filter = gtk::FileFilter::new();
         filter.add_pattern("*.terminal");
         filter.set_name(Some("Terminal profiles (*.terminal)"));
@@ -558,7 +684,10 @@ where
         let new_tab = import_new_tab.clone();
         let group_profile = import_group_profile.clone();
         let error_parent = import_parent.clone();
+        let chooser_slot = import_chooser.clone();
         chooser.connect_response(move |chooser, response| {
+            chooser_slot.borrow_mut().take();
+            chooser.hide();
             if response == gtk::ResponseType::Accept {
                 let Some(path) = chooser.file().and_then(|file| file.path()) else {
                     show_settings_error(
@@ -607,26 +736,35 @@ where
                 }
             }
         });
+        *import_chooser.borrow_mut() = Some(chooser.clone());
         chooser.show();
     });
 
     let export_button = controls.profile_export.clone();
     let export_selection = controls.profile_selection.clone();
-    let export_parent = parent.clone();
+    let export_parent = window.clone();
+    let export_chooser = active_profile_chooser.clone();
     let export_store = profile_store.clone();
     export_button.connect_clicked(move |_| {
-        let chooser = gtk::FileChooserNative::builder()
-            .title("Export Profile")
-            .accept_label("Export")
-            .cancel_label("Cancel")
-            .transient_for(&export_parent)
-            .action(gtk::FileChooserAction::Save)
-            .build();
+        let existing = export_chooser.borrow().as_ref().cloned();
+        if let Some(chooser) = existing {
+            chooser.show();
+            return;
+        }
+        let chooser = profile_file_chooser(
+            &export_parent,
+            "Export Profile",
+            "Export",
+            gtk::FileChooserAction::Save,
+        );
         chooser.set_current_name("Core Terminal Profile.terminal");
         let selection = export_selection.clone();
         let export_store = export_store.clone();
         let error_parent = export_parent.clone();
+        let chooser_slot = export_chooser.clone();
         chooser.connect_response(move |chooser, response| {
+            chooser_slot.borrow_mut().take();
+            chooser.hide();
             if response == gtk::ResponseType::Accept {
                 let Some(path) = chooser.file().and_then(|file| file.path()) else {
                     show_settings_error(
@@ -655,6 +793,7 @@ where
                 }
             }
         });
+        *export_chooser.borrow_mut() = Some(chooser.clone());
         chooser.show();
     });
 
@@ -729,7 +868,7 @@ where
     let delete_store = controls.profile_store.clone();
     let delete_list = controls.profile_list.clone();
     let delete_commit_window_group = controls.commit_window_group.clone();
-    let delete_error_parent = parent.clone();
+    let delete_error_parent = window.clone();
     delete_button.connect_clicked(move |_| {
         let name = delete_selection.borrow().clone();
         if name.is_empty() {
@@ -921,9 +1060,8 @@ where
                 use_custom_command: controls.use_custom_command.is_active(),
                 custom_command: controls.custom_command.text().to_string(),
                 shell: controls.shell.text().to_string(),
-                // This checkbox belongs to the selected profile. Retain the
-                // legacy global fallback until General exposes a separate
-                // control for it.
+                // General's custom-command mode remains global. A profile's
+                // similarly named control applies only to its profile command.
                 run_command_inside_shell: initial.run_command_inside_shell,
                 // Locale is profile-owned in the editor; retain the global
                 // setting until a dedicated global locale control exists.
@@ -932,14 +1070,17 @@ where
                 new_tab_same_directory: controls.new_tab_same_directory.is_active(),
                 ctrl_number_tabs: controls.ctrl_number_tabs.is_active(),
                 scroll_on_output: controls.scroll_on_output.is_active(),
-                scroll_on_input: controls.scroll_on_input.is_active(),
-                audible_bell: controls.audible_bell.is_active(),
-                bold_is_bright: controls.bold_is_bright.is_active(),
+                // These fields remain for old settings readers only. Runtime
+                // behavior is owned by the visible profile controls.
+                scroll_on_input: compatibility_profile.scroll_on_input,
+                audible_bell: compatibility_profile.audible_bell,
+                bold_is_bright: compatibility_profile.bold_is_bright,
                 // Pointer auto-hide is deliberately never user-configurable: the
                 // KVM-safe runtime policy always keeps the pointer visible.
                 mouse_autohide: false,
                 background_notifications: controls.background_notifications.is_active(),
                 terminal_type: compatibility_profile.terminal_type,
+                legacy_profile_flags_migrated: true,
             },
             edited_profiles,
         );
@@ -950,6 +1091,23 @@ where
     window.present();
     initial_focus.grab_focus();
     window
+}
+
+#[allow(deprecated)]
+fn profile_file_chooser(
+    parent: &gtk::Window,
+    title: &str,
+    accept_label: &str,
+    action: gtk::FileChooserAction,
+) -> gtk::FileChooserNative {
+    gtk::FileChooserNative::builder()
+        .title(title)
+        .accept_label(accept_label)
+        .cancel_label("Cancel")
+        .modal(false)
+        .transient_for(parent)
+        .action(action)
+        .build()
 }
 
 struct SettingsControls {
@@ -981,9 +1139,6 @@ struct SettingsControls {
     new_window_same_directory: gtk::CheckButton,
     ctrl_number_tabs: gtk::CheckButton,
     scroll_on_output: gtk::CheckButton,
-    scroll_on_input: gtk::CheckButton,
-    audible_bell: gtk::CheckButton,
-    bold_is_bright: gtk::CheckButton,
     // Pointer auto-hide intentionally has no settings control. All VTE
     // terminals are forced to keep the pointer visible for KVM safety.
     background_notifications: gtk::CheckButton,
@@ -1193,7 +1348,7 @@ impl SettingsControls {
         let profile_sidebar = gtk::Box::new(gtk::Orientation::Vertical, 8);
         profile_sidebar.set_widget_name("profile-sidebar");
         profile_sidebar.add_css_class("core-settings-sidebar");
-        profile_sidebar.set_size_request(300, -1);
+        profile_sidebar.set_size_request(220, -1);
         let profile_heading = gtk::Label::new(Some("Profiles"));
         profile_heading.add_css_class("core-settings-title");
         profile_heading.set_halign(gtk::Align::Start);
@@ -1288,7 +1443,6 @@ impl SettingsControls {
         let profile_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
         profile_content.add_css_class("core-settings-pane");
         profile_content.set_hexpand(true);
-        profile_content.set_size_request(650, -1);
         let profile_switcher = gtk::StackSwitcher::new();
         profile_switcher.set_widget_name("profile-page-switcher");
         let profile_stack = gtk::Stack::new();
@@ -1298,7 +1452,10 @@ impl SettingsControls {
         profile_switcher.set_stack(Some(&profile_stack));
         profile_switcher.set_halign(gtk::Align::Fill);
         profile_switcher.set_hexpand(true);
-        profile_content.append(&profile_switcher);
+        let profile_switcher_scroll = gtk::ScrolledWindow::new();
+        profile_switcher_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+        profile_switcher_scroll.set_child(Some(&profile_switcher));
+        profile_content.append(&profile_switcher_scroll);
 
         let appearance = gtk::Box::new(gtk::Orientation::Vertical, 16);
         appearance.set_widget_name("text");
@@ -1341,7 +1498,7 @@ impl SettingsControls {
         appearance_grid.attach(&cursor_blink, 1, 3, 1, 1);
         let scrollback_label = field_label("Scrollback lines");
         appearance_grid.attach(&scrollback_label, 0, 4, 1, 1);
-        let scrollback = gtk::SpinButton::with_range(100.0, 1_000_000.0, 100.0);
+        let scrollback = gtk::SpinButton::with_range(1.0, 1_000_000.0, 100.0);
         scrollback.set_widget_name("profile-scrollback");
         scrollback.set_value(selected_defaults.scrollback_lines as f64);
         appearance_grid.attach(&scrollback, 1, 4, 1, 1);
@@ -1618,11 +1775,20 @@ impl SettingsControls {
             "Smooth window resizing (managed by the desktop compositor)",
             "profile-smooth-resize",
         ));
-        window_page.0.append(&named_check(
+        let unlimited_scrollback = named_check(
             "Unlimited scrollback",
             selected_defaults.scrollback_unlimited,
             "profile-unlimited-scrollback",
+        );
+        scrollback.set_sensitive(!selected_defaults.scrollback_unlimited);
+        scrollback.set_tooltip_text(Some(
+            "The canonical scrollback limit. Unlimited scrollback is selected on the Window tab.",
         ));
+        let bounded_scrollback = scrollback.clone();
+        unlimited_scrollback.connect_toggled(move |button| {
+            bounded_scrollback.set_sensitive(!button.is_active());
+        });
+        window_page.0.append(&unlimited_scrollback);
         window_page.0.append(&unavailable_check(
             "Restore text after logout (live process state cannot be restored)",
             "profile-restore-rows",
@@ -1651,12 +1817,22 @@ impl SettingsControls {
         ));
         window_page.0.append(&field_label("Restore bookmark"));
         window_page.0.append(&restore_bookmark);
-        let scrollback_limit = gtk::SpinButton::with_range(100.0, 1_000_000.0, 100.0);
+        let scrollback_limit = gtk::SpinButton::with_range(1.0, 1_000_000.0, 100.0);
         scrollback_limit.set_widget_name("profile-scrollback-limit");
-        scrollback_limit.set_value(selected_defaults.scrollback_limit as f64);
+        scrollback_limit.set_value(selected_defaults.scrollback_lines as f64);
+        scrollback_limit.set_sensitive(false);
+        scrollback_limit.set_tooltip_text(Some(
+            "Read-only compatibility mirror. Edit Scrollback lines on the Text tab.",
+        ));
+        let scrollback_limit_mirror = scrollback_limit.clone();
+        scrollback.connect_value_changed(move |source| {
+            if (scrollback_limit_mirror.value() - source.value()).abs() > f64::EPSILON {
+                scrollback_limit_mirror.set_value(source.value());
+            }
+        });
         window_page
             .0
-            .append(&field_label("Bounded scrollback limit"));
+            .append(&field_label("Scrollback lines (Text tab)"));
         window_page.0.append(&scrollback_limit);
         window_page.0.append(&hint_label(
             "Columns and rows are the actual VTE terminal dimensions for this profile.",
@@ -2190,7 +2366,7 @@ impl SettingsControls {
                 reload_mappings.splice(0, reload_mappings.n_items(), &refs);
             }
         });
-        profile_page.append(&profile_content);
+        profile_page.append(&scroll_page(&profile_content));
         top_stack.add_titled(&profile_page, Some("profiles"), "Profiles");
 
         let window_groups = gtk::Box::new(gtk::Orientation::Vertical, 18);
@@ -2811,9 +2987,6 @@ impl SettingsControls {
         // profile controls. The visible Text and Advanced controls own these
         // behaviors for each profile.
         let legacy_scroll_on_output = check("", settings.scroll_on_output);
-        let legacy_scroll_on_input = check("", settings.scroll_on_input);
-        let legacy_audible_bell = check("", settings.audible_bell);
-        let legacy_bold_is_bright = check("", settings.bold_is_bright);
 
         Self {
             footer,
@@ -2844,9 +3017,6 @@ impl SettingsControls {
             new_window_same_directory,
             ctrl_number_tabs,
             scroll_on_output: legacy_scroll_on_output,
-            scroll_on_input: legacy_scroll_on_input,
-            audible_bell: legacy_audible_bell,
-            bold_is_bright: legacy_bold_is_bright,
             background_notifications,
             profile_add: profile_buttons[0].clone(),
             profile_duplicate: profile_buttons[1].clone(),
@@ -3126,9 +3296,10 @@ fn read_profile_widgets(
     if let Some(value) = profile_spin(stack, "profile-rows") {
         profile.rows = value as u32;
     }
-    if let Some(value) = profile_spin(stack, "profile-scrollback-limit") {
-        profile.scrollback_limit = value as u32;
-    }
+    // `profile-scrollback` is the canonical visible control. The older
+    // Window-page widget remains a disabled compatibility mirror and must not
+    // be allowed to overwrite a lower value selected on the Text page.
+    profile.scrollback_limit = profile.scrollback_lines;
     if let Some(value) = profile_dropdown(stack, "profile-close-on-exit") {
         profile.close_on_exit = match value {
             1 => CloseOnExit::Clean,
@@ -3279,7 +3450,7 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
     if let Some(widget) = profile_widget(stack, "profile-scrollback-limit")
         .and_then(|w| w.downcast::<gtk::SpinButton>().ok())
     {
-        widget.set_value(profile.scrollback_limit as f64);
+        widget.set_value(profile.scrollback_lines as f64);
     }
     if let Some(widget) = profile_widget(stack, "profile-ambiguous-width")
         .and_then(|w| w.downcast::<gtk::DropDown>().ok())
@@ -3700,6 +3871,9 @@ struct UiState {
     sessions: SessionManager,
     stack: gtk::Stack,
     window: gtk::ApplicationWindow,
+    // Settings callbacks capture this state, so the reverse reference must be
+    // weak. One live editor owns one unsaved draft for this terminal window.
+    settings_window: Option<glib::WeakRef<gtk::Window>>,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
     pending_spawns: HashSet<u64>,
@@ -3847,10 +4021,17 @@ fn build_window_with_directory(
     pending_working_directory: Option<String>,
 ) {
     gtk::Window::set_default_icon_name(APPLICATION_ID);
-    let profiles = load_user_profiles();
+    let mut profiles = load_user_profiles();
     let mut settings = Settings::load_user();
     let requested_profile = resolve_window_profile(&settings, &profiles, new_window);
     settings.selected_profile = requested_profile.clone();
+    if migrate_legacy_profile_flags(&mut settings, &mut profiles) && !save_user_profiles(&profiles)
+    {
+        // Do not persist a completed marker unless the transformed profiles
+        // were durably written. The migration formulas are idempotent, so a
+        // later launch can safely retry.
+        settings.legacy_profile_flags_migrated = false;
+    }
     // Materialize first-launch defaults so Homebrew and the initial window
     // geometry can be verified and restored even if the first session ends
     // unexpectedly.
@@ -3878,6 +4059,7 @@ fn build_window_with_directory(
         sessions: SessionManager::empty(),
         stack: stack.clone(),
         window: window.clone(),
+        settings_window: None,
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
         pending_spawns: HashSet::new(),
@@ -3892,49 +4074,40 @@ fn build_window_with_directory(
     }));
 
     let header = build_header_bar();
+    header.set_widget_name("terminal-titlebar");
+    window.set_titlebar(Some(&header));
+
+    let terminal_menu = terminal_menu_model();
+    app.set_menubar(Some(&terminal_menu));
+    let menubar = gtk::PopoverMenuBar::from_model(Some(&terminal_menu));
+    menubar.set_widget_name("terminal-menubar");
+    menubar.add_css_class("core-terminal-menubar");
+    menubar.set_hexpand(true);
+
     let switcher = gtk::StackSwitcher::new();
     switcher.set_stack(Some(&stack));
-    header.set_title_widget(Some(&switcher));
+    switcher.set_hexpand(true);
 
-    let icon = project_icon();
-    icon.set_pixel_size(24);
-    icon.set_tooltip_text(Some("Core Terminal"));
-    header.pack_start(&icon);
+    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    tab_bar.set_widget_name("terminal-toolbar");
+    tab_bar.add_css_class("core-terminal-toolbar");
+    tab_bar.append(&switcher);
+    tab_bar.append(&gtk::Label::new(Some("Profile")));
+    tab_bar.append(&profile_dropdown);
 
-    let new_tab = gtk::Button::from_icon_name("tab-new-symbolic");
-    new_tab.set_tooltip_text(Some("New tab (Ctrl+T)"));
+    let new_tab = gtk::Button::with_label("New Tab");
+    new_tab.set_tooltip_text(Some("New Tab (Ctrl+T)"));
     let new_tab_state = state.clone();
     new_tab.connect_clicked(move |_| open_tab(&new_tab_state));
-    header.pack_end(&new_tab);
 
-    let settings_button = gtk::Button::from_icon_name("emblem-system-symbolic");
-    settings_button.set_tooltip_text(Some("Settings"));
+    let settings_button = gtk::Button::with_label("Settings");
+    settings_button.set_tooltip_text(Some("Settings (Ctrl+,)"));
     let settings_state = state.clone();
     settings_button.connect_clicked(move |_| {
         show_settings_for_state(&settings_state);
     });
-    header.pack_end(&settings_button);
-    header.pack_end(&profile_dropdown);
-
-    let menu = gio::Menu::new();
-    menu.append(Some("New Window"), Some("win.new-window"));
-    menu.append(Some("New Tab"), Some("win.new-tab"));
-    menu.append(Some("Close Tab"), Some("win.close-tab"));
-    menu.append(Some("Next Tab"), Some("win.next-tab"));
-    menu.append(Some("Previous Tab"), Some("win.previous-tab"));
-    menu.append(Some("Find"), Some("win.search"));
-    menu.append(Some("Settings"), Some("win.settings"));
-    menu.append(
-        Some("Restore Default Profiles"),
-        Some("win.restore-profiles"),
-    );
-    menu.append(Some("About Core Terminal"), Some("win.about"));
-    let menu_button = gtk::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .tooltip_text("Terminal menu")
-        .menu_model(&menu)
-        .build();
-    header.pack_end(&menu_button);
+    tab_bar.append(&new_tab);
+    tab_bar.append(&settings_button);
 
     let profile_state = state.clone();
     connect_profile_selector(&profile_dropdown, move |name| {
@@ -3971,8 +4144,11 @@ fn build_window_with_directory(
         }
     });
 
-    window.set_titlebar(Some(&header));
-    window.set_child(Some(&stack));
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&menubar);
+    root.append(&tab_bar);
+    root.append(&stack);
+    window.set_child(Some(&root));
 
     install_window_actions(app, &window, &state);
     let visible_state = state.clone();
@@ -4052,19 +4228,6 @@ fn build_window_with_directory(
 /// Drive the same window/session helpers used by buttons and accelerators.
 /// This is enabled only by the acceptance-test environment and lets the
 /// native GNOME Wayland session verify real VTE PTYs and widget behavior.
-fn project_icon() -> gtk::Image {
-    let installed_icon = format!("/usr/share/icons/hicolor/64x64/apps/{APPLICATION_ID}.png");
-    for candidate in [
-        Path::new("data/icons/core-terminal-icon-64.png"),
-        Path::new(&installed_icon),
-    ] {
-        if candidate.is_file() {
-            return gtk::Image::from_file(candidate);
-        }
-    }
-    gtk::Image::from_icon_name(APPLICATION_ID)
-}
-
 /// Opt-in installed-binary acceptance run.  The harness is intentionally
 /// inert unless CORE_TERMINAL_ACCEPTANCE is present, so normal users never
 /// get an automated tab/window lifecycle.  It uses the real GTK widget tree
@@ -5043,6 +5206,8 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             }
         }
         let settings = show_settings_for_state(&state);
+        let settings_reused = show_settings_for_state(&state);
+        let settings_window_reused = settings_reused == settings;
         let (active_before_settings_save, session_count_before_settings_save) = state
             .try_borrow()
             .map(|state| {
@@ -5055,6 +5220,29 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             .unwrap_or((None, 0));
         let mut missing = Vec::new();
         let root = settings.child();
+        let settings_draft_preserved = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-font"))
+            .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
+            .is_some_and(|entry| {
+                let original = entry.text().to_string();
+                entry.set_text("Core Terminal singleton draft probe");
+                let reopened = show_settings_for_state(&state);
+                let preserved = reopened == settings
+                    && entry.text().as_str() == "Core Terminal singleton draft probe";
+                entry.set_text(&original);
+                preserved
+            });
+        let chooser_probe = profile_file_chooser(
+            &settings,
+            "Profile chooser acceptance probe",
+            "Open",
+            gtk::FileChooserAction::Open,
+        );
+        let settings_chooser_parented = !chooser_probe.is_modal()
+            && chooser_probe
+                .transient_for()
+                .is_some_and(|parent| parent == settings);
         let top_stack = root.as_ref().and_then(|root| {
             let first = root.first_child()?;
             let second = first.next_sibling()?;
@@ -5174,9 +5362,35 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 .all(|terminal| !terminal.is_mouse_autohide());
         }
         let non_modal = !settings.is_modal();
+        let main_root = state.borrow().window.child();
+        let standard_navigation_present = main_root.as_ref().is_some_and(|root| {
+            widget_tree_has_name(root, "terminal-menubar")
+                && widget_tree_has_name(root, "terminal-toolbar")
+        });
+        let menu_actions_present = [
+            "copy",
+            "paste",
+            "select-all",
+            "new-tab",
+            "close-tab",
+            "quit",
+        ]
+        .into_iter()
+        .all(|name| state.borrow().window.lookup_action(name).is_some());
+        let clean_window_title = state
+            .borrow()
+            .window
+            .title()
+            .as_deref()
+            .is_some_and(|title| title == "Core Terminal");
+        let terminal_can_shrink = state
+            .borrow()
+            .terminals
+            .values()
+            .all(|terminal| terminal.width_request() <= 1 && terminal.height_request() <= 1);
         let settings_width = settings.width();
         let settings_height = settings.height();
-        let settings_geometry_usable = settings_width >= 960 && settings_height >= 680;
+        let settings_geometry_usable = settings_width >= 720 && settings_height >= 480;
         let profile_page_not_horizontally_scrolled = top_stack
             .as_ref()
             .and_then(|stack| stack.child_by_name("profiles"))
@@ -5185,12 +5399,12 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             .as_ref()
             .and_then(|root| find_widget_by_name(root, "profile-sidebar"))
             .map_or(0, |sidebar| sidebar.width());
-        let sidebar_geometry_usable = sidebar_width >= 270;
+        let sidebar_geometry_usable = sidebar_width >= 180;
         let profile_tabs_width = root
             .as_ref()
             .and_then(|root| find_widget_by_name(root, "profile-page-switcher"))
             .map_or(0, |switcher| switcher.width());
-        let profile_tabs_usable = profile_tabs_width >= 600;
+        let profile_tabs_usable = profile_tabs_width >= 440;
         let mut minimum_profile_label_width = i32::MAX;
         let profile_labels_readable = root
             .as_ref()
@@ -5278,6 +5492,52 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             .map(|widget| widget.value());
         let profile_scrollback_loaded =
             profile_scrollback_value.is_some_and(|value| (value - 20_000.0).abs() < f64::EPSILON);
+        let scrollback_mirror_read_only = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-scrollback-limit"))
+            .and_then(|widget| widget.downcast::<gtk::SpinButton>().ok())
+            .is_some_and(|mirror| {
+                !mirror.is_sensitive()
+                    && profile_scrollback_value
+                        .is_some_and(|value| (mirror.value() - value).abs() < f64::EPSILON)
+            });
+        let scrollback_unlimited_sensitivity = root.as_ref().is_some_and(|root| {
+            let Some(unlimited) = find_widget_by_name(root, "profile-unlimited-scrollback")
+                .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok())
+            else {
+                return false;
+            };
+            let Some(scrollback) = find_widget_by_name(root, "profile-scrollback")
+                .and_then(|widget| widget.downcast::<gtk::SpinButton>().ok())
+            else {
+                return false;
+            };
+            let original = unlimited.is_active();
+            unlimited.set_active(true);
+            let disabled_when_unlimited = !scrollback.is_sensitive();
+            unlimited.set_active(false);
+            let enabled_when_bounded = scrollback.is_sensitive();
+            unlimited.set_active(original);
+            disabled_when_unlimited && enabled_when_bounded && scrollback.is_sensitive() != original
+        });
+        let scrollback_profile_canonical = root.as_ref().is_some_and(|root| {
+            let Some(scrollback) = find_widget_by_name(root, "profile-scrollback")
+                .and_then(|widget| widget.downcast::<gtk::SpinButton>().ok())
+            else {
+                return false;
+            };
+            let Some(mirror) = find_widget_by_name(root, "profile-scrollback-limit")
+                .and_then(|widget| widget.downcast::<gtk::SpinButton>().ok())
+            else {
+                return false;
+            };
+            let original = scrollback.value();
+            let probe = (original + 100.0).min(1_000_000.0);
+            scrollback.set_value(probe);
+            let mirrored = (mirror.value() - probe).abs() < f64::EPSILON;
+            scrollback.set_value(original);
+            mirrored && (mirror.value() - original).abs() < f64::EPSILON
+        });
         let profile_terminal_type_loaded = root
             .as_ref()
             .and_then(|root| find_widget_by_name(root, "advanced-terminal-type"))
@@ -5640,6 +5900,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     && !profile.close_on_clean_exit
                     && !profile.close_on_error
             });
+        let mut settings_recreated_after_save = false;
         let shell_widgets_reloaded = restored_profiles.as_ref().is_some_and(|profiles| {
             if let Ok(mut state) = state.try_borrow_mut() {
                 state.profiles = profiles.clone();
@@ -5648,6 +5909,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 return false;
             }
             let reopened = show_settings_for_state(&state);
+            settings_recreated_after_save = reopened != settings;
             drain_pending_events();
             let root = reopened.child();
             let restored = root.as_ref().is_some_and(|root| {
@@ -5758,6 +6020,17 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         let passed = missing.is_empty()
             && safe_terminals
             && non_modal
+            && settings_window_reused
+            && settings_draft_preserved
+            && settings_chooser_parented
+            && settings_recreated_after_save
+            && standard_navigation_present
+            && menu_actions_present
+            && clean_window_title
+            && terminal_can_shrink
+            && scrollback_mirror_read_only
+            && scrollback_unlimited_sensitivity
+            && scrollback_profile_canonical
             && settings_geometry_usable
             && profile_page_not_horizontally_scrolled
             && sidebar_geometry_usable
@@ -5806,10 +6079,21 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && protected_sibling_preserved
             && close_probe_cleanup;
         let report = format!(
-            "status={} missing={:?} non_modal={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
+            "status={} missing={:?} non_modal={} settings_window_reused={} settings_draft_preserved={} settings_chooser_parented={} settings_recreated_after_save={} standard_navigation_present={} menu_actions_present={} clean_window_title={} terminal_can_shrink={} scrollback_mirror_read_only={} scrollback_unlimited_sensitivity={} scrollback_profile_canonical={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
+            settings_window_reused,
+            settings_draft_preserved,
+            settings_chooser_parented,
+            settings_recreated_after_save,
+            standard_navigation_present,
+            menu_actions_present,
+            clean_window_title,
+            terminal_can_shrink,
+            scrollback_mirror_read_only,
+            scrollback_unlimited_sensitivity,
+            scrollback_profile_canonical,
             safe_terminals,
             settings_width,
             settings_height,
@@ -5970,6 +6254,70 @@ fn install_window_actions(
     close.connect_activate(move |_, _| close_current_tab(&action_state));
     window.add_action(&close);
 
+    let quit = gio::SimpleAction::new("quit", None);
+    let quit_window = window.clone();
+    quit.connect_activate(move |_, _| {
+        // Route Quit through the normal close handler so the configured
+        // confirmation policy protects active shell jobs just as it does for
+        // the compositor close button.
+        quit_window.close();
+    });
+    window.add_action(&quit);
+
+    let copy = gio::SimpleAction::new("copy", None);
+    let action_state = state.clone();
+    copy.connect_activate(move |_, _| {
+        let terminal = {
+            let state = action_state.borrow();
+            state
+                .sessions
+                .active()
+                .and_then(|tab| state.terminals.get(&tab.id.get()).cloned())
+        };
+        if let Some(terminal) = terminal {
+            copy_selection(&terminal);
+        }
+    });
+    window.add_action(&copy);
+
+    let paste = gio::SimpleAction::new("paste", None);
+    let action_state = state.clone();
+    paste.connect_activate(move |_, _| {
+        let (terminal, paste_newlines_as_cr) = {
+            let state = action_state.borrow();
+            let active = state.sessions.active();
+            let terminal = active.and_then(|tab| state.terminals.get(&tab.id.get()).cloned());
+            let paste_newlines_as_cr = active
+                .and_then(|tab| state.profiles.profile(&tab.profile_name))
+                .is_some_and(|profile| profile.paste_newlines_as_cr);
+            (terminal, paste_newlines_as_cr)
+        };
+        if let Some(terminal) = terminal {
+            if paste_newlines_as_cr {
+                paste_clipboard_with_carriage_returns(&terminal);
+            } else {
+                terminal.paste_clipboard();
+            }
+        }
+    });
+    window.add_action(&paste);
+
+    let select_all = gio::SimpleAction::new("select-all", None);
+    let action_state = state.clone();
+    select_all.connect_activate(move |_, _| {
+        let terminal = {
+            let state = action_state.borrow();
+            state
+                .sessions
+                .active()
+                .and_then(|tab| state.terminals.get(&tab.id.get()).cloned())
+        };
+        if let Some(terminal) = terminal {
+            terminal.select_all();
+        }
+    });
+    window.add_action(&select_all);
+
     let next = gio::SimpleAction::new("next-tab", None);
     let action_state = state.clone();
     next.connect_activate(move |_, _| switch_tab(&action_state, true));
@@ -6004,6 +6352,10 @@ fn install_window_actions(
 
     app.set_accels_for_action("win.new-tab", &["<Primary>t"]);
     app.set_accels_for_action("win.close-tab", &["<Primary>w"]);
+    app.set_accels_for_action("win.quit", &["<Primary>q"]);
+    app.set_accels_for_action("win.copy", &["<Primary><Shift>c"]);
+    app.set_accels_for_action("win.paste", &["<Primary><Shift>v"]);
+    app.set_accels_for_action("win.select-all", &["<Primary><Shift>a"]);
     app.set_accels_for_action("win.search", &["<Primary>f"]);
     app.set_accels_for_action("win.settings", &["<Primary>comma"]);
     app.set_accels_for_action(
@@ -6017,6 +6369,18 @@ fn install_window_actions(
 }
 
 fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
+    let existing = state
+        .borrow()
+        .settings_window
+        .as_ref()
+        .and_then(glib::WeakRef::upgrade);
+    if let Some(existing) = existing {
+        // Reopening Settings must preserve the current page, field focus, and
+        // unsaved draft instead of constructing a stale second editor.
+        existing.present();
+        return existing;
+    }
+
     let (parent, mut settings, profiles) = {
         let state = state.borrow();
         (
@@ -6036,7 +6400,7 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
     }
     let save_state = state.clone();
     let launch_state = state.clone();
-    show_settings(
+    let window = show_settings(
         &parent,
         &settings,
         profiles,
@@ -6112,7 +6476,37 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
             }
         },
         move |group| launch_window_group(&launch_state, group),
-    )
+    );
+    state.borrow_mut().settings_window = Some(window.downgrade());
+
+    let close_state = Rc::downgrade(state);
+    window.connect_close_request(move |window| {
+        clear_settings_window_if_current(&close_state, window);
+        glib::Propagation::Proceed
+    });
+    let destroy_state = Rc::downgrade(state);
+    window.connect_destroy(move |window| {
+        clear_settings_window_if_current(&destroy_state, window);
+    });
+    window
+}
+
+fn clear_settings_window_if_current(
+    state: &std::rc::Weak<RefCell<UiState>>,
+    closing: &gtk::Window,
+) {
+    let Some(state) = state.upgrade() else {
+        return;
+    };
+    let mut state = state.borrow_mut();
+    let is_current = state
+        .settings_window
+        .as_ref()
+        .and_then(glib::WeakRef::upgrade)
+        .is_some_and(|tracked| tracked == *closing);
+    if is_current {
+        state.settings_window = None;
+    }
 }
 
 /// Launch every entry in a saved group through the explicit tab/PTY path.
@@ -6352,6 +6746,10 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         if let Some((columns, rows)) = spec.size {
             terminal.set_size(columns as i64, rows as i64);
         }
+        // The profile grid supplies a useful natural size, but must never
+        // turn its default columns and rows into a resize floor.
+        terminal.set_size_request(1, 1);
+        install_terminal_context_menu(&terminal);
         // General settings provide the baseline. Profile-owned values take
         // precedence only when the profile actually specifies them, so the
         // global custom command and login shell remain useful for profiles
@@ -6614,7 +7012,7 @@ fn handle_terminal_bell(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &
             .tab(id)
             .and_then(|tab| state.profiles.profile(&tab.profile_name))
             .map(|profile| {
-                let audible = state.settings.audible_bell || profile.audible_bell;
+                let audible = profile.audible_bell;
                 (
                     profile.visual_bell && (!profile.visual_bell_only_if_muted || !audible),
                     (profile.background_notifications || profile.urgency_hint)
@@ -6748,40 +7146,6 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
     }
     let tab_title = tab_parts.join(" — ");
 
-    let mut window_parts = Vec::new();
-    if !profile.custom_window_title.trim().is_empty() {
-        push_title_part(&mut window_parts, profile.custom_window_title.trim());
-    }
-    if profile.title_show_profile {
-        push_title_part(&mut window_parts, &profile.name);
-    }
-    if profile.title_show_shell {
-        push_title_part(&mut window_parts, &shell_name);
-    }
-    if profile.title_show_path || profile.title_show_working_directory {
-        if let Some(directory) = &directory {
-            push_title_part(&mut window_parts, directory);
-        }
-    } else if profile.title_show_directory {
-        if let Some(directory) = &directory_name {
-            push_title_part(&mut window_parts, directory);
-        }
-    }
-    if profile.title_show_process || profile.title_show_arguments {
-        if let Some(title) = &reported_title {
-            push_title_part(&mut window_parts, title);
-        }
-    }
-    if profile.title_show_dimensions {
-        push_title_part(
-            &mut window_parts,
-            &format!("{}×{}", terminal.column_count(), terminal.row_count()),
-        );
-    }
-    if window_parts.is_empty() {
-        push_title_part(&mut window_parts, "Core Terminal");
-    }
-    let window_title = window_parts.join(" — ");
     let mut state = state.borrow_mut();
     state.sessions.set_title(id, &tab_title);
     if let Some(terminal) = state.terminals.get(&id.get()) {
@@ -6790,7 +7154,7 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
         }
     }
     if active {
-        state.window.set_title(Some(&window_title));
+        state.window.set_title(Some("Core Terminal"));
     }
 }
 
@@ -6851,9 +7215,6 @@ fn reapply_profile_without_resize(
 
 fn runtime_terminal_settings_changed(before: &Settings, after: &Settings) -> bool {
     before.scroll_on_output != after.scroll_on_output
-        || before.scroll_on_input != after.scroll_on_input
-        || before.audible_bell != after.audible_bell
-        || before.bold_is_bright != after.bold_is_bright
 }
 
 fn runtime_profile_requires_reapply(
@@ -6878,21 +7239,11 @@ fn apply_profile_properties(
         profile.font, profile.font_size
     ));
     terminal.set_font(Some(&font));
-    terminal.set_scrollback_lines(if profile.scrollback_unlimited {
-        -1
-    } else {
-        // Scrollback is profile-owned. `scrollback_lines` is the field edited
-        // by the profile settings panel; retain the older limit field only as
-        // a compatibility fallback for hand-authored profiles.
-        profile
-            .scrollback_lines
-            .max(profile.scrollback_limit)
-            .max(100) as i64
-    });
+    terminal.set_scrollback_lines(profile.effective_scrollback_lines());
     terminal.set_scroll_on_output(settings.scroll_on_output);
-    terminal.set_scroll_on_keystroke(settings.scroll_on_input && profile.scroll_on_input);
-    terminal.set_audible_bell(settings.audible_bell || profile.audible_bell);
-    terminal.set_bold_is_bright(settings.bold_is_bright && profile.bold_is_bright);
+    terminal.set_scroll_on_keystroke(profile.scroll_on_input);
+    terminal.set_audible_bell(profile.audible_bell);
+    terminal.set_bold_is_bright(profile.bold_is_bright);
     terminal.set_text_blink_mode(if profile.text_blink {
         vte4::TextBlinkMode::Always
     } else {

@@ -1,14 +1,29 @@
 # Changelog
 
-## Unreleased
-
 ## 0.2.2
 
 Released 2026-09-04.
 
+- Replaced crowded titlebar controls with a standard menubar, text-labeled tab
+  controls, and a terminal right-click menu for clipboard, search, and tab
+  actions.
+- Kept the compositor titlebar to the application title and window controls;
+  detailed profile and process information remains in tab titles.
+- Removed the profile editor's desktop-sized minimum and fixed inner widths so
+  narrow settings windows retain readable profile names and scrollable pages.
+- Made the release profile avoid the Ubuntu Rust/LLVM ThinLTO crash while
+  retaining optimized, stripped builds.
+
 - Restored the missing Text-page form containing font, cursor, and scrollback
   controls, and added native layout checks that require those controls to be
   present and loaded from the active profile.
+- Made Text-page scrollback the canonical per-profile value, including an
+  explicit unlimited state and low project defaults such as Man Page's 48
+  lines. The Window-page value is now a read-only compatibility mirror.
+- Migrated legacy global input scrolling, bell, and bright-bold flags into
+  every profile once during upgrade, so visible profile values describe the
+  behavior previously applied at runtime.
+- Corrected Homebrew's default font to store the family and size separately.
 - Kept renderer-owned controls truthful after profile switches and preserved
   imported values for settings that VTE or Wayland cannot edit.
 - Kept legacy compatibility fields tied to the live session profile when a
