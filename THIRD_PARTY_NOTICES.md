@@ -8,7 +8,7 @@ in the corresponding package source cache and is not copied into this file.
 | Package | Version | License expression | Repository |
 | --- | --- | --- | --- |
 | `autocfg` | `1.5.1` | `Apache-2.0 OR MIT` | https://github.com/cuviper/autocfg |
-| `base64` | `0.22.1` | `MIT OR Apache-2.0` | https://github.com/marshallpierce/rust-base64 |
+| `base64` | `0.23.1` | `MIT OR Apache-2.0` | https://github.com/marshallpierce/rust-base64 |
 | `bitflags` | `2.13.1` | `MIT OR Apache-2.0` | https://github.com/bitflags/bitflags |
 | `cairo-rs` | `0.22.9` | `MIT` | https://github.com/gtk-rs/gtk-rs-core |
 | `cairo-sys-rs` | `0.22.9` | `MIT` | https://github.com/gtk-rs/gtk-rs-core |
@@ -53,11 +53,11 @@ in the corresponding package source cache and is not copied into this file.
 | `pango-sys` | `0.22.9` | `MIT` | https://github.com/gtk-rs/gtk-rs-core |
 | `pin-project-lite` | `0.2.17` | `Apache-2.0 OR MIT` | https://github.com/taiki-e/pin-project-lite |
 | `pkg-config` | `0.3.34` | `MIT OR Apache-2.0` | https://github.com/rust-lang/pkg-config-rs |
-| `plist` | `1.10.0` | `MIT` | https://github.com/ebarnard/rust-plist/ |
+| `plist` | `1.10.1` | `MIT` | https://github.com/ebarnard/rust-plist/ |
 | `powerfmt` | `0.2.0` | `MIT OR Apache-2.0` | https://github.com/jhpratt/powerfmt |
 | `proc-macro-crate` | `3.5.0` | `MIT OR Apache-2.0` | https://github.com/bkchr/proc-macro-crate |
 | `proc-macro2` | `1.0.107` | `MIT OR Apache-2.0` | https://github.com/dtolnay/proc-macro2 |
-| `quick-xml` | `0.41.0` | `MIT` | https://github.com/tafia/quick-xml |
+| `quick-xml` | `0.42.0` | `MIT` | https://github.com/tafia/quick-xml |
 | `quote` | `1.0.47` | `MIT OR Apache-2.0` | https://github.com/dtolnay/quote |
 | `rustc_version` | `0.4.1` | `MIT OR Apache-2.0` | https://github.com/djc/rustc-version-rs |
 | `semver` | `1.0.28` | `MIT OR Apache-2.0` | https://github.com/dtolnay/semver |
