@@ -592,7 +592,7 @@ pub fn install_style(display: &gtk::gdk::Display) {
         ".core-profile-selector { min-width: 150px; }\
          .core-terminal-menubar { padding: 0 8px; }\
          .core-terminal-toolbar { padding: 6px 10px; border-bottom: 1px solid alpha(currentColor, 0.12); }\
-         .core-settings-sidebar { background: alpha(currentColor, 0.04); padding: 12px; }\
+         .core-settings-sidebar { background: alpha(currentColor, 0.04); padding: 8px; }\
          .core-profile-row { min-height: 40px; }\
          .core-profile-row-label { padding: 8px 10px; }\
          .core-profile-action { min-width: 0; min-height: 36px; padding: 4px 8px; }\
@@ -939,6 +939,34 @@ where
     F: Fn(Settings, ProfileStore) + 'static,
     L: Fn(WindowGroup) + 'static,
 {
+    show_settings_with_initial_size(
+        parent,
+        settings,
+        profiles,
+        1024,
+        720,
+        on_save,
+        on_launch_group,
+    )
+}
+
+/// Construct Settings with a caller-selected initial geometry. Production
+/// uses the 1024x720 wrapper above; acceptance uses the supported compact
+/// 720x480 floor to catch regressions that only appear after users resize.
+#[allow(deprecated)]
+fn show_settings_with_initial_size<F, L>(
+    parent: &gtk::Window,
+    settings: &Settings,
+    profiles: ProfileStore,
+    initial_width: i32,
+    initial_height: i32,
+    on_save: F,
+    on_launch_group: L,
+) -> gtk::Window
+where
+    F: Fn(Settings, ProfileStore) + 'static,
+    L: Fn(WindowGroup) + 'static,
+{
     debug_assert_eq!(SETTINGS_PAGE_IDS.len(), 4);
     let window = gtk::Window::builder()
         .title("Core Terminal Settings")
@@ -947,8 +975,8 @@ where
         .modal(false)
         .transient_for(parent)
         .destroy_with_parent(true)
-        .default_width(1024)
-        .default_height(720)
+        .default_width(initial_width)
+        .default_height(initial_height)
         .build();
     // This is a usable floor, not a fixed layout. The profile controls scroll
     // independently below this size instead of clipping profile names or tabs.
@@ -5684,6 +5712,137 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         } else {
             missing.push("top-stack".to_owned());
         }
+        // Exercise the exact compact size users can reach by resizing. This
+        // window is independent of the singleton editor above so the probe
+        // cannot discard a user's unsaved settings draft.
+        let (compact_parent, compact_settings_values, compact_profiles) = {
+            let state = state.borrow();
+            (
+                state.window.clone().upcast::<gtk::Window>(),
+                state.settings.clone(),
+                state.profiles.clone(),
+            )
+        };
+        let compact_settings = show_settings_with_initial_size(
+            &compact_parent,
+            &compact_settings_values,
+            compact_profiles,
+            720,
+            480,
+            |_, _| {},
+            |_| {},
+        );
+        compact_settings.present();
+        let compact_settings_mapped = wait_for_condition(Duration::from_millis(350), || {
+            compact_settings.is_visible()
+                && compact_settings.width() >= 720
+                && compact_settings.height() >= 480
+        });
+        let compact_root = compact_settings.child();
+        let compact_top_stack = compact_root.as_ref().and_then(|root| {
+            let first = root.first_child()?;
+            let second = first.next_sibling()?;
+            second.downcast::<gtk::Stack>().ok()
+        });
+        let compact_profiles_selected = compact_top_stack.as_ref().is_some_and(|stack| {
+            stack.set_transition_type(gtk::StackTransitionType::None);
+            stack.set_visible_child_name("profiles");
+            stack.visible_child_name().as_deref() == Some("profiles")
+        });
+        let compact_text_selected = compact_root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-pages"))
+            .and_then(|widget| widget.downcast::<gtk::Stack>().ok())
+            .is_some_and(|pages| {
+                pages.set_transition_type(gtk::StackTransitionType::None);
+                pages.set_visible_child_name("text");
+                pages.visible_child_name().as_deref() == Some("text")
+            });
+        compact_settings.queue_allocate();
+        let compact_layout_settled = wait_for_condition(Duration::from_millis(350), || {
+            compact_root.as_ref().is_some_and(|root| {
+                find_widget_by_name(root, "profile-sidebar")
+                    .is_some_and(|sidebar| sidebar.width() >= 180 && sidebar.height() > 0)
+                    && find_widget_by_name(root, "profile-add")
+                        .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+                        .is_some_and(|button| button.width() >= 80 && button.height() > 0)
+            })
+        });
+        let compact_sidebar_width = compact_root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-sidebar"))
+            .map_or(0, |sidebar| sidebar.width());
+        let compact_profile_add_width = compact_root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-add"))
+            .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+            .map_or(0, |button| button.width());
+        let compact_profile_add_height = compact_root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-add"))
+            .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+            .map_or(0, |button| button.height());
+        let compact_profile_labels_readable = compact_root.as_ref().is_some_and(|root| {
+            let Some(list) = find_widget_by_name(root, "profile-list")
+                .and_then(|widget| widget.downcast::<gtk::ListBox>().ok())
+            else {
+                return false;
+            };
+            let mut count = 0usize;
+            let mut child = list.first_child();
+            while let Some(widget) = child {
+                let next = widget.next_sibling();
+                let Some(label) = widget
+                    .downcast_ref::<gtk::ListBoxRow>()
+                    .and_then(|row| row.child())
+                    .and_downcast::<gtk::Label>()
+                else {
+                    return false;
+                };
+                let name = label.text();
+                if name.is_empty()
+                    || label.tooltip_text().as_deref() != Some(name.as_str())
+                    || label.ellipsize() != gtk::pango::EllipsizeMode::End
+                    || label.width() < 80
+                    || !label.is_visible()
+                {
+                    return false;
+                }
+                count += 1;
+                child = next;
+            }
+            count > 0
+        });
+        let compact_profile_actions_visible = compact_root.as_ref().is_some_and(|root| {
+            [
+                ("profile-add", "Add"),
+                ("profile-duplicate", "Duplicate"),
+                ("profile-delete", "Delete"),
+                ("profile-import", "Import"),
+                ("profile-export", "Export"),
+                ("profile-default", "Set Default"),
+                ("profile-reset", "Reset"),
+            ]
+            .into_iter()
+            .all(|(name, expected)| {
+                find_widget_by_name(root, name)
+                    .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+                    .is_some_and(|button| {
+                        button.label().as_deref() == Some(expected)
+                            && button.width() >= 80
+                            && button.height() > 0
+                            && button.is_visible()
+                            && button.compute_bounds(root).is_some_and(|bounds| {
+                                bounds.x() >= 0.0
+                                    && bounds.y() >= 0.0
+                                    && bounds.x() + bounds.width() <= root.width() as f32
+                                    && bounds.y() + bounds.height() <= root.height() as f32
+                            })
+                    })
+            })
+        });
+        compact_settings.close();
+        drain_pending_events();
         for id in PROFILE_PAGE_IDS {
             if !widget_tree_has_name(root.as_ref().expect("settings window has a root"), id) {
                 missing.push(id.to_owned());
@@ -6508,6 +6667,13 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && profile_tabs_usable
             && profile_labels_readable
             && profile_actions_labeled
+            && compact_settings_mapped
+            && compact_profiles_selected
+            && compact_text_selected
+            && compact_layout_settled
+            && compact_sidebar_width >= 180
+            && compact_profile_labels_readable
+            && compact_profile_actions_visible
             && profile_count > 0
             && profile_file_written
             && profile_round_trip
@@ -6550,7 +6716,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && protected_sibling_preserved
             && close_probe_cleanup;
         let report = format!(
-            "status={} missing={:?} non_modal={} settings_window_reused={} settings_draft_preserved={} settings_chooser_parented={} settings_recreated_after_save={} standard_navigation_present={} application_menubar_shared={} menu_actions_present={} clean_window_title={} terminal_can_shrink={} scrollback_mirror_read_only={} scrollback_unlimited_sensitivity={} scrollback_profile_canonical={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} profile_content_scroll_policy={} profile_list_scroll_policy={} profile_switcher_scroll_policy={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
+            "status={} missing={:?} non_modal={} settings_window_reused={} settings_draft_preserved={} settings_chooser_parented={} settings_recreated_after_save={} standard_navigation_present={} application_menubar_shared={} menu_actions_present={} clean_window_title={} terminal_can_shrink={} scrollback_mirror_read_only={} scrollback_unlimited_sensitivity={} scrollback_profile_canonical={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} profile_content_scroll_policy={} profile_list_scroll_policy={} profile_switcher_scroll_policy={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} compact_settings_mapped={} compact_profiles_selected={} compact_text_selected={} compact_layout_settled={} compact_sidebar_width={} compact_profile_add={}x{} compact_profile_labels_readable={} compact_profile_actions_visible={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
@@ -6582,6 +6748,15 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             profile_labels_readable,
             minimum_profile_action_width,
             profile_actions_labeled,
+            compact_settings_mapped,
+            compact_profiles_selected,
+            compact_text_selected,
+            compact_layout_settled,
+            compact_sidebar_width,
+            compact_profile_add_width,
+            compact_profile_add_height,
+            compact_profile_labels_readable,
+            compact_profile_actions_visible,
             profile_count,
             profile_file_written,
             profile_round_trip,
