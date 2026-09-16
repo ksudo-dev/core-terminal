@@ -106,9 +106,9 @@ Core Terminal currently includes:
   menus, plus a terminal right-click menu for copy, paste, selection, search,
   scrollback, and tab actions
 - Search navigation, selection-aware clipboard actions including shell-escaped
-  paste, tab navigation,
-  profile-picked tabs, a New Command launcher with direct or shell execution,
-  per-tab zoom, fullscreen, and Ctrl+1 through Ctrl+9 tab switching
+  paste, tab navigation, direct profile and saved-window-group menu entries,
+  a New Command launcher with direct or shell execution, per-tab zoom,
+  fullscreen, and Ctrl+1 through Ctrl+9 tab switching
 - XML and binary plist import for supported `.terminal` fields, with
   deterministic export and clear fallback reporting for unsupported fields
 - Visual bells, background notifications, exit notifications, and tab activity

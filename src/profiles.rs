@@ -20,6 +20,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub const DEFAULT_PROFILE_NAME: &str = "Homebrew";
 pub const PROFILE_SETTINGS_FILENAME: &str = "profiles.json";
 const MAX_PERSISTED_INPUT_BYTES: usize = 4 * 1024 * 1024;
+// Profile and window-group names are rendered verbatim in native menu models.
+// Keep them comfortably small and free of controls so a hand-edited or
+// imported configuration cannot turn a single label into a large, unusable UI.
+const MAX_MENU_NAME_BYTES: usize = 256;
 pub const BUILTIN_PROFILE_NAMES: [&str; 10] = [
     "Basic",
     "Grass",
@@ -699,12 +703,16 @@ pub enum ProfileError {
     Empty,
     #[error("profile file is larger than the safe limit")]
     TooLarge,
+    #[error("profile document contains an invalid profile name")]
+    InvalidProfileName,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProfileMutationError {
     #[error("profile name cannot be empty")]
     EmptyName,
+    #[error("profile names must be at most 256 bytes and contain no control characters")]
+    InvalidName,
     #[error("a profile named `{0}` already exists")]
     DuplicateName(String),
     #[error("profile `{0}` does not exist")]
@@ -717,6 +725,8 @@ pub enum ProfileMutationError {
     ProfileUsedByWindowGroup { profile: String, group: String },
     #[error("window group name cannot be empty")]
     EmptyWindowGroupName,
+    #[error("window group names must be at most 256 bytes and contain no control characters")]
+    InvalidWindowGroupName,
     #[error("window group must contain at least one entry")]
     EmptyWindowGroup,
     #[error("window group `{0}` already exists")]
@@ -741,8 +751,12 @@ pub struct ProfileStore {
 }
 
 fn validate_window_group_shape(group: &WindowGroup) -> Result<(), ProfileMutationError> {
-    if group.name.trim().is_empty() {
+    let name = group.name.trim();
+    if name.is_empty() {
         return Err(ProfileMutationError::EmptyWindowGroupName);
+    }
+    if !valid_menu_name(name) {
+        return Err(ProfileMutationError::InvalidWindowGroupName);
     }
     if group.entries.is_empty() {
         return Err(ProfileMutationError::EmptyWindowGroup);
@@ -763,6 +777,10 @@ fn validate_window_group_shape(group: &WindowGroup) -> Result<(), ProfileMutatio
         return Err(ProfileMutationError::InvalidWindowGroupDirectory);
     }
     Ok(())
+}
+
+fn valid_menu_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_MENU_NAME_BYTES && !name.chars().any(char::is_control)
 }
 
 fn valid_window_group_directory(path: &str) -> bool {
@@ -790,6 +808,12 @@ impl ProfileStore {
             .into_iter()
             .map(TerminalProfile::normalized)
             .collect::<Vec<_>>();
+        if profiles
+            .iter()
+            .any(|profile| !valid_menu_name(&profile.name))
+        {
+            return Err(ProfileError::InvalidProfileName);
+        }
         let selected = profiles
             .iter()
             .find(|profile| profile.name == DEFAULT_PROFILE_NAME)
@@ -813,7 +837,7 @@ impl ProfileStore {
             .into_iter()
             .map(WindowGroup::normalized)
             .filter(|group| {
-                !group.name.is_empty()
+                valid_menu_name(&group.name)
                     && !group.entries.is_empty()
                     && group.entries.iter().all(|entry| {
                         profile_names.contains(entry.profile.as_str())
@@ -1129,6 +1153,12 @@ impl ProfileStore {
 
     pub fn update_profile(&mut self, profile: TerminalProfile) -> Result<(), ProfileMutationError> {
         let name = profile.name.trim().to_owned();
+        if name.is_empty() {
+            return Err(ProfileMutationError::EmptyName);
+        }
+        if !valid_menu_name(&name) {
+            return Err(ProfileMutationError::InvalidName);
+        }
         let index = self
             .profiles
             .iter()
@@ -1168,6 +1198,9 @@ impl ProfileStore {
         profile.name = profile.name.trim().to_owned();
         if profile.name.is_empty() {
             return Err(ProfileMutationError::EmptyName);
+        }
+        if !valid_menu_name(&profile.name) {
+            return Err(ProfileMutationError::InvalidName);
         }
         if self.profile(&profile.name).is_some() {
             return Err(ProfileMutationError::DuplicateName(profile.name));
@@ -1726,6 +1759,35 @@ mod tests {
     }
 
     #[test]
+    fn documents_reject_unsafe_profile_names_before_they_reach_menu_models() {
+        let invalid_control = r##"{"profiles":[{
+          "name":"unsafe\nname","foreground":"#111111","background":"#eeeeee",
+          "cursor":"#111111","selection":"#cccccc","font":"Monospace","font_size":11.0
+        }]}"##;
+        assert!(matches!(
+            ProfileStore::load_from_str(invalid_control),
+            Err(ProfileError::InvalidProfileName)
+        ));
+
+        let oversized_name = "x".repeat(MAX_MENU_NAME_BYTES + 1);
+        let oversized = serde_json::json!({
+            "profiles": [{
+                "name": oversized_name,
+                "foreground": "#111111",
+                "background": "#eeeeee",
+                "cursor": "#111111",
+                "selection": "#cccccc",
+                "font": "Monospace",
+                "font_size": 11.0
+            }]
+        });
+        assert!(matches!(
+            ProfileStore::load_from_str(&oversized.to_string()),
+            Err(ProfileError::InvalidProfileName)
+        ));
+    }
+
+    #[test]
     fn loads_the_project_owned_default_profile_document() {
         let store =
             ProfileStore::load_from_str(include_str!("../data/default-profiles.json")).unwrap();
@@ -1749,6 +1811,12 @@ mod tests {
     #[test]
     fn custom_profiles_can_be_duplicated_deleted_and_defaulted() {
         let mut store = ProfileStore::defaults();
+        let mut invalid = TerminalProfile::homebrew();
+        invalid.name = "unsafe\nname".into();
+        assert_eq!(
+            store.add_profile(invalid),
+            Err(ProfileMutationError::InvalidName)
+        );
         store
             .duplicate_profile(DEFAULT_PROFILE_NAME, "My Profile")
             .unwrap();
@@ -2470,6 +2538,23 @@ mod tests {
             }),
             Err(ProfileMutationError::InvalidWindowGroupDirectory)
         );
+        for name in [
+            "unsafe\nname".to_owned(),
+            "x".repeat(MAX_MENU_NAME_BYTES + 1),
+        ] {
+            assert_eq!(
+                store.add_window_group(WindowGroup {
+                    name,
+                    entries: vec![WindowGroupEntry {
+                        profile: DEFAULT_PROFILE_NAME.into(),
+                        working_directory: None,
+                        columns: 80,
+                        rows: 24,
+                    }],
+                }),
+                Err(ProfileMutationError::InvalidWindowGroupName)
+            );
+        }
         for directory in [
             "relative/path".to_owned(),
             "/tmp/with\ncontrol".to_owned(),
