@@ -166,6 +166,21 @@ mod structural_tests {
         assert_eq!(spec.profile_name, "Homebrew");
         assert_eq!(spec.working_directory.as_deref(), Some("/srv/project"));
         assert_eq!(spec.size, Some((100, 32)));
+        assert_eq!(spec.command, None);
+    }
+
+    #[test]
+    fn new_command_launch_spec_keeps_the_requested_execution_mode() {
+        let spec = super::TabLaunchSpec::with_command(
+            "Homebrew",
+            Some("/srv/project".into()),
+            "printf hello",
+            false,
+        );
+        assert_eq!(spec.profile_name, "Homebrew");
+        assert_eq!(spec.working_directory.as_deref(), Some("/srv/project"));
+        assert_eq!(spec.command.as_deref(), Some("printf hello"));
+        assert!(!spec.run_command_inside_shell);
     }
 
     #[test]
@@ -494,6 +509,7 @@ fn terminal_menu_model() -> gio::Menu {
         Some("win.new-window-with-profile"),
     );
     shell.append(Some("New Tab"), Some("win.new-tab"));
+    shell.append(Some("New Command…"), Some("win.new-command"));
     shell.append(
         Some("New Tab with Profile…"),
         Some("win.new-tab-with-profile"),
@@ -3976,6 +3992,8 @@ struct TabLaunchSpec {
     profile_name: String,
     working_directory: Option<String>,
     size: Option<(u32, u32)>,
+    command: Option<String>,
+    run_command_inside_shell: bool,
 }
 
 impl TabLaunchSpec {
@@ -3984,6 +4002,23 @@ impl TabLaunchSpec {
             profile_name: profile_name.into(),
             working_directory,
             size: None,
+            command: None,
+            run_command_inside_shell: true,
+        }
+    }
+
+    fn with_command(
+        profile_name: impl Into<String>,
+        working_directory: Option<String>,
+        command: impl Into<String>,
+        run_command_inside_shell: bool,
+    ) -> Self {
+        Self {
+            profile_name: profile_name.into(),
+            working_directory,
+            size: None,
+            command: Some(command.into()),
+            run_command_inside_shell,
         }
     }
 
@@ -3992,6 +4027,8 @@ impl TabLaunchSpec {
             profile_name: entry.profile,
             working_directory: entry.working_directory,
             size: Some((entry.columns, entry.rows)),
+            command: None,
+            run_command_inside_shell: true,
         }
     }
 }
@@ -5447,6 +5484,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             "find-next",
             "find-previous",
             "new-tab",
+            "new-command",
             "new-tab-with-profile",
             "new-window",
             "new-window-with-profile",
@@ -6341,6 +6379,11 @@ fn install_window_actions(
     new_tab.connect_activate(move |_, _| open_tab(&action_state));
     window.add_action(&new_tab);
 
+    let new_command = gio::SimpleAction::new("new-command", None);
+    let action_state = state.clone();
+    new_command.connect_activate(move |_, _| show_new_command(&action_state));
+    window.add_action(&new_command);
+
     let new_window_with_profile = gio::SimpleAction::new("new-window-with-profile", None);
     let action_state = state.clone();
     let action_app = app.clone();
@@ -6917,6 +6960,104 @@ fn show_new_tab_with_profile(state: &Rc<RefCell<UiState>>) {
     dialog.present();
 }
 
+/// Run an explicitly supplied command in a new tab. The command is passed to
+/// the existing SpawnOptions path, which keeps direct execution and
+/// run-inside-shell behavior distinct instead of interpolating shell text.
+#[allow(deprecated)]
+fn show_new_command(state: &Rc<RefCell<UiState>>) {
+    let (parent, profile_names, selected_name, working_directory) = {
+        let state = state.borrow();
+        (
+            state.window.clone(),
+            state
+                .profiles
+                .names()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            state
+                .sessions
+                .active()
+                .map(|tab| tab.profile_name.clone())
+                .unwrap_or_else(|| state.settings.selected_profile.clone()),
+            state
+                .settings
+                .new_tab_same_directory
+                .then(|| {
+                    state
+                        .sessions
+                        .active()
+                        .and_then(|tab| tab.working_directory.clone())
+                })
+                .flatten(),
+        )
+    };
+    if profile_names.is_empty() {
+        return;
+    }
+    let profile_refs = profile_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let selector = gtk::DropDown::new(
+        Some(gtk::StringList::new(&profile_refs)),
+        None::<&gtk::Expression>,
+    );
+    selector.set_hexpand(true);
+    selector.set_selected(
+        profile_names
+            .iter()
+            .position(|name| name == &selected_name)
+            .unwrap_or(0) as u32,
+    );
+    let command = gtk::Entry::builder()
+        .placeholder_text("Command to run")
+        .activates_default(true)
+        .build();
+    let run_inside_shell = gtk::CheckButton::with_label("Run command inside shell");
+    run_inside_shell.set_active(true);
+    let dialog = gtk::Dialog::builder()
+        .title("New Command")
+        .transient_for(&parent)
+        .destroy_with_parent(true)
+        .modal(false)
+        .build();
+    enforce_non_modal(&dialog);
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Run", gtk::ResponseType::Accept);
+    dialog.set_default_response(gtk::ResponseType::Accept);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.append(&gtk::Label::new(Some("Command")));
+    content.append(&command);
+    content.append(&gtk::Label::new(Some("Profile")));
+    content.append(&selector);
+    content.append(&run_inside_shell);
+    dialog.content_area().append(&content);
+    let launch_state = state.clone();
+    let command_entry = command.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            let text = command_entry.text().trim().to_owned();
+            if let Some(profile_name) = profile_names.get(selector.selected() as usize) {
+                if !text.is_empty() {
+                    open_tab_with_spec(
+                        &launch_state,
+                        TabLaunchSpec::with_command(
+                            profile_name.clone(),
+                            working_directory.clone(),
+                            text,
+                            run_inside_shell.is_active(),
+                        ),
+                    );
+                }
+            }
+        }
+        dialog.close();
+    });
+    dialog.present();
+    command.grab_focus();
+}
+
 /// Pick a profile for a separate terminal window. The selection is passed to
 /// the new window directly, rather than changing the user's startup default.
 #[allow(deprecated)]
@@ -7184,10 +7325,17 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
     if state.borrow().closing {
         return;
     }
+    let TabLaunchSpec {
+        profile_name: requested_profile,
+        working_directory,
+        size,
+        command,
+        run_command_inside_shell,
+    } = spec;
     let (id, terminal, spawn_options) = {
         let mut state_mut = state.borrow_mut();
-        let profile_name = if state_mut.profiles.profile(&spec.profile_name).is_some() {
-            spec.profile_name
+        let profile_name = if state_mut.profiles.profile(&requested_profile).is_some() {
+            requested_profile
         } else {
             resolve_new_tab_profile(
                 &state_mut.settings,
@@ -7195,7 +7343,6 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
                 &state_mut.profiles,
             )
         };
-        let working_directory = spec.working_directory;
         let id = state_mut
             .sessions
             .open_tab(&profile_name, working_directory.as_deref());
@@ -7207,7 +7354,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         if let Some(profile) = &profile {
             apply_profile(&terminal, profile, &state_mut.settings);
         }
-        if let Some((columns, rows)) = spec.size {
+        if let Some((columns, rows)) = size {
             terminal.set_size(columns as i64, rows as i64);
         }
         // The profile grid supplies a useful natural size, but must never
@@ -7234,6 +7381,10 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
             if profile.set_locale_environment {
                 spawn_options.locale = profile_options.locale;
             }
+        }
+        if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
+            spawn_options.custom_command = Some(command);
+            spawn_options.run_command_inside_shell = run_command_inside_shell;
         }
         let surface = terminal_surface(
             &terminal,
