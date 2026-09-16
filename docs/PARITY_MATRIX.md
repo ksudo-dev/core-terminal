@@ -198,7 +198,8 @@ per-session legacy encoding selector.
 
 The current release provides a native GTK menubar with Core Terminal, Shell,
 Edit, View, Window, and Help menus; a terminal right-click menu; search and
-search navigation; selection and clipboard actions; tab navigation; per-tab
+search navigation; selection and clipboard actions including shell-escaped
+paste; tab navigation; per-tab
 zoom; fullscreen; profile-picked tabs; a New Command launcher with direct or
 shell execution; scrollback clearing; terminal reset; and an explicit Ctrl-C
 interrupt action. It does not claim parity for split panes,

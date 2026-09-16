@@ -87,10 +87,10 @@ mod structural_tests {
     use super::{
         adjust_font_scale, compatibility_profile, migrate_legacy_profile_flags,
         resolve_new_tab_profile, resolve_window_profile, runtime_profile_requires_reapply,
-        runtime_terminal_settings_changed, settings_page_ids, spawn_callback_action,
-        startup_profile_after_deletion, terminal_menu_labels, terminal_menu_model,
-        window_group_entry_summary, ProfileStore, SessionManager, Settings, SpawnCallbackAction,
-        WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        runtime_terminal_settings_changed, settings_page_ids, shell_escape_for_paste,
+        spawn_callback_action, startup_profile_after_deletion, terminal_menu_labels,
+        terminal_menu_model, window_group_entry_summary, ProfileStore, SessionManager, Settings,
+        SpawnCallbackAction, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -123,6 +123,13 @@ mod structural_tests {
             terminal_menu_labels(&terminal_menu_model()),
             ["Core Terminal", "Shell", "Edit", "View", "Window", "Help",]
         );
+    }
+
+    #[test]
+    fn shell_paste_quoting_preserves_literal_text_without_executing_it() {
+        assert_eq!(shell_escape_for_paste("hello world"), "'hello world'");
+        assert_eq!(shell_escape_for_paste("a'b"), "'a'\\''b'");
+        assert_eq!(shell_escape_for_paste(""), "''");
     }
 
     #[test]
@@ -522,6 +529,7 @@ fn terminal_menu_model() -> gio::Menu {
     edit.append(Some("Copy"), Some("win.copy"));
     edit.append(Some("Paste"), Some("win.paste"));
     edit.append(Some("Paste Selection"), Some("win.paste-selection"));
+    edit.append(Some("Paste Escaped"), Some("win.paste-escaped"));
     edit.append(Some("Select All"), Some("win.select-all"));
     edit.append(Some("Find"), Some("win.search"));
     edit.append(Some("Find Next"), Some("win.find-next"));
@@ -562,6 +570,7 @@ fn install_terminal_context_menu(terminal: &vte4::Terminal) {
     menu.append(Some("Copy"), Some("win.copy"));
     menu.append(Some("Paste"), Some("win.paste"));
     menu.append(Some("Paste Selection"), Some("win.paste-selection"));
+    menu.append(Some("Paste Escaped"), Some("win.paste-escaped"));
     menu.append(Some("Select All"), Some("win.select-all"));
     menu.append(Some("Find"), Some("win.search"));
     menu.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
@@ -5479,6 +5488,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             "copy",
             "paste",
             "paste-selection",
+            "paste-escaped",
             "select-all",
             "search",
             "find-next",
@@ -6457,6 +6467,15 @@ fn install_window_actions(
         }
     });
     window.add_action(&paste_selection);
+
+    let paste_escaped = gio::SimpleAction::new("paste-escaped", None);
+    let action_state = state.clone();
+    paste_escaped.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            paste_escaped_clipboard(&terminal);
+        }
+    });
+    window.add_action(&paste_escaped);
 
     let select_all = gio::SimpleAction::new("select-all", None);
     let action_state = state.clone();
@@ -8105,6 +8124,24 @@ fn paste_clipboard_with_carriage_returns(terminal: &vte4::Terminal) {
         let normalized = text.replace("\r\n", "\n").replace('\n', "\r");
         terminal.feed_child(normalized.as_bytes());
     });
+}
+
+/// Quote clipboard text for a POSIX-like shell, then type it into the active
+/// terminal without appending Enter. The user still reviews and executes the
+/// resulting command line themselves.
+fn paste_escaped_clipboard(terminal: &vte4::Terminal) {
+    let clipboard = terminal.display().clipboard();
+    let terminal = terminal.clone();
+    clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
+        let Ok(Some(text)) = result else {
+            return;
+        };
+        terminal.feed_child(shell_escape_for_paste(text.as_str()).as_bytes());
+    });
+}
+
+fn shell_escape_for_paste(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 fn copy_selection(terminal: &vte4::Terminal) {
