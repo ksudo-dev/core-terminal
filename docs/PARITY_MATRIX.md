@@ -12,7 +12,7 @@ behavior. A value that is only stored does not count.
 | Area | Status in 0.2.2 |
 | --- | --- |
 | Native terminal | GTK4 application with one VTE PTY per tab, login-shell startup, and child-process cleanup |
-| Windows and tabs | New window, new tab, profile-picked tabs, a New Command launcher, close tab, tab navigation, per-tab zoom, fullscreen, Ctrl+1 through Ctrl+9 switching, a standard menubar, and a terminal right-click menu with safe browser and mail links |
+| Windows and tabs | New window, new tab, profile-picked tabs, a New Command launcher, close tab, tab navigation, per-tab zoom, fullscreen, Ctrl+1 through Ctrl+9 switching, a standard menubar, and a terminal right-click menu with safe browser and mail links plus link-address copying |
 | Settings window | Non-modal General, Profiles, Window Groups, and Encodings pages with responsive profile navigation and independently scrollable editor content |
 | Profile pages | Text, Window, Tab, Shell, Keyboard, and Advanced pages are scrollable and keyboard reachable |
 | Profiles | Ten project-owned defaults, profile selection, add, duplicate, delete, reset, default selection, import, and export |
@@ -197,14 +197,14 @@ per-session legacy encoding selector.
 ## Behavior outside Settings
 
 The current release provides a native GTK menubar with Core Terminal, Shell,
-Edit, View, Window, and Help menus; a terminal right-click menu with safe browser and mail links; search and
+Edit, View, Window, and Help menus; a terminal right-click menu with safe browser and mail links plus link-address copying; search and
 search navigation; selection and clipboard actions including HTML copy and
 shell-escaped paste; tab navigation; direct profile and saved-window-group menu entries;
 transcript export to a new plain-text file; per-tab zoom; fullscreen; a New
 Command launcher with direct or shell execution; scrollback clearing; terminal
 reset; and an explicit Ctrl-C interrupt action. It does not claim parity for
 split panes,
-Inspector, marks and bookmarks, print or content export, hyperlink workflows,
+Inspector, marks and bookmarks, print or content export, dragged-file quoting,
 dragged-file quoting, remote-connection browsing, or a D-Bus automation API.
 These belong in a later feature plan rather than a release claim.
 

@@ -104,7 +104,7 @@ Core Terminal currently includes:
   custom command
 - A native GTK menubar with Core Terminal, Shell, Edit, View, Window, and Help
   menus, plus a terminal right-click menu for safe browser and mail links,
-  copy, paste, selection, search, scrollback, and tab actions
+  link-address copying, copy, paste, selection, search, scrollback, and tab actions
 - Search navigation, selection-aware clipboard actions including HTML copy and
   shell-escaped paste, tab navigation, direct profile and saved-window-group menu entries,
   transcript export to a new plain-text file, a New Command launcher with direct
