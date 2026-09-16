@@ -148,6 +148,16 @@ mod structural_tests {
     }
 
     #[test]
+    fn view_menu_exposes_a_stateful_tab_bar_toggle() {
+        let menu = terminal_menu_model(&ProfileStore::defaults());
+        let view = menu_submenu_named(&menu, "View").unwrap();
+        assert_eq!(
+            menu_item_action(&view, "Show Tab Bar"),
+            Some("win.show-tab-bar".into())
+        );
+    }
+
+    #[test]
     fn terminal_links_allow_only_browser_and_mail_uris() {
         for uri in [
             "https://example.com/docs?q=core-terminal",
@@ -687,6 +697,7 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     view.append(Some("Zoom In"), Some("win.zoom-in"));
     view.append(Some("Zoom Out"), Some("win.zoom-out"));
     view.append(Some("Actual Size"), Some("win.zoom-reset"));
+    view.append(Some("Show Tab Bar"), Some("win.show-tab-bar"));
     view.append(Some("Toggle Full Screen"), Some("win.toggle-fullscreen"));
     let window = gio::Menu::new();
     if !profiles.window_groups().is_empty() {
@@ -4265,6 +4276,7 @@ struct UiState {
     // weak. One live editor owns one unsaved draft for this terminal window.
     settings_window: Option<glib::WeakRef<gtk::Window>>,
     menubar: gtk::PopoverMenuBar,
+    tab_bar: gtk::Box,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
     pending_spawns: HashSet<u64>,
@@ -4492,6 +4504,18 @@ fn build_window_with_profile_and_directory(
     menubar.set_widget_name("terminal-menubar");
     menubar.add_css_class("core-terminal-menubar");
     menubar.set_hexpand(true);
+
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    switcher.set_hexpand(true);
+
+    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    tab_bar.set_widget_name("terminal-toolbar");
+    tab_bar.add_css_class("core-terminal-toolbar");
+    tab_bar.append(&switcher);
+    tab_bar.append(&gtk::Label::new(Some("Profile")));
+    tab_bar.append(&profile_dropdown);
+
     let state = Rc::new(RefCell::new(UiState {
         profiles,
         settings,
@@ -4500,6 +4524,7 @@ fn build_window_with_profile_and_directory(
         window: window.clone(),
         settings_window: None,
         menubar: menubar.clone(),
+        tab_bar: tab_bar.clone(),
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
         pending_spawns: HashSet::new(),
@@ -4516,17 +4541,6 @@ fn build_window_with_profile_and_directory(
     let header = build_header_bar();
     header.set_widget_name("terminal-titlebar");
     window.set_titlebar(Some(&header));
-
-    let switcher = gtk::StackSwitcher::new();
-    switcher.set_stack(Some(&stack));
-    switcher.set_hexpand(true);
-
-    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    tab_bar.set_widget_name("terminal-toolbar");
-    tab_bar.add_css_class("core-terminal-toolbar");
-    tab_bar.append(&switcher);
-    tab_bar.append(&gtk::Label::new(Some("Profile")));
-    tab_bar.append(&profile_dropdown);
 
     let new_tab = gtk::Button::with_label("New Tab");
     new_tab.set_tooltip_text(Some("New Tab (Ctrl+T)"));
@@ -5962,6 +5976,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             "zoom-in",
             "zoom-out",
             "zoom-reset",
+            "show-tab-bar",
             "toggle-fullscreen",
             "next-tab",
             "previous-tab",
@@ -5973,6 +5988,18 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         ]
         .into_iter()
         .all(|name| state.borrow().window.lookup_action(name).is_some());
+        let tab_bar_toggle_works = {
+            let (window, tab_bar) = {
+                let state = state.borrow();
+                (state.window.clone(), state.tab_bar.clone())
+            };
+            window.lookup_action("show-tab-bar").is_some_and(|action| {
+                action.change_state(&false.to_variant());
+                let hidden = !tab_bar.is_visible();
+                action.change_state(&true.to_variant());
+                hidden && tab_bar.is_visible()
+            })
+        };
         let clean_window_title = state
             .borrow()
             .window
@@ -6653,6 +6680,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && standard_navigation_present
             && application_menubar_shared
             && menu_actions_present
+            && tab_bar_toggle_works
             && clean_window_title
             && terminal_can_shrink
             && scrollback_mirror_read_only
@@ -6716,7 +6744,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && protected_sibling_preserved
             && close_probe_cleanup;
         let report = format!(
-            "status={} missing={:?} non_modal={} settings_window_reused={} settings_draft_preserved={} settings_chooser_parented={} settings_recreated_after_save={} standard_navigation_present={} application_menubar_shared={} menu_actions_present={} clean_window_title={} terminal_can_shrink={} scrollback_mirror_read_only={} scrollback_unlimited_sensitivity={} scrollback_profile_canonical={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} profile_content_scroll_policy={} profile_list_scroll_policy={} profile_switcher_scroll_policy={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} compact_settings_mapped={} compact_profiles_selected={} compact_text_selected={} compact_layout_settled={} compact_sidebar_width={} compact_profile_add={}x{} compact_profile_labels_readable={} compact_profile_actions_visible={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
+            "status={} missing={:?} non_modal={} settings_window_reused={} settings_draft_preserved={} settings_chooser_parented={} settings_recreated_after_save={} standard_navigation_present={} application_menubar_shared={} menu_actions_present={} tab_bar_toggle_works={} clean_window_title={} terminal_can_shrink={} scrollback_mirror_read_only={} scrollback_unlimited_sensitivity={} scrollback_profile_canonical={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} profile_content_scroll_policy={} profile_list_scroll_policy={} profile_switcher_scroll_policy={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} compact_settings_mapped={} compact_profiles_selected={} compact_text_selected={} compact_layout_settled={} compact_sidebar_width={} compact_profile_add={}x{} compact_profile_labels_readable={} compact_profile_actions_visible={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
@@ -6727,6 +6755,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             standard_navigation_present,
             application_menubar_shared,
             menu_actions_present,
+            tab_bar_toggle_works,
             clean_window_title,
             terminal_can_shrink,
             scrollback_mirror_read_only,
@@ -7198,6 +7227,19 @@ fn install_window_actions(
         }
     });
     window.add_action(&fullscreen);
+
+    // A stateful menu item keeps the View menu honest: it changes the real
+    // toolbar in this window instead of merely presenting a visual checkbox.
+    let show_tab_bar = gio::SimpleAction::new_stateful("show-tab-bar", None, &true.to_variant());
+    let action_tab_bar = state.borrow().tab_bar.clone();
+    show_tab_bar.connect_change_state(move |action, value| {
+        let Some(visible) = value.and_then(|value| value.get::<bool>()) else {
+            return;
+        };
+        action_tab_bar.set_visible(visible);
+        action.set_state(&visible.to_variant());
+    });
+    window.add_action(&show_tab_bar);
 
     let new_tab_with_profile = gio::SimpleAction::new("new-tab-with-profile", None);
     let action_state = state.clone();
