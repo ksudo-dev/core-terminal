@@ -200,9 +200,10 @@ The current release provides a native GTK menubar with Core Terminal, Shell,
 Edit, View, Window, and Help menus; a terminal right-click menu; search and
 search navigation; selection and clipboard actions including HTML copy and
 shell-escaped paste; tab navigation; direct profile and saved-window-group menu entries;
-per-tab zoom; fullscreen; a New Command launcher with direct or shell
-execution; scrollback clearing; terminal reset; and an explicit Ctrl-C
-interrupt action. It does not claim parity for split panes,
+transcript export to a new plain-text file; per-tab zoom; fullscreen; a New
+Command launcher with direct or shell execution; scrollback clearing; terminal
+reset; and an explicit Ctrl-C interrupt action. It does not claim parity for
+split panes,
 Inspector, marks and bookmarks, print or content export, hyperlink workflows,
 dragged-file quoting, remote-connection browsing, or a D-Bus automation API.
 These belong in a later feature plan rather than a release claim.
