@@ -85,13 +85,13 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        adjust_font_scale, compatibility_profile, menu_item_action_and_target, menu_submenu_named,
-        migrate_legacy_profile_flags, resolve_new_tab_profile, resolve_window_profile,
-        runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
-        shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
-        terminal_menu_labels, terminal_menu_model, window_group_entry_summary, ProfileStore,
-        SessionManager, Settings, SpawnCallbackAction, WindowGroup, WindowGroupEntry,
-        APPLICATION_ID, PROFILE_PAGE_IDS,
+        adjust_font_scale, compatibility_profile, menu_item_action, menu_item_action_and_target,
+        menu_submenu_named, migrate_legacy_profile_flags, replace_menu_model_contents,
+        resolve_new_tab_profile, resolve_window_profile, runtime_profile_requires_reapply,
+        runtime_terminal_settings_changed, settings_page_ids, shell_escape_for_paste,
+        spawn_callback_action, startup_profile_after_deletion, terminal_menu_labels,
+        terminal_menu_model, window_group_entry_summary, ProfileStore, SessionManager, Settings,
+        SpawnCallbackAction, WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -127,6 +127,16 @@ mod structural_tests {
     }
 
     #[test]
+    fn edit_menu_exposes_html_copy() {
+        let menu = terminal_menu_model(&ProfileStore::defaults());
+        let edit = menu_submenu_named(&menu, "Edit").unwrap();
+        assert_eq!(
+            menu_item_action(&edit, "Copy as HTML"),
+            Some("win.copy-html".into())
+        );
+    }
+
+    #[test]
     fn menubar_exposes_profile_and_window_group_shortcuts() {
         let mut profiles = ProfileStore::defaults();
         profiles
@@ -147,6 +157,31 @@ mod structural_tests {
             menu_item_action_and_target(&new_tab_profiles, "Homebrew"),
             Some(("win.new-tab-with-profile-name".into(), "Homebrew".into()))
         );
+        let window = menu_submenu_named(&menu, "Window").unwrap();
+        let groups = menu_submenu_named(&window, "Open Window Group").unwrap();
+        assert_eq!(
+            menu_item_action_and_target(&groups, "Development"),
+            Some(("win.open-window-group-name".into(), "Development".into()))
+        );
+    }
+
+    #[test]
+    fn shared_menu_model_updates_profile_and_window_group_entries_in_place() {
+        let menu = terminal_menu_model(&ProfileStore::defaults());
+        let mut profiles = ProfileStore::defaults();
+        profiles
+            .add_window_group(WindowGroup {
+                name: "Development".into(),
+                entries: vec![WindowGroupEntry {
+                    profile: "Homebrew".into(),
+                    working_directory: None,
+                    columns: 80,
+                    rows: 24,
+                }],
+            })
+            .unwrap();
+        replace_menu_model_contents(&menu, &terminal_menu_model(&profiles));
+
         let window = menu_submenu_named(&menu, "Window").unwrap();
         let groups = menu_submenu_named(&window, "Open Window Group").unwrap();
         assert_eq!(
@@ -584,6 +619,7 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     shell.append(Some("Reset Terminal"), Some("win.reset-terminal"));
     let edit = gio::Menu::new();
     edit.append(Some("Copy"), Some("win.copy"));
+    edit.append(Some("Copy as HTML"), Some("win.copy-html"));
     edit.append(Some("Paste"), Some("win.paste"));
     edit.append(Some("Paste Selection"), Some("win.paste-selection"));
     edit.append(Some("Paste Escaped"), Some("win.paste-escaped"));
@@ -621,6 +657,37 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     menu.append_submenu(Some("View"), &view);
     menu.append_submenu(Some("Window"), &window);
     menu.append_submenu(Some("Help"), &help);
+    menu
+}
+
+/// Return the single application-wide menu model. GTK renders this model in
+/// native shells, while each window PopoverMenuBar references the same object.
+/// Creating a window must never replace it with a per-window snapshot.
+fn application_menu_model(app: &gtk::Application, profiles: &ProfileStore) -> gio::Menu {
+    if let Some(menu) = app
+        .menubar()
+        .and_then(|model| model.downcast::<gio::Menu>().ok())
+    {
+        return menu;
+    }
+    let menu = terminal_menu_model(profiles);
+    app.set_menubar(Some(&menu));
+    menu
+}
+
+/// Replace the contents without changing the model object. This keeps GTK's
+/// application menubar and every existing window popover synchronized.
+fn replace_menu_model_contents(menu: &gio::Menu, replacement: &gio::Menu) {
+    menu.remove_all();
+    for index in 0..replacement.n_items() {
+        menu.append_item(&gio::MenuItem::from_model(replacement, index));
+    }
+}
+
+fn refresh_application_menu(app: &gtk::Application, profiles: &ProfileStore) -> gio::Menu {
+    let menu = application_menu_model(app, profiles);
+    let replacement = terminal_menu_model(profiles);
+    replace_menu_model_contents(&menu, &replacement);
     menu
 }
 
@@ -668,9 +735,23 @@ fn menu_item_action_and_target(
     })
 }
 
+#[cfg(test)]
+fn menu_item_action(menu: &impl IsA<gio::MenuModel>, label: &str) -> Option<String> {
+    (0..menu.n_items()).find_map(|index| {
+        let item_label = menu
+            .item_attribute_value(index, "label", None)
+            .and_then(|value| value.str().map(str::to_owned));
+        (item_label.as_deref() == Some(label))
+            .then(|| menu.item_attribute_value(index, "action", None))
+            .flatten()
+            .and_then(|value| value.str().map(str::to_owned))
+    })
+}
+
 fn install_terminal_context_menu(terminal: &vte4::Terminal) {
     let menu = gio::Menu::new();
     menu.append(Some("Copy"), Some("win.copy"));
+    menu.append(Some("Copy as HTML"), Some("win.copy-html"));
     menu.append(Some("Paste"), Some("win.paste"));
     menu.append(Some("Paste Selection"), Some("win.paste-selection"));
     menu.append(Some("Paste Escaped"), Some("win.paste-escaped"));
@@ -4203,6 +4284,10 @@ pub fn run(application_id: &str, display_name: &str) {
     let app = gtk::Application::builder()
         .application_id(application_id)
         .build();
+    app.connect_startup(|app| {
+        let profiles = load_user_profiles();
+        let _ = application_menu_model(app, &profiles);
+    });
     let display_name = display_name.to_owned();
     let activate_name = display_name.clone();
     app.connect_activate(move |app| build_window(app, &activate_name, false));
@@ -4274,8 +4359,7 @@ fn build_window_with_profile_and_directory(
         .vexpand(true)
         .transition_type(gtk::StackTransitionType::SlideLeftRight)
         .build();
-    let terminal_menu = terminal_menu_model(&profiles);
-    app.set_menubar(Some(&terminal_menu));
+    let terminal_menu = application_menu_model(app, &profiles);
     let menubar = gtk::PopoverMenuBar::from_model(Some(&terminal_menu));
     menubar.set_widget_name("terminal-menubar");
     menubar.add_css_class("core-terminal-menubar");
@@ -5588,8 +5672,14 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             widget_tree_has_name(root, "terminal-menubar")
                 && widget_tree_has_name(root, "terminal-toolbar")
         });
+        refresh_terminal_menu(&state);
+        let application_menubar_shared = app
+            .menubar()
+            .zip(state.borrow().menubar.menu_model())
+            .is_some_and(|(application_menu, window_menu)| application_menu == window_menu);
         let menu_actions_present = [
             "copy",
+            "copy-html",
             "paste",
             "paste-selection",
             "paste-escaped",
@@ -6269,6 +6359,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && settings_chooser_parented
             && settings_recreated_after_save
             && standard_navigation_present
+            && application_menubar_shared
             && menu_actions_present
             && clean_window_title
             && terminal_can_shrink
@@ -6323,7 +6414,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && protected_sibling_preserved
             && close_probe_cleanup;
         let report = format!(
-            "status={} missing={:?} non_modal={} settings_window_reused={} settings_draft_preserved={} settings_chooser_parented={} settings_recreated_after_save={} standard_navigation_present={} menu_actions_present={} clean_window_title={} terminal_can_shrink={} scrollback_mirror_read_only={} scrollback_unlimited_sensitivity={} scrollback_profile_canonical={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
+            "status={} missing={:?} non_modal={} settings_window_reused={} settings_draft_preserved={} settings_chooser_parented={} settings_recreated_after_save={} standard_navigation_present={} application_menubar_shared={} menu_actions_present={} clean_window_title={} terminal_can_shrink={} scrollback_mirror_read_only={} scrollback_unlimited_sensitivity={} scrollback_profile_canonical={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
@@ -6332,6 +6423,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             settings_chooser_parented,
             settings_recreated_after_save,
             standard_navigation_present,
+            application_menubar_shared,
             menu_actions_present,
             clean_window_title,
             terminal_can_shrink,
@@ -6583,6 +6675,22 @@ fn install_window_actions(
         }
     });
     window.add_action(&copy);
+
+    let copy_html = gio::SimpleAction::new("copy-html", None);
+    let action_state = state.clone();
+    copy_html.connect_activate(move |_, _| {
+        let terminal = {
+            let state = action_state.borrow();
+            state
+                .sessions
+                .active()
+                .and_then(|tab| state.terminals.get(&tab.id.get()).cloned())
+        };
+        if let Some(terminal) = terminal {
+            copy_selection_as_html(&terminal);
+        }
+    });
+    window.add_action(&copy_html);
 
     let paste = gio::SimpleAction::new("paste", None);
     let action_state = state.clone();
@@ -6997,10 +7105,18 @@ fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
 /// store. The visible GTK menu always reflects the same profile data that will
 /// be used when a menu action launches a tab or group.
 fn refresh_terminal_menu(state: &Rc<RefCell<UiState>>) {
-    let (menubar, menu) = {
+    let (menubar, application, profiles) = {
         let state = state.borrow();
-        (state.menubar.clone(), terminal_menu_model(&state.profiles))
+        (
+            state.menubar.clone(),
+            state.window.application(),
+            state.profiles.clone(),
+        )
     };
+    let menu = application
+        .as_ref()
+        .map(|application| refresh_application_menu(application, &profiles))
+        .unwrap_or_else(|| terminal_menu_model(&profiles));
     menubar.set_menu_model(Some(&menu));
 }
 
@@ -8358,6 +8474,12 @@ fn shell_escape_for_paste(text: &str) -> String {
 fn copy_selection(terminal: &vte4::Terminal) {
     if let Some(text) = terminal.text_selected(vte4::Format::Text) {
         terminal.display().clipboard().set_text(&text);
+    }
+}
+
+fn copy_selection_as_html(terminal: &vte4::Terminal) {
+    if terminal.text_selected(vte4::Format::Text).is_some() {
+        terminal.copy_clipboard_format(vte4::Format::Html);
     }
 }
 

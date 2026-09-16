@@ -54,6 +54,7 @@ require_report_field() {
 }
 
 require_report_field status PASS
+require_report_field application_menubar_shared true
 require_report_field scrollback_mirror_read_only true
 require_report_field scrollback_unlimited_sensitivity true
 require_report_field scrollback_profile_canonical true
