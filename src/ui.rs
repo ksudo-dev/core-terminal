@@ -85,11 +85,12 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        compatibility_profile, migrate_legacy_profile_flags, resolve_new_tab_profile,
-        resolve_window_profile, runtime_profile_requires_reapply,
-        runtime_terminal_settings_changed, settings_page_ids, spawn_callback_action,
-        startup_profile_after_deletion, window_group_entry_summary, ProfileStore, SessionManager,
-        Settings, SpawnCallbackAction, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        adjust_font_scale, compatibility_profile, migrate_legacy_profile_flags,
+        resolve_new_tab_profile, resolve_window_profile, runtime_profile_requires_reapply,
+        runtime_terminal_settings_changed, settings_page_ids, shell_escape_for_paste,
+        spawn_callback_action, startup_profile_after_deletion, terminal_menu_labels,
+        terminal_menu_model, window_group_entry_summary, ProfileStore, SessionManager, Settings,
+        SpawnCallbackAction, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -106,6 +107,29 @@ mod structural_tests {
         assert_eq!(PROFILE_PAGE_IDS[0], "text");
         assert_eq!(PROFILE_PAGE_IDS[2], "tab");
         assert_eq!(PROFILE_PAGE_IDS[5], "advanced");
+    }
+
+    #[test]
+    fn menu_zoom_is_bounded_and_reversible() {
+        assert_eq!(adjust_font_scale(1.0, 0.1), 1.1);
+        assert_eq!(adjust_font_scale(1.1, -0.1), 1.0);
+        assert_eq!(adjust_font_scale(0.5, -0.1), 0.5);
+        assert_eq!(adjust_font_scale(2.0, 0.1), 2.0);
+    }
+
+    #[test]
+    fn menubar_uses_the_terminal_facing_top_level_inventory() {
+        assert_eq!(
+            terminal_menu_labels(&terminal_menu_model()),
+            ["Core Terminal", "Shell", "Edit", "View", "Window", "Help",]
+        );
+    }
+
+    #[test]
+    fn shell_paste_quoting_preserves_literal_text_without_executing_it() {
+        assert_eq!(shell_escape_for_paste("hello world"), "'hello world'");
+        assert_eq!(shell_escape_for_paste("a'b"), "'a'\\''b'");
+        assert_eq!(shell_escape_for_paste(""), "''");
     }
 
     #[test]
@@ -149,6 +173,21 @@ mod structural_tests {
         assert_eq!(spec.profile_name, "Homebrew");
         assert_eq!(spec.working_directory.as_deref(), Some("/srv/project"));
         assert_eq!(spec.size, Some((100, 32)));
+        assert_eq!(spec.command, None);
+    }
+
+    #[test]
+    fn new_command_launch_spec_keeps_the_requested_execution_mode() {
+        let spec = super::TabLaunchSpec::with_command(
+            "Homebrew",
+            Some("/srv/project".into()),
+            "printf hello",
+            false,
+        );
+        assert_eq!(spec.profile_name, "Homebrew");
+        assert_eq!(spec.working_directory.as_deref(), Some("/srv/project"));
+        assert_eq!(spec.command.as_deref(), Some("printf hello"));
+        assert!(!spec.run_command_inside_shell);
     }
 
     #[test]
@@ -461,41 +500,80 @@ pub fn build_header_bar() -> gtk::HeaderBar {
 
 fn terminal_menu_model() -> gio::Menu {
     let menu = gio::Menu::new();
-    let file = gio::Menu::new();
-    file.append(Some("New Window"), Some("win.new-window"));
-    file.append(Some("New Tab"), Some("win.new-tab"));
-    file.append(Some("Close Tab"), Some("win.close-tab"));
-    file.append(Some("Quit"), Some("win.quit"));
-    let edit = gio::Menu::new();
-    edit.append(Some("Copy"), Some("win.copy"));
-    edit.append(Some("Paste"), Some("win.paste"));
-    edit.append(Some("Select All"), Some("win.select-all"));
-    edit.append(Some("Find"), Some("win.search"));
-    let view = gio::Menu::new();
-    view.append(Some("Next Tab"), Some("win.next-tab"));
-    view.append(Some("Previous Tab"), Some("win.previous-tab"));
-    let profiles = gio::Menu::new();
-    profiles.append(Some("Settings"), Some("win.settings"));
-    profiles.append(
+    let application = gio::Menu::new();
+    application.append(Some("Settings"), Some("win.settings"));
+    application.append(
         Some("Restore Default Profiles"),
         Some("win.restore-profiles"),
     );
+    application.append(Some("About Core Terminal"), Some("win.about"));
+    application.append(Some("Quit"), Some("win.quit"));
+
+    let shell = gio::Menu::new();
+    shell.append(Some("New Window"), Some("win.new-window"));
+    shell.append(
+        Some("New Window with Profile…"),
+        Some("win.new-window-with-profile"),
+    );
+    shell.append(Some("New Tab"), Some("win.new-tab"));
+    shell.append(Some("New Command…"), Some("win.new-command"));
+    shell.append(
+        Some("New Tab with Profile…"),
+        Some("win.new-tab-with-profile"),
+    );
+    shell.append(Some("Close Tab"), Some("win.close-tab"));
+    shell.append(Some("Interrupt (Ctrl-C)"), Some("win.interrupt"));
+    shell.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
+    shell.append(Some("Reset Terminal"), Some("win.reset-terminal"));
+    let edit = gio::Menu::new();
+    edit.append(Some("Copy"), Some("win.copy"));
+    edit.append(Some("Paste"), Some("win.paste"));
+    edit.append(Some("Paste Selection"), Some("win.paste-selection"));
+    edit.append(Some("Paste Escaped"), Some("win.paste-escaped"));
+    edit.append(Some("Select All"), Some("win.select-all"));
+    edit.append(Some("Find"), Some("win.search"));
+    edit.append(Some("Find Next"), Some("win.find-next"));
+    edit.append(Some("Find Previous"), Some("win.find-previous"));
+    let view = gio::Menu::new();
+    view.append(Some("Zoom In"), Some("win.zoom-in"));
+    view.append(Some("Zoom Out"), Some("win.zoom-out"));
+    view.append(Some("Actual Size"), Some("win.zoom-reset"));
+    view.append(Some("Toggle Full Screen"), Some("win.toggle-fullscreen"));
+    let window = gio::Menu::new();
+    window.append(Some("Open Window Group…"), Some("win.open-window-group"));
+    window.append(Some("Next Tab"), Some("win.next-tab"));
+    window.append(Some("Previous Tab"), Some("win.previous-tab"));
+    window.append(Some("Close Window"), Some("win.close-window"));
     let help = gio::Menu::new();
     help.append(Some("About Core Terminal"), Some("win.about"));
-    menu.append_submenu(Some("File"), &file);
+    menu.append_submenu(Some("Core Terminal"), &application);
+    menu.append_submenu(Some("Shell"), &shell);
     menu.append_submenu(Some("Edit"), &edit);
     menu.append_submenu(Some("View"), &view);
-    menu.append_submenu(Some("Profiles"), &profiles);
+    menu.append_submenu(Some("Window"), &window);
     menu.append_submenu(Some("Help"), &help);
     menu
+}
+
+#[cfg(test)]
+fn terminal_menu_labels(menu: &gio::Menu) -> Vec<String> {
+    (0..menu.n_items())
+        .filter_map(|index| {
+            menu.item_attribute_value(index, "label", None)
+                .and_then(|value| value.str().map(str::to_owned))
+        })
+        .collect()
 }
 
 fn install_terminal_context_menu(terminal: &vte4::Terminal) {
     let menu = gio::Menu::new();
     menu.append(Some("Copy"), Some("win.copy"));
     menu.append(Some("Paste"), Some("win.paste"));
+    menu.append(Some("Paste Selection"), Some("win.paste-selection"));
+    menu.append(Some("Paste Escaped"), Some("win.paste-escaped"));
     menu.append(Some("Select All"), Some("win.select-all"));
     menu.append(Some("Find"), Some("win.search"));
+    menu.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
     menu.append(Some("New Tab"), Some("win.new-tab"));
     menu.append(Some("Close Tab"), Some("win.close-tab"));
     let popover = gtk::PopoverMenu::from_model(Some(&menu));
@@ -3923,6 +4001,8 @@ struct TabLaunchSpec {
     profile_name: String,
     working_directory: Option<String>,
     size: Option<(u32, u32)>,
+    command: Option<String>,
+    run_command_inside_shell: bool,
 }
 
 impl TabLaunchSpec {
@@ -3931,6 +4011,23 @@ impl TabLaunchSpec {
             profile_name: profile_name.into(),
             working_directory,
             size: None,
+            command: None,
+            run_command_inside_shell: true,
+        }
+    }
+
+    fn with_command(
+        profile_name: impl Into<String>,
+        working_directory: Option<String>,
+        command: impl Into<String>,
+        run_command_inside_shell: bool,
+    ) -> Self {
+        Self {
+            profile_name: profile_name.into(),
+            working_directory,
+            size: None,
+            command: Some(command.into()),
+            run_command_inside_shell,
         }
     }
 
@@ -3939,6 +4036,8 @@ impl TabLaunchSpec {
             profile_name: entry.profile,
             working_directory: entry.working_directory,
             size: Some((entry.columns, entry.rows)),
+            command: None,
+            run_command_inside_shell: true,
         }
     }
 }
@@ -4020,10 +4119,28 @@ fn build_window_with_directory(
     new_window: bool,
     pending_working_directory: Option<String>,
 ) {
+    build_window_with_profile_and_directory(
+        app,
+        display_name,
+        new_window,
+        pending_working_directory,
+        None,
+    );
+}
+
+fn build_window_with_profile_and_directory(
+    app: &gtk::Application,
+    display_name: &str,
+    new_window: bool,
+    pending_working_directory: Option<String>,
+    requested_profile_override: Option<String>,
+) {
     gtk::Window::set_default_icon_name(APPLICATION_ID);
     let mut profiles = load_user_profiles();
     let mut settings = Settings::load_user();
-    let requested_profile = resolve_window_profile(&settings, &profiles, new_window);
+    let requested_profile = requested_profile_override
+        .filter(|name| profiles.profile(name).is_some())
+        .unwrap_or_else(|| resolve_window_profile(&settings, &profiles, new_window));
     settings.selected_profile = requested_profile.clone();
     if migrate_legacy_profile_flags(&mut settings, &mut profiles) && !save_user_profiles(&profiles)
     {
@@ -5370,9 +5487,32 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         let menu_actions_present = [
             "copy",
             "paste",
+            "paste-selection",
+            "paste-escaped",
             "select-all",
+            "search",
+            "find-next",
+            "find-previous",
             "new-tab",
+            "new-command",
+            "new-tab-with-profile",
+            "new-window",
+            "new-window-with-profile",
             "close-tab",
+            "close-window",
+            "interrupt",
+            "clear-scrollback",
+            "reset-terminal",
+            "zoom-in",
+            "zoom-out",
+            "zoom-reset",
+            "toggle-fullscreen",
+            "next-tab",
+            "previous-tab",
+            "open-window-group",
+            "settings",
+            "restore-profiles",
+            "about",
             "quit",
         ]
         .into_iter()
@@ -6249,10 +6389,27 @@ fn install_window_actions(
     new_tab.connect_activate(move |_, _| open_tab(&action_state));
     window.add_action(&new_tab);
 
+    let new_command = gio::SimpleAction::new("new-command", None);
+    let action_state = state.clone();
+    new_command.connect_activate(move |_, _| show_new_command(&action_state));
+    window.add_action(&new_command);
+
+    let new_window_with_profile = gio::SimpleAction::new("new-window-with-profile", None);
+    let action_state = state.clone();
+    let action_app = app.clone();
+    new_window_with_profile
+        .connect_activate(move |_, _| show_new_window_with_profile(&action_app, &action_state));
+    window.add_action(&new_window_with_profile);
+
     let close = gio::SimpleAction::new("close-tab", None);
     let action_state = state.clone();
     close.connect_activate(move |_, _| close_current_tab(&action_state));
     window.add_action(&close);
+
+    let close_window = gio::SimpleAction::new("close-window", None);
+    let close_window_parent = window.clone();
+    close_window.connect_activate(move |_, _| close_window_parent.close());
+    window.add_action(&close_window);
 
     let quit = gio::SimpleAction::new("quit", None);
     let quit_window = window.clone();
@@ -6302,6 +6459,24 @@ fn install_window_actions(
     });
     window.add_action(&paste);
 
+    let paste_selection = gio::SimpleAction::new("paste-selection", None);
+    let action_state = state.clone();
+    paste_selection.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            terminal.paste_primary();
+        }
+    });
+    window.add_action(&paste_selection);
+
+    let paste_escaped = gio::SimpleAction::new("paste-escaped", None);
+    let action_state = state.clone();
+    paste_escaped.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            paste_escaped_clipboard(&terminal);
+        }
+    });
+    window.add_action(&paste_escaped);
+
     let select_all = gio::SimpleAction::new("select-all", None);
     let action_state = state.clone();
     select_all.connect_activate(move |_, _| {
@@ -6317,6 +6492,99 @@ fn install_window_actions(
         }
     });
     window.add_action(&select_all);
+
+    let find_next = gio::SimpleAction::new("find-next", None);
+    let action_state = state.clone();
+    find_next.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            terminal.search_find_next();
+        }
+    });
+    window.add_action(&find_next);
+
+    let find_previous = gio::SimpleAction::new("find-previous", None);
+    let action_state = state.clone();
+    find_previous.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            terminal.search_find_previous();
+        }
+    });
+    window.add_action(&find_previous);
+
+    let clear_scrollback = gio::SimpleAction::new("clear-scrollback", None);
+    let action_state = state.clone();
+    clear_scrollback.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            terminal.reset(false, true);
+        }
+    });
+    window.add_action(&clear_scrollback);
+
+    let reset_terminal = gio::SimpleAction::new("reset-terminal", None);
+    let action_state = state.clone();
+    reset_terminal.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            terminal.reset(true, true);
+        }
+    });
+    window.add_action(&reset_terminal);
+
+    let interrupt = gio::SimpleAction::new("interrupt", None);
+    let action_state = state.clone();
+    interrupt.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            terminal.feed_child(&[3]);
+        }
+    });
+    window.add_action(&interrupt);
+
+    let zoom_in = gio::SimpleAction::new("zoom-in", None);
+    let action_state = state.clone();
+    zoom_in.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            terminal.set_font_scale(adjust_font_scale(terminal.font_scale(), 0.1));
+        }
+    });
+    window.add_action(&zoom_in);
+
+    let zoom_out = gio::SimpleAction::new("zoom-out", None);
+    let action_state = state.clone();
+    zoom_out.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            terminal.set_font_scale(adjust_font_scale(terminal.font_scale(), -0.1));
+        }
+    });
+    window.add_action(&zoom_out);
+
+    let zoom_reset = gio::SimpleAction::new("zoom-reset", None);
+    let action_state = state.clone();
+    zoom_reset.connect_activate(move |_, _| {
+        if let Some(terminal) = active_terminal(&action_state.borrow()) {
+            terminal.set_font_scale(1.0);
+        }
+    });
+    window.add_action(&zoom_reset);
+
+    let fullscreen = gio::SimpleAction::new("toggle-fullscreen", None);
+    let fullscreen_window = window.clone();
+    fullscreen.connect_activate(move |_, _| {
+        if fullscreen_window.is_fullscreen() {
+            fullscreen_window.unfullscreen();
+        } else {
+            fullscreen_window.fullscreen();
+        }
+    });
+    window.add_action(&fullscreen);
+
+    let new_tab_with_profile = gio::SimpleAction::new("new-tab-with-profile", None);
+    let action_state = state.clone();
+    new_tab_with_profile.connect_activate(move |_, _| show_new_tab_with_profile(&action_state));
+    window.add_action(&new_tab_with_profile);
+
+    let open_window_group = gio::SimpleAction::new("open-window-group", None);
+    let action_state = state.clone();
+    open_window_group.connect_activate(move |_, _| show_window_group_chooser(&action_state));
+    window.add_action(&open_window_group);
 
     let next = gio::SimpleAction::new("next-tab", None);
     let action_state = state.clone();
@@ -6357,6 +6625,13 @@ fn install_window_actions(
     app.set_accels_for_action("win.paste", &["<Primary><Shift>v"]);
     app.set_accels_for_action("win.select-all", &["<Primary><Shift>a"]);
     app.set_accels_for_action("win.search", &["<Primary>f"]);
+    app.set_accels_for_action("win.find-next", &["<Primary>g"]);
+    app.set_accels_for_action("win.find-previous", &["<Primary><Shift>g"]);
+    app.set_accels_for_action("win.zoom-in", &["<Primary>plus", "<Primary>equal"]);
+    app.set_accels_for_action("win.zoom-out", &["<Primary>minus"]);
+    app.set_accels_for_action("win.zoom-reset", &["<Primary>0"]);
+    app.set_accels_for_action("win.toggle-fullscreen", &["F11"]);
+    app.set_accels_for_action("win.close-window", &["<Primary><Shift>w"]);
     app.set_accels_for_action("win.settings", &["<Primary>comma"]);
     app.set_accels_for_action(
         "win.next-tab",
@@ -6620,6 +6895,355 @@ fn show_search(state: &Rc<RefCell<UiState>>) {
     dialog.present();
 }
 
+/// Keep zoom local to the active terminal.  A menu zoom should be immediately
+/// reversible and must not silently rewrite the selected profile's font size.
+fn adjust_font_scale(current: f64, delta: f64) -> f64 {
+    ((current + delta).clamp(0.5, 2.0) * 10.0).round() / 10.0
+}
+
+/// Pick an existing profile before opening a tab. This exposes the profile
+/// workflow from the Shell menu without creating hidden temporary profiles.
+#[allow(deprecated)]
+fn show_new_tab_with_profile(state: &Rc<RefCell<UiState>>) {
+    let (parent, profile_names, selected_name, working_directory) = {
+        let state = state.borrow();
+        (
+            state.window.clone(),
+            state
+                .profiles
+                .names()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            state
+                .sessions
+                .active()
+                .map(|tab| tab.profile_name.clone())
+                .unwrap_or_else(|| state.settings.selected_profile.clone()),
+            state
+                .settings
+                .new_tab_same_directory
+                .then(|| {
+                    state
+                        .sessions
+                        .active()
+                        .and_then(|tab| tab.working_directory.clone())
+                })
+                .flatten(),
+        )
+    };
+    if profile_names.is_empty() {
+        return;
+    }
+    let profile_refs = profile_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let selector = gtk::DropDown::new(
+        Some(gtk::StringList::new(&profile_refs)),
+        None::<&gtk::Expression>,
+    );
+    selector.set_hexpand(true);
+    selector.set_selected(
+        profile_names
+            .iter()
+            .position(|name| name == &selected_name)
+            .unwrap_or(0) as u32,
+    );
+    let dialog = gtk::Dialog::builder()
+        .title("New Tab with Profile")
+        .transient_for(&parent)
+        .destroy_with_parent(true)
+        .modal(false)
+        .build();
+    enforce_non_modal(&dialog);
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Open Tab", gtk::ResponseType::Accept);
+    dialog.set_default_response(gtk::ResponseType::Accept);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.append(&gtk::Label::new(Some("Profile")));
+    content.append(&selector);
+    dialog.content_area().append(&content);
+    let launch_state = state.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            if let Some(profile_name) = profile_names.get(selector.selected() as usize) {
+                open_tab_with_spec(
+                    &launch_state,
+                    TabLaunchSpec::new(profile_name.clone(), working_directory.clone()),
+                );
+            }
+        }
+        dialog.close();
+    });
+    dialog.present();
+}
+
+/// Run an explicitly supplied command in a new tab. The command is passed to
+/// the existing SpawnOptions path, which keeps direct execution and
+/// run-inside-shell behavior distinct instead of interpolating shell text.
+#[allow(deprecated)]
+fn show_new_command(state: &Rc<RefCell<UiState>>) {
+    let (parent, profile_names, selected_name, working_directory) = {
+        let state = state.borrow();
+        (
+            state.window.clone(),
+            state
+                .profiles
+                .names()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            state
+                .sessions
+                .active()
+                .map(|tab| tab.profile_name.clone())
+                .unwrap_or_else(|| state.settings.selected_profile.clone()),
+            state
+                .settings
+                .new_tab_same_directory
+                .then(|| {
+                    state
+                        .sessions
+                        .active()
+                        .and_then(|tab| tab.working_directory.clone())
+                })
+                .flatten(),
+        )
+    };
+    if profile_names.is_empty() {
+        return;
+    }
+    let profile_refs = profile_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let selector = gtk::DropDown::new(
+        Some(gtk::StringList::new(&profile_refs)),
+        None::<&gtk::Expression>,
+    );
+    selector.set_hexpand(true);
+    selector.set_selected(
+        profile_names
+            .iter()
+            .position(|name| name == &selected_name)
+            .unwrap_or(0) as u32,
+    );
+    let command = gtk::Entry::builder()
+        .placeholder_text("Command to run")
+        .activates_default(true)
+        .build();
+    let run_inside_shell = gtk::CheckButton::with_label("Run command inside shell");
+    run_inside_shell.set_active(true);
+    let dialog = gtk::Dialog::builder()
+        .title("New Command")
+        .transient_for(&parent)
+        .destroy_with_parent(true)
+        .modal(false)
+        .build();
+    enforce_non_modal(&dialog);
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Run", gtk::ResponseType::Accept);
+    dialog.set_default_response(gtk::ResponseType::Accept);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.append(&gtk::Label::new(Some("Command")));
+    content.append(&command);
+    content.append(&gtk::Label::new(Some("Profile")));
+    content.append(&selector);
+    content.append(&run_inside_shell);
+    dialog.content_area().append(&content);
+    let launch_state = state.clone();
+    let command_entry = command.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            let text = command_entry.text().trim().to_owned();
+            if let Some(profile_name) = profile_names.get(selector.selected() as usize) {
+                if !text.is_empty() {
+                    open_tab_with_spec(
+                        &launch_state,
+                        TabLaunchSpec::with_command(
+                            profile_name.clone(),
+                            working_directory.clone(),
+                            text,
+                            run_inside_shell.is_active(),
+                        ),
+                    );
+                }
+            }
+        }
+        dialog.close();
+    });
+    dialog.present();
+    command.grab_focus();
+}
+
+/// Pick a profile for a separate terminal window. The selection is passed to
+/// the new window directly, rather than changing the user's startup default.
+#[allow(deprecated)]
+fn show_new_window_with_profile(app: &gtk::Application, state: &Rc<RefCell<UiState>>) {
+    let (parent, profile_names, selected_name, display_name, working_directory) = {
+        let state = state.borrow();
+        (
+            state.window.clone(),
+            state
+                .profiles
+                .names()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            state
+                .sessions
+                .active()
+                .map(|tab| tab.profile_name.clone())
+                .unwrap_or_else(|| state.settings.selected_profile.clone()),
+            state
+                .window
+                .title()
+                .map(|title| title.to_string())
+                .unwrap_or_else(|| "Core Terminal".to_owned()),
+            state
+                .settings
+                .new_window_same_directory
+                .then(|| {
+                    state
+                        .sessions
+                        .active()
+                        .and_then(|tab| tab.working_directory.clone())
+                })
+                .flatten(),
+        )
+    };
+    if profile_names.is_empty() {
+        return;
+    }
+    let profile_refs = profile_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let selector = gtk::DropDown::new(
+        Some(gtk::StringList::new(&profile_refs)),
+        None::<&gtk::Expression>,
+    );
+    selector.set_hexpand(true);
+    selector.set_selected(
+        profile_names
+            .iter()
+            .position(|name| name == &selected_name)
+            .unwrap_or(0) as u32,
+    );
+    let dialog = gtk::Dialog::builder()
+        .title("New Window with Profile")
+        .transient_for(&parent)
+        .destroy_with_parent(true)
+        .modal(false)
+        .build();
+    enforce_non_modal(&dialog);
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Open Window", gtk::ResponseType::Accept);
+    dialog.set_default_response(gtk::ResponseType::Accept);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.append(&gtk::Label::new(Some("Profile")));
+    content.append(&selector);
+    dialog.content_area().append(&content);
+    let action_app = app.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            if let Some(profile_name) = profile_names.get(selector.selected() as usize) {
+                build_window_with_profile_and_directory(
+                    &action_app,
+                    &display_name,
+                    true,
+                    working_directory.clone(),
+                    Some(profile_name.clone()),
+                );
+            }
+        }
+        dialog.close();
+    });
+    dialog.present();
+}
+
+/// Open one of the saved tab layouts without routing the user through the
+/// settings editor. Window groups intentionally launch into this window: GTK
+/// and Wayland do not offer portable geometry restoration for new windows.
+#[allow(deprecated)]
+fn show_window_group_chooser(state: &Rc<RefCell<UiState>>) {
+    let (parent, group_names) = {
+        let state = state.borrow();
+        (
+            state.window.clone(),
+            state
+                .profiles
+                .window_groups()
+                .iter()
+                .map(|group| group.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    if group_names.is_empty() {
+        let dialog = gtk::MessageDialog::builder()
+            .transient_for(&parent)
+            .modal(false)
+            .message_type(gtk::MessageType::Info)
+            .text("No saved window groups")
+            .secondary_text("Create and save a group in Settings before opening it here.")
+            .build();
+        enforce_non_modal(&dialog);
+        dialog.add_button("Open Settings", gtk::ResponseType::Accept);
+        dialog.add_button("Close", gtk::ResponseType::Close);
+        let settings_state = state.clone();
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk::ResponseType::Accept {
+                show_settings_for_state(&settings_state);
+            }
+            dialog.close();
+        });
+        dialog.present();
+        return;
+    }
+    let group_refs = group_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let selector = gtk::DropDown::new(
+        Some(gtk::StringList::new(&group_refs)),
+        None::<&gtk::Expression>,
+    );
+    selector.set_hexpand(true);
+    let dialog = gtk::Dialog::builder()
+        .title("Open Window Group")
+        .transient_for(&parent)
+        .destroy_with_parent(true)
+        .modal(false)
+        .build();
+    enforce_non_modal(&dialog);
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Open Group", gtk::ResponseType::Accept);
+    dialog.set_default_response(gtk::ResponseType::Accept);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.append(&gtk::Label::new(Some("Saved group")));
+    content.append(&selector);
+    dialog.content_area().append(&content);
+    let launch_state = state.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            let group = {
+                let state = launch_state.borrow();
+                group_names
+                    .get(selector.selected() as usize)
+                    .and_then(|name| state.profiles.window_group(name))
+                    .cloned()
+            };
+            if let Some(group) = group {
+                launch_window_group(&launch_state, group);
+            }
+        }
+        dialog.close();
+    });
+    dialog.present();
+}
+
 fn active_terminal(state: &UiState) -> Option<vte4::Terminal> {
     state
         .sessions
@@ -6720,10 +7344,17 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
     if state.borrow().closing {
         return;
     }
+    let TabLaunchSpec {
+        profile_name: requested_profile,
+        working_directory,
+        size,
+        command,
+        run_command_inside_shell,
+    } = spec;
     let (id, terminal, spawn_options) = {
         let mut state_mut = state.borrow_mut();
-        let profile_name = if state_mut.profiles.profile(&spec.profile_name).is_some() {
-            spec.profile_name
+        let profile_name = if state_mut.profiles.profile(&requested_profile).is_some() {
+            requested_profile
         } else {
             resolve_new_tab_profile(
                 &state_mut.settings,
@@ -6731,7 +7362,6 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
                 &state_mut.profiles,
             )
         };
-        let working_directory = spec.working_directory;
         let id = state_mut
             .sessions
             .open_tab(&profile_name, working_directory.as_deref());
@@ -6743,7 +7373,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         if let Some(profile) = &profile {
             apply_profile(&terminal, profile, &state_mut.settings);
         }
-        if let Some((columns, rows)) = spec.size {
+        if let Some((columns, rows)) = size {
             terminal.set_size(columns as i64, rows as i64);
         }
         // The profile grid supplies a useful natural size, but must never
@@ -6770,6 +7400,10 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
             if profile.set_locale_environment {
                 spawn_options.locale = profile_options.locale;
             }
+        }
+        if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
+            spawn_options.custom_command = Some(command);
+            spawn_options.run_command_inside_shell = run_command_inside_shell;
         }
         let surface = terminal_surface(
             &terminal,
@@ -7490,6 +8124,24 @@ fn paste_clipboard_with_carriage_returns(terminal: &vte4::Terminal) {
         let normalized = text.replace("\r\n", "\n").replace('\n', "\r");
         terminal.feed_child(normalized.as_bytes());
     });
+}
+
+/// Quote clipboard text for a POSIX-like shell, then type it into the active
+/// terminal without appending Enter. The user still reviews and executes the
+/// resulting command line themselves.
+fn paste_escaped_clipboard(terminal: &vte4::Terminal) {
+    let clipboard = terminal.display().clipboard();
+    let terminal = terminal.clone();
+    clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
+        let Ok(Some(text)) = result else {
+            return;
+        };
+        terminal.feed_child(shell_escape_for_paste(text.as_str()).as_bytes());
+    });
+}
+
+fn shell_escape_for_paste(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 fn copy_selection(terminal: &vte4::Terminal) {
