@@ -137,6 +137,16 @@ mod structural_tests {
     }
 
     #[test]
+    fn shell_menu_exposes_transcript_export() {
+        let menu = terminal_menu_model(&ProfileStore::defaults());
+        let shell = menu_submenu_named(&menu, "Shell").unwrap();
+        assert_eq!(
+            menu_item_action(&shell, "Export Text…"),
+            Some("win.export-text".into())
+        );
+    }
+
+    #[test]
     fn menubar_exposes_profile_and_window_group_shortcuts() {
         let mut profiles = ProfileStore::defaults();
         profiles
@@ -617,6 +627,7 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     shell.append(Some("Interrupt (Ctrl-C)"), Some("win.interrupt"));
     shell.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
     shell.append(Some("Reset Terminal"), Some("win.reset-terminal"));
+    shell.append(Some("Export Text…"), Some("win.export-text"));
     let edit = gio::Menu::new();
     edit.append(Some("Copy"), Some("win.copy"));
     edit.append(Some("Copy as HTML"), Some("win.copy-html"));
@@ -758,6 +769,7 @@ fn install_terminal_context_menu(terminal: &vte4::Terminal) {
     menu.append(Some("Select All"), Some("win.select-all"));
     menu.append(Some("Find"), Some("win.search"));
     menu.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
+    menu.append(Some("Export Text…"), Some("win.export-text"));
     menu.append(Some("New Tab"), Some("win.new-tab"));
     menu.append(Some("Close Tab"), Some("win.close-tab"));
     let popover = gtk::PopoverMenu::from_model(Some(&menu));
@@ -5697,6 +5709,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             "interrupt",
             "clear-scrollback",
             "reset-terminal",
+            "export-text",
             "zoom-in",
             "zoom-out",
             "zoom-reset",
@@ -6783,6 +6796,24 @@ fn install_window_actions(
         }
     });
     window.add_action(&reset_terminal);
+
+    let export_text = gio::SimpleAction::new("export-text", None);
+    let action_state = state.clone();
+    export_text.connect_activate(move |action, _| {
+        let (parent, terminal) = {
+            let state = action_state.borrow();
+            (
+                state.window.clone().upcast::<gtk::Window>(),
+                active_terminal(&state),
+            )
+        };
+        let Some(terminal) = terminal else {
+            return;
+        };
+        action.set_enabled(false);
+        show_transcript_export_dialog(&parent, &terminal, action);
+    });
+    window.add_action(&export_text);
 
     let interrupt = gio::SimpleAction::new("interrupt", None);
     let action_state = state.clone();
@@ -8481,6 +8512,73 @@ fn copy_selection_as_html(terminal: &vte4::Terminal) {
     if terminal.text_selected(vte4::Format::Text).is_some() {
         terminal.copy_clipboard_format(vte4::Format::Html);
     }
+}
+
+/// Save the VTE transcript through a user-selected native file chooser. The
+/// destination must not already exist: this action never overwrites or deletes
+/// a file the user may have created outside Core Terminal.
+#[allow(deprecated)]
+fn show_transcript_export_dialog(
+    parent: &gtk::Window,
+    terminal: &vte4::Terminal,
+    action: &gio::SimpleAction,
+) {
+    let chooser = profile_file_chooser(
+        parent,
+        "Export Terminal Text",
+        "Export",
+        gtk::FileChooserAction::Save,
+    );
+    chooser.set_current_name("Core Terminal Transcript.txt");
+    let filter = gtk::FileFilter::new();
+    filter.add_pattern("*.txt");
+    filter.set_name(Some("Plain text (*.txt)"));
+    chooser.set_filter(&filter);
+
+    let terminal = terminal.clone();
+    let parent = parent.clone();
+    let action = action.clone();
+    chooser.connect_response(move |chooser, response| {
+        action.set_enabled(true);
+        chooser.hide();
+        if response != gtk::ResponseType::Accept {
+            return;
+        }
+        let Some(file) = chooser.file() else {
+            show_settings_error(&parent, "Export failed", "No destination file was selected.");
+            return;
+        };
+        let stream = match file.create(gio::FileCreateFlags::NONE, None::<&gio::Cancellable>) {
+            Ok(stream) => stream,
+            Err(error) => {
+                show_settings_error(
+                    &parent,
+                    "Export failed",
+                    format!(
+                        "Core Terminal could not create a new text transcript. Choose a new filename or location. {error}"
+                    ),
+                );
+                return;
+            }
+        };
+        let write_result = terminal.write_contents_sync(
+            &stream,
+            vte4::WriteFlags::Default,
+            None::<&gio::Cancellable>,
+        );
+        let close_result = stream.close(None::<&gio::Cancellable>);
+        let result = write_result.and(close_result);
+        if let Err(error) = result {
+            show_settings_error(
+                &parent,
+                "Export failed",
+                format!(
+                    "Core Terminal could not finish the text transcript. Any newly created partial file was left in place for you to inspect or remove. {error}"
+                ),
+            );
+        }
+    });
+    chooser.show();
 }
 
 fn close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
