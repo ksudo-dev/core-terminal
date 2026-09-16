@@ -85,13 +85,14 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        adjust_font_scale, compatibility_profile, menu_item_action, menu_item_action_and_target,
-        menu_submenu_named, migrate_legacy_profile_flags, replace_menu_model_contents,
-        resolve_new_tab_profile, resolve_window_profile, runtime_profile_requires_reapply,
-        runtime_terminal_settings_changed, settings_page_ids, shell_escape_for_paste,
-        spawn_callback_action, startup_profile_after_deletion, terminal_menu_labels,
-        terminal_menu_model, window_group_entry_summary, ProfileStore, SessionManager, Settings,
-        SpawnCallbackAction, WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        adjust_font_scale, compatibility_profile, is_supported_terminal_link, menu_item_action,
+        menu_item_action_and_target, menu_submenu_named, migrate_legacy_profile_flags,
+        replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
+        runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
+        shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
+        terminal_menu_labels, terminal_menu_model, window_group_entry_summary, ProfileStore,
+        SessionManager, Settings, SpawnCallbackAction, WindowGroup, WindowGroupEntry,
+        APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -144,6 +145,28 @@ mod structural_tests {
             menu_item_action(&shell, "Export Text…"),
             Some("win.export-text".into())
         );
+    }
+
+    #[test]
+    fn terminal_links_allow_only_browser_and_mail_uris() {
+        for uri in [
+            "https://example.com/docs?q=core-terminal",
+            "http://example.com",
+            "mailto:maintainer@example.com",
+        ] {
+            assert!(is_supported_terminal_link(uri), "{uri}");
+        }
+        for uri in [
+            "file:///home/user/.ssh/id_ed25519",
+            "ssh://host.example",
+            "custom-handler:payload",
+            "https://example.com/has space",
+            "https://example.com/line\nbreak",
+            "https:",
+            "not a uri",
+        ] {
+            assert!(!is_supported_terminal_link(uri), "{uri}");
+        }
     }
 
     #[test]
@@ -759,24 +782,53 @@ fn menu_item_action(menu: &impl IsA<gio::MenuModel>, label: &str) -> Option<Stri
     })
 }
 
+/// Limit terminal-originated links to user-facing URI schemes. In particular,
+/// never hand a terminal escape sequence to a local-file or custom-scheme
+/// handler merely because it appeared under the pointer.
+fn is_supported_terminal_link(uri: &str) -> bool {
+    let Some((scheme, remainder)) = uri.split_once(':') else {
+        return false;
+    };
+    !remainder.is_empty()
+        && uri.len() <= 8_192
+        && !uri
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        && matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "http" | "https" | "mailto"
+        )
+}
+
 fn install_terminal_context_menu(terminal: &vte4::Terminal) {
-    let menu = gio::Menu::new();
-    menu.append(Some("Copy"), Some("win.copy"));
-    menu.append(Some("Copy as HTML"), Some("win.copy-html"));
-    menu.append(Some("Paste"), Some("win.paste"));
-    menu.append(Some("Paste Selection"), Some("win.paste-selection"));
-    menu.append(Some("Paste Escaped"), Some("win.paste-escaped"));
-    menu.append(Some("Select All"), Some("win.select-all"));
-    menu.append(Some("Find"), Some("win.search"));
-    menu.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
-    menu.append(Some("Export Text…"), Some("win.export-text"));
-    menu.append(Some("New Tab"), Some("win.new-tab"));
-    menu.append(Some("Close Tab"), Some("win.close-tab"));
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    let popover = gtk::PopoverMenu::from_model(Some(&gio::Menu::new()));
     popover.set_widget_name("terminal-context-menu");
     popover.set_parent(terminal);
     let click = gtk::GestureClick::builder().button(3).build();
+    let terminal_for_click = terminal.clone();
     click.connect_pressed(move |_, _, x, y| {
+        let menu = gio::Menu::new();
+        if let Some(link) = terminal_for_click
+            .check_hyperlink_at(x, y)
+            .map(|link| link.to_string())
+            .filter(|link| is_supported_terminal_link(link))
+        {
+            let item = gio::MenuItem::new(Some("Open Link"), None);
+            item.set_action_and_target_value(Some("win.open-link"), Some(&link.to_variant()));
+            menu.append_item(&item);
+        }
+        menu.append(Some("Copy"), Some("win.copy"));
+        menu.append(Some("Copy as HTML"), Some("win.copy-html"));
+        menu.append(Some("Paste"), Some("win.paste"));
+        menu.append(Some("Paste Selection"), Some("win.paste-selection"));
+        menu.append(Some("Paste Escaped"), Some("win.paste-escaped"));
+        menu.append(Some("Select All"), Some("win.select-all"));
+        menu.append(Some("Find"), Some("win.search"));
+        menu.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
+        menu.append(Some("Export Text…"), Some("win.export-text"));
+        menu.append(Some("New Tab"), Some("win.new-tab"));
+        menu.append(Some("Close Tab"), Some("win.close-tab"));
+        popover.set_menu_model(Some(&menu));
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.popup();
     });
@@ -5698,6 +5750,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         let menu_actions_present = [
             "copy",
             "copy-html",
+            "open-link",
             "paste",
             "paste-selection",
             "paste-escaped",
@@ -6746,6 +6799,27 @@ fn install_window_actions(
         }
     });
     window.add_action(&copy_html);
+
+    let open_link = gio::SimpleAction::new("open-link", Some(glib::VariantTy::STRING));
+    let open_link_parent = window.clone();
+    open_link.connect_activate(move |_, parameter| {
+        let Some(uri) = parameter.and_then(|value| value.str()).map(str::to_owned) else {
+            return;
+        };
+        if !is_supported_terminal_link(&uri) {
+            return;
+        }
+        gtk::UriLauncher::new(&uri).launch(
+            Some(&open_link_parent),
+            None::<&gio::Cancellable>,
+            move |result| {
+                if let Err(error) = result {
+                    eprintln!("Core Terminal: could not open terminal link: {error}");
+                }
+            },
+        );
+    });
+    window.add_action(&open_link);
 
     let paste = gio::SimpleAction::new("paste", None);
     let action_state = state.clone();
