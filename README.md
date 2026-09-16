@@ -102,10 +102,12 @@ Core Terminal currently includes:
   terminal dimensions
 - VTE-backed PTY tabs and windows with login-shell startup and an optional
   custom command
-- A standard File, Edit, View, Profiles, and Help menubar plus a terminal
-  right-click menu for copy, paste, selection, search, and tab actions
-- Search, selection-aware clipboard actions, tab navigation, and Ctrl+1 through
-  Ctrl+9 tab switching
+- A native GTK menubar with Core Terminal, Shell, Edit, View, Window, and Help
+  menus, plus a terminal right-click menu for copy, paste, selection, search,
+  scrollback, and tab actions
+- Search navigation, selection-aware clipboard actions, tab navigation,
+  profile-picked tabs, per-tab zoom, fullscreen, and Ctrl+1 through Ctrl+9 tab
+  switching
 - XML and binary plist import for supported `.terminal` fields, with
   deterministic export and clear fallback reporting for unsupported fields
 - Visual bells, background notifications, exit notifications, and tab activity
