@@ -1645,7 +1645,10 @@ impl SettingsControls {
         profile_list_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         profile_list_scroll.set_hexpand(true);
         profile_list_scroll.set_vexpand(true);
-        profile_list_scroll.set_min_content_height(260);
+        // Keep the list usable in the compact 720×480 settings window without
+        // reserving enough height to push the named profile actions below the
+        // visible sidebar. The list expands into all remaining vertical space.
+        profile_list_scroll.set_min_content_height(120);
         profile_list_scroll.set_child(Some(&profile_list));
         profile_sidebar.append(&profile_list_scroll);
         let profile_actions = gtk::Grid::new();
@@ -1727,6 +1730,7 @@ impl SettingsControls {
         profile_switcher.set_halign(gtk::Align::Fill);
         profile_switcher.set_hexpand(true);
         let profile_switcher_scroll = gtk::ScrolledWindow::new();
+        profile_switcher_scroll.set_widget_name("profile-page-switcher-scroll");
         profile_switcher_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
         profile_switcher_scroll.set_child(Some(&profile_switcher));
         profile_content.append(&profile_switcher_scroll);
@@ -2640,7 +2644,9 @@ impl SettingsControls {
                 reload_mappings.splice(0, reload_mappings.n_items(), &refs);
             }
         });
-        profile_page.append(&scroll_page(&profile_content));
+        let profile_content_scroll = scroll_page(&profile_content);
+        profile_content_scroll.set_widget_name("profile-content-scroll");
+        profile_page.append(&profile_content_scroll);
         top_stack.add_titled(&profile_page, Some("profiles"), "Profiles");
 
         let window_groups = gtk::Box::new(gtk::Orientation::Vertical, 18);
@@ -5742,6 +5748,30 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             .as_ref()
             .and_then(|stack| stack.child_by_name("profiles"))
             .is_some_and(|page| !page.is::<gtk::ScrolledWindow>());
+        let profile_content_scroll_policy = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-content-scroll"))
+            .and_then(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
+            .is_some_and(|scroll| {
+                scroll.hscrollbar_policy() == gtk::PolicyType::Never
+                    && scroll.vscrollbar_policy() == gtk::PolicyType::Automatic
+            });
+        let profile_list_scroll_policy = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-list-scroll"))
+            .and_then(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
+            .is_some_and(|scroll| {
+                scroll.hscrollbar_policy() == gtk::PolicyType::Never
+                    && scroll.vscrollbar_policy() == gtk::PolicyType::Automatic
+            });
+        let profile_switcher_scroll_policy = root
+            .as_ref()
+            .and_then(|root| find_widget_by_name(root, "profile-page-switcher-scroll"))
+            .and_then(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
+            .is_some_and(|scroll| {
+                scroll.hscrollbar_policy() == gtk::PolicyType::Automatic
+                    && scroll.vscrollbar_policy() == gtk::PolicyType::Never
+            });
         let sidebar_width = root
             .as_ref()
             .and_then(|root| find_widget_by_name(root, "profile-sidebar"))
@@ -5768,7 +5798,13 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     let Some(label) = row.child().and_downcast::<gtk::Label>() else {
                         return false;
                     };
-                    if label.text().is_empty() || label.width() < 120 || !label.is_visible() {
+                    let name = label.text();
+                    if name.is_empty()
+                        || label.tooltip_text().as_deref() != Some(name.as_str())
+                        || label.ellipsize() != gtk::pango::EllipsizeMode::End
+                        || label.width() < 120
+                        || !label.is_visible()
+                    {
                         return false;
                     }
                     minimum_profile_label_width = minimum_profile_label_width.min(label.width());
@@ -6381,6 +6417,9 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && scrollback_profile_canonical
             && settings_geometry_usable
             && profile_page_not_horizontally_scrolled
+            && profile_content_scroll_policy
+            && profile_list_scroll_policy
+            && profile_switcher_scroll_policy
             && sidebar_geometry_usable
             && profile_tabs_usable
             && profile_labels_readable
@@ -6427,7 +6466,7 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             && protected_sibling_preserved
             && close_probe_cleanup;
         let report = format!(
-            "status={} missing={:?} non_modal={} settings_window_reused={} settings_draft_preserved={} settings_chooser_parented={} settings_recreated_after_save={} standard_navigation_present={} application_menubar_shared={} menu_actions_present={} clean_window_title={} terminal_can_shrink={} scrollback_mirror_read_only={} scrollback_unlimited_sensitivity={} scrollback_profile_canonical={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
+            "status={} missing={:?} non_modal={} settings_window_reused={} settings_draft_preserved={} settings_chooser_parented={} settings_recreated_after_save={} standard_navigation_present={} application_menubar_shared={} menu_actions_present={} clean_window_title={} terminal_can_shrink={} scrollback_mirror_read_only={} scrollback_unlimited_sensitivity={} scrollback_profile_canonical={} mouse_autohide_disabled={} settings_geometry={}x{} settings_geometry_usable={} profile_page_not_horizontally_scrolled={} profile_content_scroll_policy={} profile_list_scroll_policy={} profile_switcher_scroll_policy={} sidebar_width={} sidebar_geometry_usable={} profile_tabs_width={} profile_tabs_usable={} minimum_profile_label_width={} profile_labels_readable={} minimum_profile_action_width={} profile_actions_labeled={} profiles={} profile_file_written={} profile_round_trip={} profile_owned_values_loaded={} profile_font_loaded={} profile_font_value={:?} profile_font_size_loaded={} profile_font_size_value={:?} profile_cursor_shape_loaded={} profile_cursor_shape_value={:?} profile_cursor_blink_loaded={} profile_cursor_blink_value={:?} profile_scrollback_loaded={} profile_scrollback_value={:?} profile_terminal_type_loaded={} non_editable_profile_values_preserved={} profile_editor_switch_before_save={} profile_switch_values_loaded={} renderer_owned_controls_truthful={} unavailable_controls_truthful={} compatibility_fields_preserved={} shell_policy_consolidated={} global_shell_mode_preserved={} shell_sensitivity_logic={} shell_widgets_reloaded={} shell_accessibility_metadata={} window_group_editor_interaction={} window_group_round_trip={} standard_mappings_present={} encoding_rows_present={} runtime_profile_applied={} active_session_preserved={} startup_profile_independent={} profile_default_preserved={} same_profile_new_tab={} group_launch_explicit={} active_profile_synced_after_close={} close_before_spawn_cleanup={} background_session_cleanup={} brokered_proxy_cleanup={} close_prompt_details_bounded={} confirmation_accepted={} stale_pending_revalidated={} new_window_target_revalidated={} overlapping_window_request_preserved={} state_machine_probe_cleanup={} tab_close_prompted={} tab_close_cancelled={} shell_exit_window_prompted={} shell_exit_prompt_cancelled={} exited_pid_cleared={} protected_sibling_preserved={} close_probe_cleanup={}\n",
             if passed { "PASS" } else { "FAIL" },
             missing,
             non_modal,
@@ -6448,6 +6487,9 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             settings_height,
             settings_geometry_usable,
             profile_page_not_horizontally_scrolled,
+            profile_content_scroll_policy,
+            profile_list_scroll_policy,
+            profile_switcher_scroll_policy,
             sidebar_width,
             sidebar_geometry_usable,
             profile_tabs_width,
