@@ -85,12 +85,13 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        adjust_font_scale, compatibility_profile, migrate_legacy_profile_flags,
-        resolve_new_tab_profile, resolve_window_profile, runtime_profile_requires_reapply,
-        runtime_terminal_settings_changed, settings_page_ids, shell_escape_for_paste,
-        spawn_callback_action, startup_profile_after_deletion, terminal_menu_labels,
-        terminal_menu_model, window_group_entry_summary, ProfileStore, SessionManager, Settings,
-        SpawnCallbackAction, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        adjust_font_scale, compatibility_profile, menu_item_action_and_target, menu_submenu_named,
+        migrate_legacy_profile_flags, resolve_new_tab_profile, resolve_window_profile,
+        runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
+        shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
+        terminal_menu_labels, terminal_menu_model, window_group_entry_summary, ProfileStore,
+        SessionManager, Settings, SpawnCallbackAction, WindowGroup, WindowGroupEntry,
+        APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -120,8 +121,37 @@ mod structural_tests {
     #[test]
     fn menubar_uses_the_terminal_facing_top_level_inventory() {
         assert_eq!(
-            terminal_menu_labels(&terminal_menu_model()),
+            terminal_menu_labels(&terminal_menu_model(&ProfileStore::defaults())),
             ["Core Terminal", "Shell", "Edit", "View", "Window", "Help",]
+        );
+    }
+
+    #[test]
+    fn menubar_exposes_profile_and_window_group_shortcuts() {
+        let mut profiles = ProfileStore::defaults();
+        profiles
+            .add_window_group(WindowGroup {
+                name: "Development".into(),
+                entries: vec![WindowGroupEntry {
+                    profile: "Homebrew".into(),
+                    working_directory: None,
+                    columns: 80,
+                    rows: 24,
+                }],
+            })
+            .unwrap();
+        let menu = terminal_menu_model(&profiles);
+        let shell = menu_submenu_named(&menu, "Shell").unwrap();
+        let new_tab_profiles = menu_submenu_named(&shell, "New Tab with Profile").unwrap();
+        assert_eq!(
+            menu_item_action_and_target(&new_tab_profiles, "Homebrew"),
+            Some(("win.new-tab-with-profile-name".into(), "Homebrew".into()))
+        );
+        let window = menu_submenu_named(&menu, "Window").unwrap();
+        let groups = menu_submenu_named(&window, "Open Window Group").unwrap();
+        assert_eq!(
+            menu_item_action_and_target(&groups, "Development"),
+            Some(("win.open-window-group-name".into(), "Development".into()))
         );
     }
 
@@ -498,7 +528,14 @@ pub fn build_header_bar() -> gtk::HeaderBar {
     bar
 }
 
-fn terminal_menu_model() -> gio::Menu {
+fn append_string_target(menu: &gio::Menu, label: &str, action: &str, target: &str) {
+    let item = gio::MenuItem::new(Some(label), Some(action));
+    let target = glib::Variant::from(target);
+    item.set_attribute_value("target", Some(&target));
+    menu.append_item(&item);
+}
+
+fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     let menu = gio::Menu::new();
     let application = gio::Menu::new();
     application.append(Some("Settings"), Some("win.settings"));
@@ -511,14 +548,34 @@ fn terminal_menu_model() -> gio::Menu {
 
     let shell = gio::Menu::new();
     shell.append(Some("New Window"), Some("win.new-window"));
+    let new_window_profiles = gio::Menu::new();
+    for name in profiles.names() {
+        append_string_target(
+            &new_window_profiles,
+            name,
+            "win.new-window-with-profile-name",
+            name,
+        );
+    }
+    shell.append_submenu(Some("New Window with Profile"), &new_window_profiles);
     shell.append(
-        Some("New Window with Profile…"),
+        Some("Choose Window Profile…"),
         Some("win.new-window-with-profile"),
     );
     shell.append(Some("New Tab"), Some("win.new-tab"));
     shell.append(Some("New Command…"), Some("win.new-command"));
+    let new_tab_profiles = gio::Menu::new();
+    for name in profiles.names() {
+        append_string_target(
+            &new_tab_profiles,
+            name,
+            "win.new-tab-with-profile-name",
+            name,
+        );
+    }
+    shell.append_submenu(Some("New Tab with Profile"), &new_tab_profiles);
     shell.append(
-        Some("New Tab with Profile…"),
+        Some("Choose Tab Profile…"),
         Some("win.new-tab-with-profile"),
     );
     shell.append(Some("Close Tab"), Some("win.close-tab"));
@@ -540,6 +597,18 @@ fn terminal_menu_model() -> gio::Menu {
     view.append(Some("Actual Size"), Some("win.zoom-reset"));
     view.append(Some("Toggle Full Screen"), Some("win.toggle-fullscreen"));
     let window = gio::Menu::new();
+    if !profiles.window_groups().is_empty() {
+        let window_groups = gio::Menu::new();
+        for group in profiles.window_groups() {
+            append_string_target(
+                &window_groups,
+                &group.name,
+                "win.open-window-group-name",
+                &group.name,
+            );
+        }
+        window.append_submenu(Some("Open Window Group"), &window_groups);
+    }
     window.append(Some("Open Window Group…"), Some("win.open-window-group"));
     window.append(Some("Next Tab"), Some("win.next-tab"));
     window.append(Some("Previous Tab"), Some("win.previous-tab"));
@@ -563,6 +632,40 @@ fn terminal_menu_labels(menu: &gio::Menu) -> Vec<String> {
                 .and_then(|value| value.str().map(str::to_owned))
         })
         .collect()
+}
+
+#[cfg(test)]
+fn menu_submenu_named(menu: &impl IsA<gio::MenuModel>, label: &str) -> Option<gio::MenuModel> {
+    (0..menu.n_items()).find_map(|index| {
+        (menu
+            .item_attribute_value(index, "label", None)
+            .and_then(|value| value.str().map(str::to_owned))
+            .as_deref()
+            == Some(label))
+        .then(|| menu.item_link(index, "submenu"))
+        .flatten()
+    })
+}
+
+#[cfg(test)]
+fn menu_item_action_and_target(
+    menu: &impl IsA<gio::MenuModel>,
+    label: &str,
+) -> Option<(String, String)> {
+    (0..menu.n_items()).find_map(|index| {
+        let item_label = menu
+            .item_attribute_value(index, "label", None)
+            .and_then(|value| value.str().map(str::to_owned));
+        (item_label.as_deref() == Some(label)).then(|| {
+            let action = menu
+                .item_attribute_value(index, "action", None)
+                .and_then(|value| value.str().map(str::to_owned))?;
+            let target = menu
+                .item_attribute_value(index, "target", None)
+                .and_then(|value| value.str().map(str::to_owned))?;
+            Some((action, target))
+        })?
+    })
 }
 
 fn install_terminal_context_menu(terminal: &vte4::Terminal) {
@@ -3952,6 +4055,7 @@ struct UiState {
     // Settings callbacks capture this state, so the reverse reference must be
     // weak. One live editor owns one unsaved draft for this terminal window.
     settings_window: Option<glib::WeakRef<gtk::Window>>,
+    menubar: gtk::PopoverMenuBar,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
     pending_spawns: HashSet<u64>,
@@ -4170,6 +4274,12 @@ fn build_window_with_profile_and_directory(
         .vexpand(true)
         .transition_type(gtk::StackTransitionType::SlideLeftRight)
         .build();
+    let terminal_menu = terminal_menu_model(&profiles);
+    app.set_menubar(Some(&terminal_menu));
+    let menubar = gtk::PopoverMenuBar::from_model(Some(&terminal_menu));
+    menubar.set_widget_name("terminal-menubar");
+    menubar.add_css_class("core-terminal-menubar");
+    menubar.set_hexpand(true);
     let state = Rc::new(RefCell::new(UiState {
         profiles,
         settings,
@@ -4177,6 +4287,7 @@ fn build_window_with_profile_and_directory(
         stack: stack.clone(),
         window: window.clone(),
         settings_window: None,
+        menubar: menubar.clone(),
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
         pending_spawns: HashSet::new(),
@@ -4193,13 +4304,6 @@ fn build_window_with_profile_and_directory(
     let header = build_header_bar();
     header.set_widget_name("terminal-titlebar");
     window.set_titlebar(Some(&header));
-
-    let terminal_menu = terminal_menu_model();
-    app.set_menubar(Some(&terminal_menu));
-    let menubar = gtk::PopoverMenuBar::from_model(Some(&terminal_menu));
-    menubar.set_widget_name("terminal-menubar");
-    menubar.add_css_class("core-terminal-menubar");
-    menubar.set_hexpand(true);
 
     let switcher = gtk::StackSwitcher::new();
     switcher.set_stack(Some(&stack));
@@ -6401,6 +6505,49 @@ fn install_window_actions(
         .connect_activate(move |_, _| show_new_window_with_profile(&action_app, &action_state));
     window.add_action(&new_window_with_profile);
 
+    let new_window_with_profile_name = gio::SimpleAction::new(
+        "new-window-with-profile-name",
+        Some(glib::VariantTy::STRING),
+    );
+    let action_state = state.clone();
+    let action_app = app.clone();
+    new_window_with_profile_name.connect_activate(move |_, parameter| {
+        let Some(profile_name) = parameter.and_then(|value| value.str()).map(str::to_owned) else {
+            return;
+        };
+        let (display_name, directory, exists) = {
+            let state = action_state.borrow();
+            (
+                state
+                    .window
+                    .title()
+                    .map(|title| title.to_string())
+                    .unwrap_or_else(|| "Core Terminal".to_owned()),
+                state
+                    .settings
+                    .new_window_same_directory
+                    .then(|| {
+                        state
+                            .sessions
+                            .active()
+                            .and_then(|tab| tab.working_directory.clone())
+                    })
+                    .flatten(),
+                state.profiles.profile(&profile_name).is_some(),
+            )
+        };
+        if exists {
+            build_window_with_profile_and_directory(
+                &action_app,
+                &display_name,
+                true,
+                directory,
+                Some(profile_name),
+            );
+        }
+    });
+    window.add_action(&new_window_with_profile_name);
+
     let close = gio::SimpleAction::new("close-tab", None);
     let action_state = state.clone();
     close.connect_activate(move |_, _| close_current_tab(&action_state));
@@ -6581,10 +6728,60 @@ fn install_window_actions(
     new_tab_with_profile.connect_activate(move |_, _| show_new_tab_with_profile(&action_state));
     window.add_action(&new_tab_with_profile);
 
+    let new_tab_with_profile_name =
+        gio::SimpleAction::new("new-tab-with-profile-name", Some(glib::VariantTy::STRING));
+    let action_state = state.clone();
+    new_tab_with_profile_name.connect_activate(move |_, parameter| {
+        let Some(profile_name) = parameter.and_then(|value| value.str()).map(str::to_owned) else {
+            return;
+        };
+        let (working_directory, exists) = {
+            let state = action_state.borrow();
+            (
+                state
+                    .settings
+                    .new_tab_same_directory
+                    .then(|| {
+                        state
+                            .sessions
+                            .active()
+                            .and_then(|tab| tab.working_directory.clone())
+                    })
+                    .flatten(),
+                state.profiles.profile(&profile_name).is_some(),
+            )
+        };
+        if exists {
+            open_tab_with_spec(
+                &action_state,
+                TabLaunchSpec::new(profile_name, working_directory),
+            );
+        }
+    });
+    window.add_action(&new_tab_with_profile_name);
+
     let open_window_group = gio::SimpleAction::new("open-window-group", None);
     let action_state = state.clone();
     open_window_group.connect_activate(move |_, _| show_window_group_chooser(&action_state));
     window.add_action(&open_window_group);
+
+    let open_window_group_name =
+        gio::SimpleAction::new("open-window-group-name", Some(glib::VariantTy::STRING));
+    let action_state = state.clone();
+    open_window_group_name.connect_activate(move |_, parameter| {
+        let Some(group_name) = parameter.and_then(|value| value.str()) else {
+            return;
+        };
+        let group = action_state
+            .borrow()
+            .profiles
+            .window_group(group_name)
+            .cloned();
+        if let Some(group) = group {
+            launch_window_group(&action_state, group);
+        }
+    });
+    window.add_action(&open_window_group_name);
 
     let next = gio::SimpleAction::new("next-tab", None);
     let action_state = state.clone();
@@ -6745,6 +6942,7 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
                 })
                 .collect::<Vec<_>>();
             drop(state);
+            refresh_terminal_menu(&save_state);
             for (id, terminal, profile) in terminals {
                 reapply_profile_without_resize(&terminal, &profile, &new_settings);
                 update_tab_title(&save_state, id, &terminal);
@@ -6795,50 +6993,63 @@ fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
     }
 }
 
+/// Rebuild the profile and window-group submenus after settings mutate the
+/// store. The visible GTK menu always reflects the same profile data that will
+/// be used when a menu action launches a tab or group.
+fn refresh_terminal_menu(state: &Rc<RefCell<UiState>>) {
+    let (menubar, menu) = {
+        let state = state.borrow();
+        (state.menubar.clone(), terminal_menu_model(&state.profiles))
+    };
+    menubar.set_menu_model(Some(&menu));
+}
+
 fn restore_default_profiles(state: &Rc<RefCell<UiState>>) {
-    let mut state = state.borrow_mut();
-    state.profiles.restore_defaults();
-    let profile = state.profiles.selected().clone();
-    let width = state.settings.window_width;
-    let height = state.settings.window_height;
+    let mut state_mut = state.borrow_mut();
+    state_mut.profiles.restore_defaults();
+    let profile = state_mut.profiles.selected().clone();
+    let width = state_mut.settings.window_width;
+    let height = state_mut.settings.window_height;
     let profile_settings = Settings::from_profile(&profile);
     // Restoring profiles must not erase unrelated global preferences.
-    state.settings.selected_profile = profile.name.clone();
-    state.settings.startup_profile = profile.name.clone();
-    state.settings.font = profile_settings.font;
-    state.settings.font_size = profile_settings.font_size;
-    state.settings.cursor_shape = profile_settings.cursor_shape;
-    state.settings.cursor_blink = profile_settings.cursor_blink;
-    state.settings.scrollback_lines = profile_settings.scrollback_lines;
-    state.settings.window_width = width;
-    state.settings.window_height = height;
-    if let Some(model) = state
+    state_mut.settings.selected_profile = profile.name.clone();
+    state_mut.settings.startup_profile = profile.name.clone();
+    state_mut.settings.font = profile_settings.font;
+    state_mut.settings.font_size = profile_settings.font_size;
+    state_mut.settings.cursor_shape = profile_settings.cursor_shape;
+    state_mut.settings.cursor_blink = profile_settings.cursor_blink;
+    state_mut.settings.scrollback_lines = profile_settings.scrollback_lines;
+    state_mut.settings.window_width = width;
+    state_mut.settings.window_height = height;
+    if let Some(model) = state_mut
         .profile_dropdown
         .model()
         .and_downcast::<gtk::StringList>()
     {
-        let names = state
+        let names = state_mut
             .profiles
             .names()
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
         model.splice(0, model.n_items(), &name_refs);
-        state.profile_dropdown.set_selected(
+        state_mut.profile_dropdown.set_selected(
             names
                 .iter()
                 .position(|name| name == &profile.name)
                 .unwrap_or(0) as u32,
         );
     }
-    if let Some(session) = state.sessions.active_mut() {
+    if let Some(session) = state_mut.sessions.active_mut() {
         session.profile_name = profile.name.clone();
     }
-    if let Some(terminal) = active_terminal(&state) {
-        apply_profile(&terminal, &profile, &state.settings);
+    if let Some(terminal) = active_terminal(&state_mut) {
+        apply_profile(&terminal, &profile, &state_mut.settings);
     }
-    let _ = state.settings.save_user();
-    save_user_profiles(&state.profiles);
+    let _ = state_mut.settings.save_user();
+    save_user_profiles(&state_mut.profiles);
+    drop(state_mut);
+    refresh_terminal_menu(state);
 }
 
 #[allow(deprecated)]
