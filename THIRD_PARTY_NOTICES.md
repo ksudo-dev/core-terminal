@@ -73,8 +73,8 @@ in the corresponding package source cache and is not copied into this file.
 | `system-deps` | `7.0.8` | `MIT OR Apache-2.0` | https://github.com/gdesmott/system-deps |
 | `system-deps` | `9.0.0` | `MIT OR Apache-2.0` | https://github.com/gdesmott/system-deps |
 | `target-lexicon` | `0.13.5` | `Apache-2.0 WITH LLVM-exception` | https://github.com/bytecodealliance/target-lexicon |
-| `thiserror` | `2.0.20` | `MIT OR Apache-2.0` | https://github.com/dtolnay/thiserror |
-| `thiserror-impl` | `2.0.20` | `MIT OR Apache-2.0` | https://github.com/dtolnay/thiserror |
+| `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | https://github.com/dtolnay/thiserror |
+| `thiserror-impl` | `2.0.21` | `MIT OR Apache-2.0` | https://github.com/dtolnay/thiserror |
 | `time` | `0.3.55` | `MIT OR Apache-2.0` | https://github.com/time-rs/time |
 | `time-core` | `0.1.9` | `MIT OR Apache-2.0` | https://github.com/time-rs/time |
 | `time-macros` | `0.2.32` | `MIT OR Apache-2.0` | https://github.com/time-rs/time |
