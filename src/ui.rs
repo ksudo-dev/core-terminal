@@ -45,6 +45,12 @@ fn compatibility_profile<'a>(
         .unwrap_or_else(|| profiles.selected())
 }
 
+fn startup_window_group(profiles: &ProfileStore, configured_group: &str) -> Option<WindowGroup> {
+    (!configured_group.is_empty())
+        .then(|| profiles.window_group(configured_group).cloned())
+        .flatten()
+}
+
 /// Run process-session escalation away from GTK's main thread. Holding the
 /// application until the worker finishes keeps last-window shutdown from
 /// abandoning a pending TERM/KILL sequence.
@@ -90,7 +96,7 @@ mod structural_tests {
         replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
         runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
         shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
-        terminal_context_menu, terminal_menu_labels, terminal_menu_model,
+        startup_window_group, terminal_context_menu, terminal_menu_labels, terminal_menu_model,
         window_group_entry_summary, ProfileStore, SessionManager, Settings, SpawnCallbackAction,
         WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
@@ -318,6 +324,47 @@ mod structural_tests {
         assert_eq!(spec.working_directory.as_deref(), Some("/srv/project"));
         assert_eq!(spec.command.as_deref(), Some("printf hello"));
         assert!(!spec.run_command_inside_shell);
+    }
+
+    #[test]
+    fn startup_window_group_uses_recovered_first_group_and_missing_falls_back() {
+        let document = crate::profiles::ProfileDocument {
+            default_profile: Some("Homebrew".into()),
+            profiles: vec![crate::profiles::TerminalProfile::homebrew()],
+            window_groups: vec![
+                WindowGroup {
+                    name: " Development ".into(),
+                    entries: vec![WindowGroupEntry {
+                        profile: "Homebrew".into(),
+                        working_directory: Some(" /tmp/original ".into()),
+                        columns: 80,
+                        rows: 24,
+                    }],
+                },
+                WindowGroup {
+                    name: "Development".into(),
+                    entries: vec![WindowGroupEntry {
+                        profile: "Homebrew".into(),
+                        working_directory: Some("/tmp/later-duplicate".into()),
+                        columns: 90,
+                        rows: 24,
+                    }],
+                },
+            ],
+        };
+        let profiles =
+            ProfileStore::load_from_str(&serde_json::to_string(&document).unwrap()).unwrap();
+
+        assert_eq!(
+            startup_window_group(&profiles, "Development")
+                .unwrap()
+                .entries[0]
+                .working_directory
+                .as_deref(),
+            Some("/tmp/original")
+        );
+        assert!(startup_window_group(&profiles, "Missing group").is_none());
+        assert!(startup_window_group(&profiles, "").is_none());
     }
 
     #[test]
@@ -4623,14 +4670,7 @@ fn build_window_with_profile_and_directory(
         None
     } else {
         let state = state.borrow();
-        (!state.settings.startup_window_group.is_empty())
-            .then(|| {
-                state
-                    .profiles
-                    .window_group(&state.settings.startup_window_group)
-                    .cloned()
-            })
-            .flatten()
+        startup_window_group(&state.profiles, &state.settings.startup_window_group)
     };
     if let Some(group) = startup_group {
         launch_window_group(&state, group);
