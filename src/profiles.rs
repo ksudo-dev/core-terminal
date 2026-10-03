@@ -792,6 +792,47 @@ fn valid_window_group_directory(path: &str) -> bool {
             && !path.chars().any(char::is_control))
 }
 
+fn normalize_window_group_names(mut groups: Vec<WindowGroup>) -> Vec<WindowGroup> {
+    let reserved_names = groups
+        .iter()
+        .map(|group| group.name.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut used_names = std::collections::HashSet::new();
+    for group in &mut groups {
+        if !used_names.insert(group.name.clone()) {
+            group.name = unique_window_group_name(&group.name, &reserved_names, &used_names);
+            used_names.insert(group.name.clone());
+        }
+    }
+    groups
+}
+
+fn unique_window_group_name(
+    name: &str,
+    reserved_names: &std::collections::HashSet<String>,
+    used_names: &std::collections::HashSet<String>,
+) -> String {
+    for suffix in 2usize.. {
+        let suffix = format!(" {suffix}");
+        let max_prefix_bytes = MAX_MENU_NAME_BYTES - suffix.len();
+        let prefix = name
+            .chars()
+            .scan(0, |bytes, character| {
+                let next = *bytes + character.len_utf8();
+                (next <= max_prefix_bytes).then(|| {
+                    *bytes = next;
+                    character
+                })
+            })
+            .collect::<String>();
+        let candidate = format!("{prefix}{suffix}");
+        if !reserved_names.contains(&candidate) && !used_names.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("numbered window group names cannot be exhausted")
+}
+
 impl ProfileStore {
     pub fn new(profiles: Vec<TerminalProfile>) -> Result<Self, ProfileError> {
         Self::new_with_window_groups(profiles, Vec::new())
@@ -850,6 +891,7 @@ impl ProfileStore {
                     })
             })
             .collect();
+        let window_groups = normalize_window_group_names(window_groups);
         Ok(Self {
             profiles,
             selected,
@@ -2461,6 +2503,106 @@ mod tests {
             import_terminal_plist(&oversized).unwrap_err(),
             ProfilePlistError::TooLarge
         ));
+    }
+
+    #[test]
+    fn loading_window_groups_recovers_duplicate_names_without_losing_data() {
+        let entry = |directory: &str, columns| WindowGroupEntry {
+            profile: "Homebrew".into(),
+            working_directory: Some(directory.into()),
+            columns,
+            rows: 24,
+        };
+        let document = ProfileDocument {
+            default_profile: Some(DEFAULT_PROFILE_NAME.into()),
+            profiles: vec![TerminalProfile::homebrew()],
+            window_groups: vec![
+                WindowGroup {
+                    name: " Development ".into(),
+                    entries: vec![entry(" /tmp/first ", 80)],
+                },
+                WindowGroup {
+                    name: "Development".into(),
+                    entries: vec![entry("/tmp/second", 90)],
+                },
+                WindowGroup {
+                    name: "Development 2".into(),
+                    entries: vec![entry("/tmp/existing-suffix", 100)],
+                },
+                WindowGroup {
+                    name: " Development ".into(),
+                    entries: vec![entry("/tmp/fourth", 110)],
+                },
+            ],
+        };
+        let store =
+            ProfileStore::load_from_str(&serde_json::to_string(&document).unwrap()).unwrap();
+        assert_eq!(
+            store
+                .window_groups()
+                .iter()
+                .map(|group| group.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Development",
+                "Development 3",
+                "Development 2",
+                "Development 4"
+            ]
+        );
+        assert_eq!(
+            store.window_group("Development").unwrap().entries[0]
+                .working_directory
+                .as_deref(),
+            Some("/tmp/first")
+        );
+        assert_eq!(
+            store
+                .window_groups()
+                .iter()
+                .map(|group| group.entries[0].columns)
+                .collect::<Vec<_>>(),
+            [80, 90, 100, 110]
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "core-terminal-window-group-normalization-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        store.save_to_path(&path).unwrap();
+        let once = ProfileStore::load_from_path(&path).unwrap();
+        once.save_to_path(&path).unwrap();
+        let twice = ProfileStore::load_from_path(&path).unwrap();
+        assert_eq!(once.window_groups(), twice.window_groups());
+        let _ = fs::remove_file(path);
+
+        let long_name = "x".repeat(MAX_MENU_NAME_BYTES);
+        let long_document = ProfileDocument {
+            default_profile: Some(DEFAULT_PROFILE_NAME.into()),
+            profiles: vec![TerminalProfile::homebrew()],
+            window_groups: vec![
+                WindowGroup {
+                    name: long_name.clone(),
+                    entries: vec![entry("/tmp/long-first", 80)],
+                },
+                WindowGroup {
+                    name: long_name.clone(),
+                    entries: vec![entry("/tmp/long-second", 81)],
+                },
+            ],
+        };
+        let long_store =
+            ProfileStore::load_from_str(&serde_json::to_string(&long_document).unwrap()).unwrap();
+        assert_eq!(long_store.window_groups()[0].name, long_name);
+        assert_eq!(
+            long_store.window_groups()[1].name.len(),
+            MAX_MENU_NAME_BYTES
+        );
+        assert!(long_store.window_groups()[1].name.ends_with(" 2"));
     }
 
     #[test]
