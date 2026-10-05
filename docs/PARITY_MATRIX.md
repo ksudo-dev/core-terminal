@@ -205,7 +205,7 @@ tab bar control; fullscreen; a New
 Command launcher with direct or shell execution; scrollback clearing; terminal
 reset; and an explicit Ctrl-C interrupt action. It does not claim parity for
 split panes,
-Inspector, marks and bookmarks, print or content export, dragged-file quoting,
+full macOS Inspector behavior, automatic command marks, print, dragged-file quoting,
 dragged-file quoting, remote-connection browsing, or a D-Bus automation API.
 These belong in a later feature plan rather than a release claim.
 
@@ -274,3 +274,13 @@ desktop. Weston is not an acceptance environment for this project.
 - GNOME, [VTE Terminal API](https://gnome.pages.gitlab.gnome.org/vte/gtk4/class.Terminal.html)
 - Wayland, [XDG shell protocol](https://wayland.app/protocols/xdg-shell)
 - GL.iNet, [Comet Console Guide](https://docs.gl-inet.com/kvm/en/user_guide/gl-rm1/console_guide/)
+
+## Context menu update
+
+The menu now includes selection and word actions, safe URL handling, local
+folder sessions, manual-page lookup, encoded web search, and per-tab row
+marks and bookmarks. Shift+F10 and the Menu key also open it. Manual lookup
+requires man and apropos on PATH. Marks are session-only row anchors.
+Inspector changes the live profile and window grid, and shows verified
+process information read-only. It does not send process signals. macOS
+Dictionary and Services have no built-in Linux implementation.

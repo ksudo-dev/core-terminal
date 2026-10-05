@@ -1,4 +1,6 @@
+mod context_menu;
 mod core;
+mod inspector;
 mod profiles;
 mod settings;
 mod shortcuts;
