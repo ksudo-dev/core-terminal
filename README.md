@@ -122,6 +122,31 @@ independently instead of forcing an outer horizontal settings scroller. GTK
 and the compositor own window controls, focus, placement, and pointer behavior
 outside the application window.
 
+## Session restoration
+
+Enable **Restore windows and tabs when Core Terminal starts** in General.
+It is off by default. Saved windows, ordered tabs, active selections, profiles,
+and requested window sizes reopen in fresh shells. Missing profiles use a current
+fallback. Last-known folders are checked before launch; unavailable folders
+fall back to home or / (host-only Flatpak folders may be unavailable).
+
+Changed snapshots are saved on a best-effort 15-second interval, after settings
+saves, and before graceful close. Quiet active sessions are refreshed hourly.
+Recent changes can be lost after a crash. At most 16 windows and 64 tabs are
+saved, and snapshots older than seven days are ignored.
+
+Profiles separately enable recent-text restoration and set its row limit.
+Text is capped at 10,000 rows and 256 KiB per tab, with a 3 MiB aggregate cap.
+Wide terminals may retain fewer rows. Current profile permissions control
+capture and display; text from a deleted profile is not shown under a fallback.
+Sanitized text is labeled before a fresh shell starts. Commands and running
+processes are never resumed, including configured profile/global commands.
+
+Saved text may contain sensitive information. The local snapshot uses
+owner-only permissions. Turning restoration off deletes it; turning a profile's
+text option off removes its saved text after a successful settings save.
+Bookmark-based restoration and screen positions remain unsupported.
+
 ## Linux limits
 
 Core Terminal follows the useful parts of Terminal.app's profile model, but it
