@@ -2,6 +2,7 @@ mod context_menu;
 mod core;
 mod inspector;
 mod profiles;
+mod session_restore;
 mod settings;
 mod shortcuts;
 mod ui;

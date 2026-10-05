@@ -37,8 +37,9 @@ outside this process.
 
 Implemented controls include startup profile, login shell path, optional
 custom command, new-window profile, new-tab profile, same-directory behavior,
-and Ctrl+1 through Ctrl+9 tab switching. The shell path must be an absolute
-path. A custom command runs through the login shell when that mode is selected.
+Ctrl+1 through Ctrl+9 tab switching, and opt-in session restoration. The shell
+path must be absolute. Custom commands apply to ordinary launches; restoration
+and recovery always start fresh shells after all command settings are resolved.
 
 ### Profiles
 
@@ -80,8 +81,9 @@ color escape handling are disabled and labeled as VTE-owned.
 
 The page exposes title text, optional background image and placement mode,
 title components, columns, rows, resize behavior, a read-only scrollback mirror,
-restored rows, and a bookmark field. VTE receives the requested columns and
-rows.
+optional recent-text restoration with a row limit, and a disabled bookmark
+metadata field. Text restoration requires General's session-restoration option.
+VTE receives the requested columns and rows.
 Profile, shell, directory, process-reported title, and dimensions feed each tab
 title. The top-level window title remains `Core Terminal` so the compositor
 titlebar stays stable and uncluttered. TTY and Ctrl-key title components are
@@ -177,6 +179,14 @@ validated before entering the child environment. VTE owns application keypad
 mode and UTF-8 decoding, so those controls are disabled and labeled. Visual
 bell output can be limited to profiles where the app's audible bell is off.
 
+### Session restoration
+
+Opt-in snapshots restore windows, tabs, current profile references, last-known
+folders, selections, and window geometry. Missing profiles and folders fall
+back safely. Saved output is sanitized and separated from the fresh shell.
+See [session restoration](../README.md#session-restoration) for privacy,
+retention, size limits, and periodic-save behavior.
+
 ### Window Groups
 
 The data model validates group names, profile references, directories, and
@@ -222,8 +232,8 @@ These belong in a later feature plan rather than a release claim.
   overrides for those modes.
 - Background blur and inactive-window blur depend on compositor APIs that are
   not portable across Wayland desktops.
-- The application can restore text and launch settings, not arbitrary live
-  process state after logout.
+- Session restoration reopens fresh shells and bounded display-only text; it
+  does not resume commands or running processes. Bookmark restoration is unavailable.
 - Apple fonts, symbols, icons, source, and undocumented private profile data
   are not redistributed.
 
