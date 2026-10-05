@@ -2,13 +2,19 @@
 use crate::{profiles::read_bounded_text_file, settings::Settings};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::{
+    fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    io::AsRawFd,
+};
 use std::{
     collections::VecDeque,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, MutexGuard,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 pub const VERSION: u32 = 1;
@@ -19,7 +25,12 @@ pub const MAX_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_TEXT_LINES: usize = 10_000;
 const MAX_TOTAL_TEXT_BYTES: usize = 3 * 1024 * 1024;
 const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const SESSION_FILE_NAME: &str = "session.json";
+const LOCK_FILE_NAME: &str = ".session-restore.lock";
+const TEMP_PREFIX: &str = ".session-";
+const TEMP_SUFFIX: &str = ".tmp";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static STATE_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabSnapshot {
@@ -175,19 +186,21 @@ pub fn save(path: &Path, snapshot: &Snapshot) -> Result<(), RestoreError> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(RestoreError::TooLarge);
     }
-    atomic_write_private(path, &bytes)?;
+    with_state_lock(path, |parent| atomic_write_private(path, parent, &bytes))?;
     Ok(())
 }
 pub fn save_user(snapshot: &Snapshot) -> Result<(), RestoreError> {
     save(&state_path().ok_or(RestoreError::NoPath)?, snapshot)
 }
+pub fn clear(path: &Path) -> Result<(), RestoreError> {
+    with_state_lock(path, |parent| {
+        remove_session_file(path)?;
+        cleanup_interrupted_temporary_files(parent)
+    })?;
+    Ok(())
+}
 pub fn clear_user() -> Result<(), RestoreError> {
-    let path = state_path().ok_or(RestoreError::NoPath)?;
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    clear(&state_path().ok_or(RestoreError::NoPath)?)
 }
 fn valid_directory(p: &str) -> bool {
     !p.is_empty()
@@ -336,11 +349,39 @@ pub fn display_bytes(input: &str) -> Vec<u8> {
     }
     output
 }
-fn atomic_write_private(path: &Path, content: &[u8]) -> io::Result<()> {
+struct StateLock {
+    _process_guard: MutexGuard<'static, ()>,
+    #[cfg(unix)]
+    file: File,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        // The descriptor remains open until after this explicit unlock. Keep the
+        // lock file itself: unlinking it would permit an inode-race bypass.
+        unsafe {
+            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn state_parent(path: &Path) -> io::Result<&Path> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+    if path.file_name().and_then(|name| name.to_str()) != Some(SESSION_FILE_NAME) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unexpected session state filename",
+        ));
+    }
+    Ok(parent)
+}
+
+fn prepare_state_directory(path: &Path) -> io::Result<&Path> {
+    let parent = state_parent(path)?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -354,6 +395,127 @@ fn atomic_write_private(path: &Path, content: &[u8]) -> io::Result<()> {
     }
     #[cfg(unix)]
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    Ok(parent)
+}
+
+fn acquire_state_lock(parent: &Path) -> io::Result<StateLock> {
+    let process_guard = STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = parent.join(LOCK_FILE_NAME);
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session lock is not a regular file",
+            ));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = options.open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session lock is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        // SAFETY: `file` stays open in StateLock until the matching unlock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(StateLock {
+        _process_guard: process_guard,
+        #[cfg(unix)]
+        file,
+    })
+}
+
+fn with_state_lock<T>(
+    path: &Path,
+    operation: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<T> {
+    let parent = prepare_state_directory(path)?;
+    let _lock = acquire_state_lock(parent)?;
+    operation(parent)
+}
+
+fn session_path_is_safe(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session state must not be a symlink",
+        )),
+        Ok(metadata) if !metadata.file_type().is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session state is not a regular file",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_interrupted_temporary_file(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(numbers) = name
+        .strip_prefix(TEMP_PREFIX)
+        .and_then(|value| value.strip_suffix(TEMP_SUFFIX))
+    else {
+        return false;
+    };
+    let mut parts = numbers.split('-');
+    parts.by_ref().take(3).count() == 3
+        && parts.next().is_none()
+        && numbers
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn cleanup_interrupted_temporary_files(parent: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if !is_interrupted_temporary_file(&entry.file_name()) {
+            continue;
+        }
+        // DirEntry::file_type does not follow links. Never unlink a link even
+        // when its name resembles an interrupted Core Terminal write.
+        if entry.file_type()?.is_file() {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_session_file(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session state must not be a symlink",
+        )),
+        Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(path),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session state is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn atomic_write_private(path: &Path, parent: &Path, content: &[u8]) -> io::Result<()> {
+    session_path_is_safe(path)?;
+    cleanup_interrupted_temporary_files(parent)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -374,6 +536,7 @@ fn atomic_write_private(path: &Path, content: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         drop(file);
+        session_path_is_safe(path)?;
         fs::rename(&temporary, path)?;
         fs::File::open(parent)?.sync_all()?;
         Ok(())
@@ -386,6 +549,34 @@ fn atomic_write_private(path: &Path, content: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+
+    struct TemporaryState {
+        root: PathBuf,
+    }
+
+    impl TemporaryState {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "core-terminal-{label}-{}-{}",
+                std::process::id(),
+                TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            Self { root }
+        }
+
+        fn session(&self) -> PathBuf {
+            self.root.join(SESSION_FILE_NAME)
+        }
+    }
+
+    impl Drop for TemporaryState {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn sample() -> Snapshot {
         Snapshot::new(
             vec![WindowSnapshot {
@@ -471,7 +662,7 @@ mod tests {
         assert!(matches!(save(&path, &invalid), Err(RestoreError::TooLarge)));
         assert_eq!(fs::read(&path).unwrap(), before);
         save(&path, &original).unwrap();
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
         assert!(matches!(
             load(&path, loaded.saved_at + MAX_AGE_SECS + 2),
             Err(RestoreError::Expired)
@@ -510,7 +701,117 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), before);
             fs::remove_file(link).unwrap();
         }
-        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_cleans_only_interrupted_application_temporary_files() {
+        let state = TemporaryState::new("interrupted-session");
+        let path = state.session();
+        let interrupted = state.root.join(".session-10-20-30.tmp");
+        let malformed = state.root.join(".session-10-20.tmp");
+        let unrelated = state.root.join("snapshot.json");
+        fs::write(&interrupted, b"partial").unwrap();
+        fs::write(&malformed, b"preserve").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        save(&path, &sample()).unwrap();
+
+        assert!(!interrupted.exists());
+        assert_eq!(fs::read(&malformed).unwrap(), b"preserve");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+        assert!(path.is_file());
+        assert!(state.root.join(LOCK_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn clear_is_opt_out_and_preserves_unrelated_state() {
+        let state = TemporaryState::new("clear-session");
+        let path = state.session();
+        let interrupted = state.root.join(".session-10-20-30.tmp");
+        let unrelated = state.root.join("other-snapshot.json");
+        save(&path, &sample()).unwrap();
+        fs::write(&interrupted, b"partial").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        clear(&path).unwrap();
+
+        assert!(!path.exists());
+        assert!(!interrupted.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+        assert!(state.root.join(LOCK_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn concurrent_save_and_clear_leave_no_recognized_remnant() {
+        let state = TemporaryState::new("concurrent-session");
+        let path = Arc::new(state.session());
+        let barrier = Arc::new(Barrier::new(3));
+        let saver_path = Arc::clone(&path);
+        let saver_barrier = Arc::clone(&barrier);
+        let saver = std::thread::spawn(move || {
+            saver_barrier.wait();
+            for _ in 0..32 {
+                save(&saver_path, &sample()).unwrap();
+            }
+        });
+        let clearer_path = Arc::clone(&path);
+        let clearer_barrier = Arc::clone(&barrier);
+        let clearer = std::thread::spawn(move || {
+            clearer_barrier.wait();
+            for _ in 0..32 {
+                clear(&clearer_path).unwrap();
+            }
+        });
+        barrier.wait();
+        saver.join().unwrap();
+        clearer.join().unwrap();
+
+        if path.exists() {
+            assert!(load(&path, now_secs()).is_ok());
+        }
+        let entries = fs::read_dir(&state.root)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(entries
+            .iter()
+            .all(|entry| !is_interrupted_temporary_file(&entry.file_name())));
+        assert!(state.root.join(LOCK_FILE_NAME).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_preserves_symlinked_and_unrelated_files() {
+        let state = TemporaryState::new("symlink-preserve");
+        let path = state.session();
+        let target = state.root.join("unrelated-target");
+        let temporary_link = state.root.join(".session-10-20-30.tmp");
+        let unrelated = state.root.join("other-snapshot.json");
+        fs::write(&target, b"outside").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+        save(&path, &sample()).unwrap();
+        std::os::unix::fs::symlink(&target, &temporary_link).unwrap();
+
+        clear(&path).unwrap();
+
+        assert!(temporary_link.is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"outside");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_and_clear_reject_a_symlinked_session_file() {
+        let state = TemporaryState::new("symlink-session");
+        let path = state.session();
+        let target = state.root.join("unrelated-target");
+        fs::write(&target, b"outside").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(save(&path, &sample()).is_err());
+        assert!(clear(&path).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"outside");
+        assert!(path.is_symlink());
     }
     #[test]
     fn limits_aggregate_text_and_empty_windows() {

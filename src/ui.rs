@@ -5292,7 +5292,10 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         let stat = std::str::from_utf8(&stat).ok()?;
         let fields = stat.rsplit_once(") ")?.1;
         let mut fields = fields.split_whitespace();
-        let _state = fields.next()?;
+        let state = fields.next()?;
+        if !acceptance_state_is_live(state) {
+            return None;
+        }
         let _parent = fields.next()?;
         let process_group = fields.next()?.parse().ok()?;
         let session = fields.next()?.parse().ok()?;
@@ -9881,4 +9884,21 @@ fn stack_page_child(stack: &gtk::Stack, terminal: &vte4::Terminal) -> Option<gtk
         child = parent;
     }
     None
+}
+
+// Orphan zombies may persist under container PID 1 after successful termination.
+#[cfg(target_os = "linux")]
+fn acceptance_state_is_live(state: &str) -> bool {
+    !matches!(state, "Z" | "X" | "x")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn acceptance_process_liveness_excludes_terminated_states() {
+    for state in ["Z", "X", "x"] {
+        assert!(!acceptance_state_is_live(state));
+    }
+    for state in ["R", "S", "D", "T", "t", "I", "?"] {
+        assert!(acceptance_state_is_live(state));
+    }
 }
