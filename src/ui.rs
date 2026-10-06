@@ -35,6 +35,10 @@ use vte4::prelude::{TerminalExt, TerminalExtManual};
 
 const SETTINGS_PAGE_IDS: [&str; 4] = ["general", "profiles", "window-groups", "encodings"];
 const PROFILE_PAGE_IDS: [&str; 6] = ["text", "window", "tab", "shell", "keyboard", "advanced"];
+/// A split pane is a review aid, not a second terminal. Keep its capture
+/// bounded even when a profile intentionally keeps unlimited VTE scrollback.
+const SNAPSHOT_MAX_ROWS: usize = 10_000;
+const SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
 static ACCEPTANCE_CLOSED_SPAWN_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn compatibility_profile<'a>(
@@ -100,11 +104,11 @@ mod structural_tests {
         menu_item_action_and_target, menu_submenu_named, migrate_legacy_profile_flags,
         replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
         runtime_profile_requires_reapply, runtime_terminal_settings_changed,
-        set_inspector_overrides, settings_page_ids, shell_escape_for_paste, spawn_callback_action,
-        startup_profile_after_deletion, startup_window_group, terminal_menu_labels,
-        terminal_menu_model, window_group_entry_summary, PathBuf, ProfileStore, SessionManager,
-        Settings, SpawnCallbackAction, WindowGroup, WindowGroupEntry, APPLICATION_ID,
-        PROFILE_PAGE_IDS,
+        set_inspector_overrides, settings_page_ids, shell_escape_for_paste, snapshot_row_bounds,
+        spawn_callback_action, startup_profile_after_deletion, startup_window_group,
+        terminal_menu_labels, terminal_menu_model, window_group_entry_summary, PathBuf,
+        ProfileStore, SessionManager, Settings, SpawnCallbackAction, WindowGroup, WindowGroupEntry,
+        APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -227,6 +231,24 @@ mod structural_tests {
             menu_item_action(&view, "Show Tab Bar"),
             Some("win.show-tab-bar".into())
         );
+    }
+
+    #[test]
+    fn view_menu_exposes_split_scrollback_toggle() {
+        let menu = terminal_menu_model(&ProfileStore::defaults());
+        let view = menu_submenu_named(&menu, "View").unwrap();
+        assert_eq!(
+            menu_item_action(&view, "Toggle Split Scrollback"),
+            Some("win.toggle-split-scrollback".into())
+        );
+    }
+
+    #[test]
+    fn split_snapshot_is_bounded_for_large_scrollback() {
+        let (first, last, rows) = snapshot_row_bounds(900_000, 80);
+        assert_eq!(last, 900_000);
+        assert!(rows <= 10_000);
+        assert_eq!(last - first + 1, rows as libc::c_long);
     }
 
     #[test]
@@ -887,6 +909,10 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     view.append(Some("Zoom In"), Some("win.zoom-in"));
     view.append(Some("Zoom Out"), Some("win.zoom-out"));
     view.append(Some("Actual Size"), Some("win.zoom-reset"));
+    view.append(
+        Some("Toggle Split Scrollback"),
+        Some("win.toggle-split-scrollback"),
+    );
     view.append(Some("Show Tab Bar"), Some("win.show-tab-bar"));
     view.append(Some("Toggle Full Screen"), Some("win.toggle-fullscreen"));
     let window = gio::Menu::new();
@@ -5040,6 +5066,7 @@ struct UiState {
     tab_bar: gtk::Box,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
+    scrollback_snapshots: HashMap<u64, ScrollbackSnapshot>,
     inspector_overrides: HashMap<u64, InspectorOverrides>,
     pending_spawns: HashSet<u64>,
     exited_before_spawn_callbacks: HashSet<u64>,
@@ -5050,6 +5077,15 @@ struct UiState {
     active_close_request: Option<CloseRequest>,
     pending_close_request: Option<CloseRequest>,
     window_close_authorization: Option<core::ClosePlan>,
+}
+
+/// Widgets owned by one tab's optional, read-only scrollback review pane.
+/// No VTE or PTY is created for this view.
+#[derive(Clone)]
+struct ScrollbackSnapshot {
+    split: gtk::Paned,
+    panel: gtk::Box,
+    text: gtk::TextView,
 }
 
 /// Runtime-only customizations owned by one terminal tab. These are never
@@ -5395,6 +5431,7 @@ fn build_session_window(
         tab_bar: tab_bar.clone(),
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
+        scrollback_snapshots: HashMap::new(),
         inspector_overrides: HashMap::new(),
         pending_spawns: HashSet::new(),
         exited_before_spawn_callbacks: HashSet::new(),
@@ -8112,6 +8149,13 @@ fn install_window_actions(
     });
     window.add_action(&clear_scrollback);
 
+    let split_scrollback_action = gio::SimpleAction::new("toggle-split-scrollback", None);
+    let action_state = state.clone();
+    split_scrollback_action.connect_activate(move |_, _| {
+        toggle_split_scrollback(&action_state);
+    });
+    window.add_action(&split_scrollback_action);
+
     let reset_terminal = gio::SimpleAction::new("reset-terminal", None);
     let action_state = state.clone();
     reset_terminal.connect_activate(move |_, _| {
@@ -8742,6 +8786,7 @@ fn show_connections(state: &Rc<RefCell<UiState>>) {
             command: None,
             explicit_argv: Some(argv),
             run_command_inside_shell: false,
+            suppress_profile_command: false,
             restore: false,
             restored_text: String::new(),
         };
@@ -9536,7 +9581,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
                 .unwrap_or_default();
         }
 
-        let surface = terminal_surface(
+        let (surface, snapshot) = split_scrollback_surface(
             &terminal,
             profile
                 .as_ref()
@@ -9555,6 +9600,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
             .add_titled(&surface, Some(&page_name), "Terminal");
         state_mut.stack.set_visible_child_name(&page_name);
         state_mut.terminals.insert(id.get(), terminal.clone());
+        state_mut.scrollback_snapshots.insert(id.get(), snapshot);
         state_mut.pending_spawns.insert(id.get());
         if spawn_options.custom_command.is_none() {
             let login_shell = spawn_options
@@ -9982,6 +10028,149 @@ fn terminal_surface(
     }
     overlay.add_overlay(terminal);
     overlay
+}
+
+/// Wrap the live terminal with an initially hidden review pane. The pane has
+/// no terminal widget: it can only display a copy of already-rendered VTE
+/// text, so opening or refreshing it cannot send bytes to the shell.
+fn split_scrollback_surface(
+    terminal: &vte4::Terminal,
+    profile_image: Option<&str>,
+    image_mode: Option<BackgroundImageMode>,
+    background_alpha: f64,
+) -> (gtk::Paned, ScrollbackSnapshot) {
+    let live_surface = terminal_surface(terminal, profile_image, image_mode, background_alpha);
+    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    split.set_widget_name("terminal-split-scrollback");
+    split.set_hexpand(true);
+    split.set_vexpand(true);
+    split.set_resize_start_child(true);
+    split.set_shrink_start_child(true);
+    split.set_start_child(Some(&live_surface));
+
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    panel.set_widget_name("scrollback-snapshot-pane");
+    panel.set_hexpand(true);
+    panel.set_vexpand(true);
+    panel.set_margin_start(8);
+    panel.set_margin_end(8);
+    panel.set_margin_top(8);
+    panel.set_margin_bottom(8);
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let label = gtk::Label::new(Some("Scrollback snapshot (read-only)"));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_tooltip_text(Some(
+        "A bounded copy of prior output. Refresh to capture the latest output; this is not a second shell.",
+    ));
+    let refresh = gtk::Button::with_label("Refresh");
+    refresh.set_widget_name("scrollback-snapshot-refresh");
+    refresh.set_tooltip_text(Some(
+        "Capture a new read-only snapshot from this terminal's scrollback",
+    ));
+    let close = gtk::Button::with_label("Close");
+    close.set_widget_name("scrollback-snapshot-close");
+    close.set_tooltip_text(Some("Close split scrollback"));
+    header.append(&label);
+    header.append(&refresh);
+    header.append(&close);
+    panel.append(&header);
+
+    let note =
+        hint_label("Shows the latest 10,000 rows at most. It does not update until refreshed.");
+    panel.append(&note);
+    let text = gtk::TextView::new();
+    text.set_widget_name("scrollback-snapshot-text");
+    text.set_editable(false);
+    text.set_monospace(true);
+    text.set_wrap_mode(gtk::WrapMode::None);
+    text.set_cursor_visible(true);
+    text.set_hexpand(true);
+    text.set_vexpand(true);
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_widget_name("scrollback-snapshot-scroller");
+    scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&text));
+    panel.append(&scroller);
+
+    let snapshot = ScrollbackSnapshot {
+        split: split.clone(),
+        panel: panel.clone(),
+        text: text.clone(),
+    };
+    let refresh_terminal = terminal.clone();
+    let refresh_text = text.clone();
+    refresh.connect_clicked(move |_| refresh_scrollback_snapshot(&refresh_text, &refresh_terminal));
+    let close_split = split.clone();
+    close.connect_clicked(move |_| close_split.set_end_child(None::<&gtk::Widget>));
+    (split, snapshot)
+}
+
+fn snapshot_scrollback_text(terminal: &vte4::Terminal) -> String {
+    let columns = terminal.column_count().max(1);
+    let visible_rows = terminal.row_count().max(1);
+    let last_row = terminal
+        .vadjustment()
+        .map(|adjustment| {
+            ((adjustment.upper() - adjustment.page_size()).max(0.0) as libc::c_long)
+                .saturating_add(visible_rows.saturating_sub(1))
+        })
+        .unwrap_or_else(|| visible_rows.saturating_sub(1));
+    let (first_row, last_row, rows) = snapshot_row_bounds(last_row, columns);
+    terminal
+        .text_range_format(vte4::Format::Text, first_row, 0, last_row, columns)
+        .0
+        .map(|text| restore::sanitize_text(&text, SNAPSHOT_MAX_BYTES, rows))
+        .unwrap_or_default()
+}
+
+fn snapshot_row_bounds(
+    last_row: libc::c_long,
+    columns: libc::c_long,
+) -> (libc::c_long, libc::c_long, usize) {
+    let byte_rows =
+        (SNAPSHOT_MAX_BYTES / (columns.max(1) as usize).saturating_mul(4).max(1)).max(1);
+    let rows = SNAPSHOT_MAX_ROWS.min(byte_rows);
+    let first_row = last_row
+        .saturating_sub(rows.saturating_sub(1) as libc::c_long)
+        .max(0);
+    let captured_rows = (last_row.saturating_sub(first_row) as usize).saturating_add(1);
+    (first_row, last_row, captured_rows)
+}
+
+fn refresh_scrollback_snapshot(text: &gtk::TextView, terminal: &vte4::Terminal) {
+    text.buffer().set_text(&snapshot_scrollback_text(terminal));
+}
+
+fn toggle_split_scrollback(state: &Rc<RefCell<UiState>>) {
+    let (terminal, snapshot) = {
+        let state = state.borrow();
+        let Some(id) = state.sessions.active().map(|tab| tab.id.get()) else {
+            return;
+        };
+        let Some(terminal) = state.terminals.get(&id).cloned() else {
+            return;
+        };
+        let Some(snapshot) = state.scrollback_snapshots.get(&id).cloned() else {
+            return;
+        };
+        (terminal, snapshot)
+    };
+    if snapshot.split.end_child().is_some() {
+        snapshot.split.set_end_child(None::<&gtk::Widget>);
+    } else {
+        refresh_scrollback_snapshot(&snapshot.text, &terminal);
+        snapshot.split.set_end_child(Some(&snapshot.panel));
+        snapshot
+            .split
+            .set_position((snapshot.split.width() / 2).max(1));
+        // Preserve command entry continuity: opening the review pane never
+        // steals focus from the live prompt.
+        terminal.grab_focus();
+    }
 }
 
 fn apply_profile(terminal: &vte4::Terminal, profile: &TerminalProfile, settings: &Settings) {
@@ -10706,6 +10895,7 @@ fn finish_window_close(state: &Rc<RefCell<UiState>>) {
             .collect::<Vec<_>>();
         state.sessions = SessionManager::empty();
         state.terminals.clear();
+        state.scrollback_snapshots.clear();
         state.pending_spawns.clear();
         state.child_process_identities.clear();
         state.login_shell_identities.clear();
@@ -10729,6 +10919,7 @@ fn force_close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
     };
     if let Some(tab) = state_mut.sessions.close_tab(id) {
         state_mut.pending_spawns.remove(&id.get());
+        state_mut.scrollback_snapshots.remove(&id.get());
         clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
         let child_identity = state_mut.child_process_identities.remove(&id.get());
         state_mut.login_shell_identities.remove(&id.get());
