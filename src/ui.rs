@@ -10,6 +10,7 @@ use crate::{
     profiles::{
         AskBeforeClosePolicy, BackgroundImageMode, CloseOnExit, CursorShape, KeyMapping,
         ProfileStore, ShellExitAction, TerminalProfile, WindowGroup, WindowGroupEntry,
+        WindowGroupWindow,
     },
     settings::{Settings, CURRENT_SCHEMA_VERSION},
     shortcuts::{
@@ -92,14 +93,15 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        adjust_font_scale, compatibility_profile, is_supported_terminal_link, menu_item_action,
+        adjust_font_scale, clear_inspector_overrides, compatibility_profile,
+        inspector_title_override, is_supported_terminal_link, menu_item_action,
         menu_item_action_and_target, menu_submenu_named, migrate_legacy_profile_flags,
         replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
-        runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
-        shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
-        startup_window_group, terminal_menu_labels, terminal_menu_model,
-        window_group_entry_summary, ProfileStore, SessionManager, Settings, SpawnCallbackAction,
-        WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        runtime_profile_requires_reapply, runtime_terminal_settings_changed,
+        set_inspector_overrides, settings_page_ids, shell_escape_for_paste, spawn_callback_action,
+        startup_profile_after_deletion, startup_window_group, terminal_menu_labels,
+        terminal_menu_model, window_group_entry_summary, ProfileStore, SessionManager, Settings,
+        SpawnCallbackAction, WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -124,6 +126,57 @@ mod structural_tests {
         assert_eq!(adjust_font_scale(1.1, -0.1), 1.0);
         assert_eq!(adjust_font_scale(0.5, -0.1), 0.5);
         assert_eq!(adjust_font_scale(2.0, 0.1), 2.0);
+    }
+
+    #[test]
+    fn inspector_overrides_apply_and_reset_without_changing_profiles() {
+        let profiles = ProfileStore::defaults();
+        let profile_snapshot = profiles.profiles().to_vec();
+        let mut sessions = SessionManager::empty();
+        let id = sessions.open_tab("Homebrew", None);
+        let mut overrides = std::collections::HashMap::new();
+        let background = gtk::gdk::RGBA::new(0.1, 0.2, 0.3, 1.0);
+
+        let applied =
+            set_inspector_overrides(&mut overrides, id, "  Build output\n", Some(background));
+        assert_eq!(applied.title.as_deref(), Some("Build output"));
+        assert!(applied.background.is_some());
+        assert_eq!(profiles.profiles(), profile_snapshot.as_slice());
+
+        clear_inspector_overrides(&mut overrides, id);
+        assert!(!overrides.contains_key(&id.get()));
+        assert_eq!(profiles.profiles(), profile_snapshot.as_slice());
+    }
+
+    #[test]
+    fn inspector_overrides_are_scoped_to_the_closed_tab() {
+        let mut sessions = SessionManager::empty();
+        let inspected = sessions.open_tab("Homebrew", None);
+        let sibling = sessions.open_tab("Homebrew", None);
+        let mut overrides = std::collections::HashMap::new();
+        set_inspector_overrides(&mut overrides, inspected, "Inspected", None);
+        set_inspector_overrides(&mut overrides, sibling, "Sibling", None);
+
+        clear_inspector_overrides(&mut overrides, inspected);
+        assert!(!overrides.contains_key(&inspected.get()));
+        assert_eq!(
+            overrides
+                .get(&sibling.get())
+                .and_then(|values| values.title.as_deref()),
+            Some("Sibling")
+        );
+    }
+
+    #[test]
+    fn inspector_title_override_is_bounded_and_control_free() {
+        assert_eq!(inspector_title_override(" \n "), None);
+        assert_eq!(inspector_title_override("A\u{1b}B"), Some("AB".into()));
+        assert_eq!(
+            inspector_title_override(&"x".repeat(300))
+                .as_deref()
+                .map(str::len),
+            Some(256)
+        );
     }
 
     #[test]
@@ -192,6 +245,8 @@ mod structural_tests {
         profiles
             .add_window_group(WindowGroup {
                 name: "Development".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: "Homebrew".into(),
                     working_directory: None,
@@ -222,6 +277,8 @@ mod structural_tests {
         profiles
             .add_window_group(WindowGroup {
                 name: "Development".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: "Homebrew".into(),
                     working_directory: None,
@@ -313,6 +370,8 @@ mod structural_tests {
             window_groups: vec![
                 WindowGroup {
                     name: " Development ".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: "Homebrew".into(),
                         working_directory: Some(" /tmp/original ".into()),
@@ -322,6 +381,8 @@ mod structural_tests {
                 },
                 WindowGroup {
                     name: "Development".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: "Homebrew".into(),
                         working_directory: Some("/tmp/later-duplicate".into()),
@@ -996,6 +1057,9 @@ fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
     };
     let snapshot_state = Rc::downgrade(state);
     let profile_state = Rc::downgrade(state);
+    let reset_state = Rc::downgrade(state);
+    let overrides_state = Rc::downgrade(state);
+    let reset_profile_state = Rc::downgrade(state);
     let inspector = crate::inspector::build_inspector(
         &parent,
         &terminal,
@@ -1017,6 +1081,14 @@ fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
                     .get(&id.get())
                     .map(|child| core::running_process_identity(Some(terminal), child)),
                 pending: state.pending_spawns.contains(&id.get()),
+                title_override: state
+                    .inspector_overrides
+                    .get(&id.get())
+                    .and_then(|overrides| overrides.title.clone()),
+                background_override: state
+                    .inspector_overrides
+                    .get(&id.get())
+                    .and_then(|overrides| overrides.background),
             })
         },
         move |profile_name| {
@@ -1031,9 +1103,67 @@ fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
                 return false;
             };
             state_mut.sessions.set_profile(id, &profile.name);
+            clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
             apply_profile(&terminal, &profile, &state_mut.settings);
             drop(state_mut);
             sync_active_profile_ui(&state);
+            update_tab_title(&state, id, &terminal);
+            true
+        },
+        move || {
+            let Some(state) = reset_state.upgrade() else {
+                return false;
+            };
+            let terminal = state.borrow().terminals.get(&id.get()).cloned();
+            let Some(terminal) = terminal else {
+                return false;
+            };
+            terminal.reset(false, false);
+            true
+        },
+        move |title, background| {
+            let Some(state) = overrides_state.upgrade() else {
+                return false;
+            };
+            let mut state_mut = state.borrow_mut();
+            let Some(profile) = state_mut
+                .sessions
+                .tab(id)
+                .and_then(|tab| state_mut.profiles.profile(&tab.profile_name))
+                .cloned()
+            else {
+                return false;
+            };
+            let Some(terminal) = state_mut.terminals.get(&id.get()).cloned() else {
+                return false;
+            };
+            let overrides =
+                set_inspector_overrides(&mut state_mut.inspector_overrides, id, &title, background);
+            apply_profile(&terminal, &profile, &state_mut.settings);
+            apply_inspector_background(&terminal, overrides.background);
+            drop(state_mut);
+            update_tab_title(&state, id, &terminal);
+            true
+        },
+        move || {
+            let Some(state) = reset_profile_state.upgrade() else {
+                return false;
+            };
+            let mut state_mut = state.borrow_mut();
+            let Some(profile) = state_mut
+                .sessions
+                .tab(id)
+                .and_then(|tab| state_mut.profiles.profile(&tab.profile_name))
+                .cloned()
+            else {
+                return false;
+            };
+            let Some(terminal) = state_mut.terminals.get(&id.get()).cloned() else {
+                return false;
+            };
+            clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
+            apply_profile(&terminal, &profile, &state_mut.settings);
+            drop(state_mut);
             update_tab_title(&state, id, &terminal);
             true
         },
@@ -3021,7 +3151,7 @@ impl SettingsControls {
         entry_heading.set_halign(gtk::Align::Start);
         window_groups.append(&entry_heading);
         window_groups.append(&hint_label(
-            "Each row launches as one tab, in the order shown. Select a row to edit its profile, directory, and terminal size above.",
+            "Rows edit the first saved window. Capture open windows to save a reusable multiwindow layout, including each window's active tab.",
         ));
         let group_entry_list = gtk::ListBox::new();
         group_entry_list.set_widget_name("window-group-entries");
@@ -3075,7 +3205,9 @@ impl SettingsControls {
         remove_group.set_widget_name("window-group-remove");
         let launch_group = gtk::Button::with_label("Launch selected group");
         launch_group.set_widget_name("window-group-launch");
-        for (index, button) in [&add_group, &remove_group, &launch_group]
+        let capture_group = gtk::Button::with_label("Capture open windows");
+        capture_group.set_widget_name("window-group-capture");
+        for (index, button) in [&add_group, &remove_group, &launch_group, &capture_group]
             .into_iter()
             .enumerate()
         {
@@ -3121,7 +3253,23 @@ impl SettingsControls {
                 }
                 let group = WindowGroup {
                     name: new_name.clone(),
-                    entries: edited_entries,
+                    entries: Vec::new(),
+                    windows: vec![
+                        WindowGroupWindow {
+                            active_tab: 1,
+                            entries: edited_entries,
+                        },
+                        WindowGroupWindow {
+                            active_tab: 0,
+                            entries: vec![WindowGroupEntry {
+                                profile: "Acceptance Profile".into(),
+                                working_directory: Some("/tmp/core-terminal-third".into()),
+                                columns: 120,
+                                rows: 40,
+                            }],
+                        },
+                    ],
+                    active_window: 1,
                 };
                 let result = store.borrow_mut().rename_window_group(&old_name, group);
                 result.map_err(|error| error.to_string())?;
@@ -3321,7 +3469,7 @@ impl SettingsControls {
             *selected_group_for_select.borrow_mut() = Some(name);
             name_for_select.set_text(&group.name);
             *selected_entry_for_group_select.borrow_mut() = None;
-            *entries_for_group_select.borrow_mut() = group.entries;
+            *entries_for_group_select.borrow_mut() = group.first_window_entries().to_vec();
             let entries = entries_for_group_select.borrow().clone();
             rebuild_window_group_entry_list(&entry_list_for_group_select, &entries, Some(0));
             status_for_group_select.set_text(
@@ -3359,12 +3507,17 @@ impl SettingsControls {
             let profile = profile_selection_for_add.borrow().clone();
             let group = WindowGroup {
                 name: name.clone(),
-                entries: vec![WindowGroupEntry {
-                    profile,
-                    working_directory: None,
-                    columns: 80,
-                    rows: 24,
+                entries: Vec::new(),
+                windows: vec![WindowGroupWindow {
+                    active_tab: 0,
+                    entries: vec![WindowGroupEntry {
+                        profile,
+                        working_directory: None,
+                        columns: 80,
+                        rows: 24,
+                    }],
                 }],
+                active_window: 0,
             };
             if group_store_for_add
                 .borrow_mut()
@@ -3456,6 +3609,41 @@ impl SettingsControls {
                 launch_callback(group);
             }
         });
+        let capture_store = group_store.clone();
+        let capture_selection = selected_group.clone();
+        let capture_entries = group_entries.clone();
+        let capture_selected_entry = selected_group_entry.clone();
+        let capture_list = group_entry_list.clone();
+        let commit_for_capture = commit_window_group.clone();
+        let status_for_capture = group_status.clone();
+        capture_group.connect_clicked(move |_| {
+            if let Err(error) = commit_for_capture() {
+                status_for_capture.set_text(&error);
+                return;
+            }
+            let Some(name) = capture_selection.borrow().clone() else {
+                status_for_capture.set_text("Select a saved group before capturing windows.");
+                return;
+            };
+            let Some(group) = capture_window_group(name.clone()) else {
+                status_for_capture.set_text("No open terminal windows could be captured.");
+                return;
+            };
+            if let Err(error) = capture_store.borrow_mut().update_window_group(group.clone()) {
+                status_for_capture.set_text(&error.to_string());
+                return;
+            }
+            *capture_entries.borrow_mut() = group.first_window_entries().to_vec();
+            *capture_selected_entry.borrow_mut() = None;
+            rebuild_window_group_entry_list(
+                &capture_list,
+                &capture_entries.borrow(),
+                Some(0),
+            );
+            status_for_capture.set_text(
+                "Captured all open terminal windows. Launch recreates their tabs and active window without replaying commands.",
+            );
+        });
         let groups_scroll = gtk::ScrolledWindow::new();
         groups_scroll.set_widget_name("window-groups-scroll");
         groups_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -3464,7 +3652,7 @@ impl SettingsControls {
         window_groups.append(&groups_scroll);
         window_groups.append(&group_actions);
         window_groups.append(&group_status);
-        window_groups.append(&hint_label("Core Terminal stores each group's profile, directory, and grid geometry. Launch opens one tab per entry; the Linux compositor owns final window placement and grouping."));
+        window_groups.append(&hint_label("Core Terminal stores each group's windows, profile, directory, grid geometry, and active tabs. Launch recreates separate top-level windows; commands are never saved or replayed."));
         top_stack.add_titled(
             &scroll_page(&window_groups),
             Some("window-groups"),
@@ -4731,8 +4919,15 @@ fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
                         .with(|r| r.borrow_mut().last_saved = Some(snapshot.clone()));
                     let mut active_window = None;
                     for (index, saved) in snapshot.windows.into_iter().enumerate() {
-                        let window =
-                            build_session_window(app, display_name, false, None, None, Some(saved));
+                        let window = build_session_window(
+                            app,
+                            display_name,
+                            false,
+                            None,
+                            None,
+                            Some(saved),
+                            None,
+                        );
                         if index == active {
                             active_window = Some(window);
                         }
@@ -4759,7 +4954,7 @@ fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
                 }],
                 ..Default::default()
             };
-            build_session_window(app, display_name, false, None, None, Some(fallback));
+            build_session_window(app, display_name, false, None, None, Some(fallback), None);
             return;
         }
     }
@@ -4779,6 +4974,7 @@ struct UiState {
     tab_bar: gtk::Box,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
+    inspector_overrides: HashMap<u64, InspectorOverrides>,
     pending_spawns: HashSet<u64>,
     exited_before_spawn_callbacks: HashSet<u64>,
     child_process_identities: HashMap<u64, core::ChildProcessIdentity>,
@@ -4788,6 +4984,42 @@ struct UiState {
     active_close_request: Option<CloseRequest>,
     pending_close_request: Option<CloseRequest>,
     window_close_authorization: Option<core::ClosePlan>,
+}
+
+/// Runtime-only customizations owned by one terminal tab. These are never
+/// copied into a profile store or settings document.
+#[derive(Clone, Debug, Default)]
+struct InspectorOverrides {
+    title: Option<String>,
+    background: Option<gtk::gdk::RGBA>,
+}
+
+fn inspector_title_override(value: &str) -> Option<String> {
+    let title: String = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect();
+    (!title.is_empty()).then_some(title)
+}
+
+fn set_inspector_overrides(
+    overrides: &mut HashMap<u64, InspectorOverrides>,
+    id: SessionId,
+    title: &str,
+    background: Option<gtk::gdk::RGBA>,
+) -> InspectorOverrides {
+    let override_values = InspectorOverrides {
+        title: inspector_title_override(title),
+        background,
+    };
+    overrides.insert(id.get(), override_values.clone());
+    override_values
+}
+
+fn clear_inspector_overrides(overrides: &mut HashMap<u64, InspectorOverrides>, id: SessionId) {
+    overrides.remove(&id.get());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4828,6 +5060,7 @@ struct TabLaunchSpec {
     size: Option<(u32, u32)>,
     command: Option<String>,
     run_command_inside_shell: bool,
+    suppress_profile_command: bool,
     restore: bool,
     restored_text: String,
 }
@@ -4840,6 +5073,7 @@ impl TabLaunchSpec {
             size: None,
             command: None,
             run_command_inside_shell: true,
+            suppress_profile_command: false,
             restore: false,
             restored_text: String::new(),
         }
@@ -4857,6 +5091,7 @@ impl TabLaunchSpec {
             size: None,
             command: Some(command.into()),
             run_command_inside_shell,
+            suppress_profile_command: false,
             restore: false,
             restored_text: String::new(),
         }
@@ -4869,6 +5104,10 @@ impl TabLaunchSpec {
             size: Some((entry.columns, entry.rows)),
             command: None,
             run_command_inside_shell: true,
+            // A reusable group stores layout, not process state. In
+            // particular, opening it must not replay a profile's custom
+            // command from whichever session happened to define the group.
+            suppress_profile_command: true,
             restore: false,
             restored_text: String::new(),
         }
@@ -4991,6 +5230,7 @@ fn build_window_with_profile_and_directory(
         pending_working_directory,
         requested_profile_override,
         None,
+        None,
     );
 }
 fn build_session_window(
@@ -5000,6 +5240,7 @@ fn build_session_window(
     pending_working_directory: Option<String>,
     requested_profile_override: Option<String>,
     restored: Option<restore::WindowSnapshot>,
+    saved_group_window: Option<WindowGroupWindow>,
 ) -> gtk::ApplicationWindow {
     gtk::Window::set_default_icon_name(APPLICATION_ID);
     let mut profiles = load_user_profiles();
@@ -5074,6 +5315,7 @@ fn build_session_window(
         tab_bar: tab_bar.clone(),
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
+        inspector_overrides: HashMap::new(),
         pending_spawns: HashSet::new(),
         exited_before_spawn_callbacks: HashSet::new(),
         child_process_identities: HashMap::new(),
@@ -5182,6 +5424,14 @@ fn build_session_window(
             .min(restored.tabs.len().saturating_sub(1));
         for tab in restored.tabs {
             open_tab_with_spec(&state, TabLaunchSpec::from_snapshot(tab));
+        }
+        switch_tab_index(&state, active);
+    } else if let Some(group_window) = saved_group_window {
+        let active = group_window
+            .active_tab
+            .min(group_window.entries.len().saturating_sub(1));
+        for entry in group_window.entries {
+            open_tab_with_spec(&state, TabLaunchSpec::from_window_group_entry(entry));
         }
         switch_tab_index(&state, active);
     } else if let Some(group) = startup_group {
@@ -6175,20 +6425,25 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             if state.profiles.window_group("Acceptance Group").is_none() {
                 let _ = state.profiles.add_window_group(WindowGroup {
                     name: "Acceptance Group".into(),
-                    entries: vec![
-                        WindowGroupEntry {
-                            profile: "Homebrew".into(),
-                            working_directory: Some("/tmp".into()),
-                            columns: 80,
-                            rows: 24,
-                        },
-                        WindowGroupEntry {
-                            profile: "Acceptance Profile".into(),
-                            working_directory: None,
-                            columns: 100,
-                            rows: 30,
-                        },
-                    ],
+                    entries: Vec::new(),
+                    windows: vec![WindowGroupWindow {
+                        active_tab: 0,
+                        entries: vec![
+                            WindowGroupEntry {
+                                profile: "Homebrew".into(),
+                                working_directory: Some("/tmp".into()),
+                                columns: 80,
+                                rows: 24,
+                            },
+                            WindowGroupEntry {
+                                profile: "Acceptance Profile".into(),
+                                working_directory: None,
+                                columns: 100,
+                                rows: 30,
+                            },
+                        ],
+                    }],
+                    active_window: 0,
                 });
             }
             if let Some(model) = state
@@ -7157,8 +7412,10 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             .as_ref()
             .and_then(|store| store.window_group("Acceptance Group"))
             .is_some_and(|group| {
-                group.entries.len() == 3
-                    && group.entries[1].working_directory.as_deref()
+                group.windows.len() == 2
+                    && group.active_window == 1
+                    && group.windows[0].active_tab == 1
+                    && group.windows[1].entries[0].working_directory.as_deref()
                         == Some("/tmp/core-terminal-third")
             });
         let standard_mappings_present = root
@@ -7182,32 +7439,91 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     && terminal.cjk_ambiguous_width() == 2
                     && !terminal.is_mouse_autohide()
             });
-        let (group_to_launch, sessions_before_group) = state
+        let group_to_launch = state
             .try_borrow_mut()
             .map(|mut state| {
                 // Deliberately conflict with the group's profiles: explicit
                 // group entries must win over normal new-tab policy.
                 state.settings.new_tab_profile = "Ocean".into();
-                (
-                    state.profiles.window_group("Acceptance Group").cloned(),
-                    state.sessions.tabs().len(),
-                )
-            })
-            .unwrap_or((None, 0));
-        let group_launch_explicit = group_to_launch.is_some_and(|group| {
-            let expected = group.entries.clone();
-            launch_window_group(&state, group);
-            state.try_borrow().is_ok_and(|state| {
-                let launched = state.sessions.tabs().get(sessions_before_group..);
-                launched.is_some_and(|launched| {
-                    launched.len() == expected.len()
-                        && launched.iter().zip(&expected).all(|(tab, entry)| {
-                            tab.profile_name == entry.profile
-                                && tab.working_directory == entry.working_directory
-                        })
+                // Saved groups create fresh top-level windows, which load the
+                // persisted profile document just like a normal new window.
+                // Keep the acceptance fixture on that real code path.
+                let _ = save_user_profiles(&state.profiles);
+                Some(WindowGroup {
+                    name: "Acceptance launch probe".into(),
+                    entries: Vec::new(),
+                    windows: vec![
+                        WindowGroupWindow {
+                            active_tab: 1,
+                            entries: vec![
+                                WindowGroupEntry {
+                                    profile: "Homebrew".into(),
+                                    working_directory: Some("/tmp".into()),
+                                    columns: 80,
+                                    rows: 24,
+                                },
+                                WindowGroupEntry {
+                                    profile: "Acceptance Profile".into(),
+                                    working_directory: None,
+                                    columns: 100,
+                                    rows: 30,
+                                },
+                            ],
+                        },
+                        WindowGroupWindow {
+                            active_tab: 0,
+                            entries: vec![WindowGroupEntry {
+                                profile: "Acceptance Profile".into(),
+                                working_directory: Some("/tmp/core-terminal-third".into()),
+                                columns: 120,
+                                rows: 40,
+                            }],
+                        },
+                    ],
+                    active_window: 1,
                 })
             })
+            .unwrap_or(None);
+        let group_launch_explicit = group_to_launch.is_some_and(|group| {
+            let expected = group.windows.clone();
+            let launched = launch_window_group(&state, group);
+            let state_count_matches =
+                wait_for_condition(Duration::from_secs(4), || launched.len() == expected.len());
+            let group_matches = state_count_matches
+                && launched
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(launched, expected_window)| {
+                        let launched = launched.borrow();
+                        let active = launched.sessions.active().map(|tab| tab.id);
+                        let expected_active = expected_window
+                            .entries
+                            .get(expected_window.active_tab)
+                            .map(|entry| &entry.profile);
+                        launched.sessions.tabs().len() == expected_window.entries.len()
+                            && launched
+                                .sessions
+                                .tabs()
+                                .iter()
+                                .zip(&expected_window.entries)
+                                .all(|(tab, entry)| {
+                                    tab.profile_name == entry.profile
+                                        && tab.working_directory == entry.working_directory
+                                })
+                            && expected_active.is_some_and(|profile| {
+                                active.is_some_and(|id| {
+                                    launched
+                                        .sessions
+                                        .tab(id)
+                                        .is_some_and(|tab| tab.profile_name == *profile)
+                                })
+                            })
+                    });
+            group_matches
         });
+        // The group deliberately launches into separate windows. Exercise
+        // active-profile synchronization on a real sibling in this window.
+        open_tab_with_spec(&state, TabLaunchSpec::new("Homebrew", None));
         let active_profile_synced_after_close = state
             .try_borrow()
             .ok()
@@ -8043,7 +8359,9 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
                 update_tab_title(&save_state, id, &terminal);
             }
         },
-        move |group| launch_window_group(&launch_state, group),
+        move |group| {
+            launch_window_group(&launch_state, group);
+        },
     );
     state.borrow_mut().settings_window = Some(window.downgrade());
 
@@ -8077,15 +8395,118 @@ fn clear_settings_window_if_current(
     }
 }
 
-/// Launch every entry in a saved group through the explicit tab/PTY path.
+/// Launch every saved top-level window through the explicit tab/PTY path.
 /// Group entries never mutate or depend on normal new-tab preferences.
-fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
-    for entry in group.entries {
-        if state.borrow().profiles.profile(&entry.profile).is_none() {
+fn launch_window_group(
+    state: &Rc<RefCell<UiState>>,
+    group: WindowGroup,
+) -> Vec<Rc<RefCell<UiState>>> {
+    let (app, display_name) = {
+        let state = state.borrow();
+        (
+            state.window.application(),
+            state
+                .window
+                .title()
+                .unwrap_or_else(|| "Core Terminal".into()),
+        )
+    };
+    let Some(app) = app else {
+        return Vec::new();
+    };
+    let mut active = None;
+    let mut launched = Vec::with_capacity(group.windows.len());
+    for (index, group_window) in group.windows.into_iter().enumerate() {
+        let window = build_session_window(
+            &app,
+            &display_name,
+            true,
+            None,
+            None,
+            None,
+            Some(group_window),
+        );
+        // `session_ui_states` is a weak, process-wide lifecycle registry.
+        // Associate this exact window with its state while the launch owns the
+        // result instead of inferring it later from registry insertion order.
+        if let Some(launched_state) = session_ui_states()
+            .into_iter()
+            .find(|candidate| candidate.borrow().window == window)
+        {
+            launched.push(launched_state);
+        }
+        if index == group.active_window {
+            active = Some(window);
+        }
+    }
+    if let Some(window) = active {
+        window.present();
+    }
+    launched
+}
+
+/// Capture the live top-level windows as a reusable named group. Only profile,
+/// directory, terminal grid, and selection state are stored; processes and
+/// commands are deliberately never replayed.
+fn capture_window_group(name: String) -> Option<WindowGroup> {
+    let mut windows = Vec::new();
+    let mut active_window = 0;
+    for state in session_ui_states() {
+        let state = state.try_borrow().ok()?;
+        if state.closing || state.sessions.is_empty() {
             continue;
         }
-        open_tab_with_spec(state, TabLaunchSpec::from_window_group_entry(entry));
+        let entries = state
+            .sessions
+            .tabs()
+            .iter()
+            .map(|tab| {
+                let (columns, rows) = state
+                    .terminals
+                    .get(&tab.id.get())
+                    .map(|terminal| {
+                        (
+                            terminal.column_count().max(1) as u32,
+                            terminal.row_count().max(1) as u32,
+                        )
+                    })
+                    .unwrap_or((80, 24));
+                WindowGroupEntry {
+                    profile: tab.profile_name.clone(),
+                    working_directory: snapshot_working_directory(&state, tab),
+                    columns,
+                    rows,
+                }
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            continue;
+        }
+        let active_tab = state
+            .sessions
+            .active()
+            .and_then(|active| {
+                state
+                    .sessions
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.id == active.id)
+            })
+            .unwrap_or(0);
+        if state.window.is_active() {
+            active_window = windows.len();
+        }
+        windows.push(WindowGroupWindow {
+            active_tab,
+            entries,
+        });
     }
+    (!windows.is_empty()).then_some(WindowGroup {
+        name,
+        entries: Vec::new(),
+        windows,
+        active_window,
+    })
 }
 
 /// Rebuild the profile and window-group submenus after settings mutate the
@@ -8664,6 +9085,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         size,
         command,
         run_command_inside_shell,
+        suppress_profile_command,
         restore,
         mut restored_text,
     } = spec;
@@ -8713,7 +9135,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
             if !profile.shell.trim().is_empty() {
                 spawn_options.shell = profile_options.shell;
             }
-            if !profile.shell_command.trim().is_empty() {
+            if !suppress_profile_command && !profile.shell_command.trim().is_empty() {
                 spawn_options.custom_command = profile_options.custom_command;
                 spawn_options.run_command_inside_shell = profile_options.run_command_inside_shell;
             }
@@ -9056,7 +9478,7 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
             .map(|name| name.to_string_lossy().into_owned())
             .or_else(|| Some(directory.to_owned()))
     });
-    let (profile, active) = {
+    let (profile, active, title_override) = {
         let state = state.borrow();
         let profile = state
             .sessions
@@ -9064,7 +9486,11 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
             .and_then(|tab| state.profiles.profile(&tab.profile_name))
             .cloned();
         let active = state.sessions.active().is_some_and(|tab| tab.id == id);
-        (profile, active)
+        let title_override = state
+            .inspector_overrides
+            .get(&id.get())
+            .and_then(|overrides| overrides.title.clone());
+        (profile, active, title_override)
     };
     let Some(profile) = profile else {
         return;
@@ -9124,7 +9550,9 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
                 .unwrap_or_else(|| directory_name.as_deref().unwrap_or("Terminal")),
         );
     }
-    let tab_title = tab_parts.join(" — ");
+    let tab_title = title_override
+        .clone()
+        .unwrap_or_else(|| tab_parts.join(" — "));
 
     let mut state = state.borrow_mut();
     state.sessions.set_title(id, &tab_title);
@@ -9134,7 +9562,9 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
         }
     }
     if active {
-        state.window.set_title(Some("Core Terminal"));
+        state
+            .window
+            .set_title(Some(title_override.as_deref().unwrap_or("Core Terminal")));
     }
 }
 
@@ -9183,6 +9613,12 @@ fn terminal_surface(
 
 fn apply_profile(terminal: &vte4::Terminal, profile: &TerminalProfile, settings: &Settings) {
     apply_profile_properties(terminal, profile, settings, true);
+}
+
+fn apply_inspector_background(terminal: &vte4::Terminal, background: Option<gtk::gdk::RGBA>) {
+    if let Some(background) = background {
+        terminal.set_color_background(&background);
+    }
 }
 
 fn reapply_profile_without_resize(
@@ -9852,6 +10288,7 @@ fn force_close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
     };
     if let Some(tab) = state_mut.sessions.close_tab(id) {
         state_mut.pending_spawns.remove(&id.get());
+        clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
         let child_identity = state_mut.child_process_identities.remove(&id.get());
         state_mut.login_shell_identities.remove(&id.get());
         if tab.child_pid.is_some() {

@@ -30,6 +30,8 @@ pub(crate) struct InspectorSnapshot {
     pub working_directory: Option<String>,
     pub process: Option<RunningProcessIdentity>,
     pub pending: bool,
+    pub title_override: Option<String>,
+    pub background_override: Option<gtk::gdk::RGBA>,
 }
 
 struct InspectorView {
@@ -48,6 +50,12 @@ struct InspectorView {
     columns: gtk::SpinButton,
     rows: gtk::SpinButton,
     resize: gtk::Button,
+    reset: gtk::Button,
+    override_title: gtk::Entry,
+    override_background: gtk::ColorDialogButton,
+    override_background_enabled: gtk::CheckButton,
+    apply_overrides: gtk::Button,
+    reset_profile: gtk::Button,
     resize_note: gtk::Label,
     status: gtk::Label,
     size_edited: Cell<bool>,
@@ -61,15 +69,21 @@ struct InspectorView {
 ///
 /// Process information is deliberately read-only: exposing a signal control
 /// would require per-process identity checks and a separate confirmation flow.
-pub(crate) fn build_inspector<F, P>(
+pub(crate) fn build_inspector<F, P, R, O, Q>(
     parent: &gtk::ApplicationWindow,
     terminal: &vte4::Terminal,
     snapshot: F,
     apply_profile: P,
+    reset_terminal: R,
+    apply_overrides: O,
+    reset_profile: Q,
 ) -> gtk::Window
 where
     F: Fn() -> Option<InspectorSnapshot> + 'static,
     P: Fn(&str) -> bool + 'static,
+    R: Fn() -> bool + 'static,
+    O: Fn(String, Option<gtk::gdk::RGBA>) -> bool + 'static,
+    Q: Fn() -> bool + 'static,
 {
     let window = gtk::Window::builder()
         .title("Inspector")
@@ -129,6 +143,33 @@ where
     controls.append(&size_row);
     let resize_note = note("Resizing changes this window only. The desktop may limit its size.");
     controls.append(&resize_note);
+    let reset = gtk::Button::with_label("Reset Terminal");
+    reset.set_widget_name("inspector-reset-terminal");
+    reset.set_tooltip_text(Some("Reset terminal modes without clearing scrollback."));
+    controls.append(&reset);
+    let override_group = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    override_group.append(&gtk::Label::new(Some("Temporary Overrides")));
+    let override_title = gtk::Entry::new();
+    override_title.set_widget_name("inspector-title-override");
+    override_title.set_placeholder_text(Some("Tab and active window title"));
+    override_group.append(&override_title);
+    let override_background_enabled = gtk::CheckButton::with_label("Override background color");
+    override_background_enabled.set_widget_name("inspector-background-override-enabled");
+    let override_background = gtk::ColorDialogButton::new(None::<gtk::ColorDialog>);
+    override_background.set_widget_name("inspector-background-override");
+    let background_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    background_row.append(&override_background_enabled);
+    background_row.append(&override_background);
+    override_group.append(&background_row);
+    let override_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let apply_overrides_button = gtk::Button::with_label("Apply Overrides");
+    apply_overrides_button.set_widget_name("inspector-apply-overrides");
+    let reset_profile_button = gtk::Button::with_label("Reset to Profile");
+    reset_profile_button.set_widget_name("inspector-reset-profile");
+    override_actions.append(&apply_overrides_button);
+    override_actions.append(&reset_profile_button);
+    override_group.append(&override_actions);
+    controls.append(&override_group);
     controls.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     let processes_heading = gtk::Label::new(Some("Processes"));
@@ -190,13 +231,28 @@ where
         columns,
         rows,
         resize,
+        reset,
+        override_title,
+        override_background,
+        override_background_enabled,
+        apply_overrides: apply_overrides_button,
+        reset_profile: reset_profile_button,
         resize_note,
         status,
         size_edited: Cell::new(false),
         syncing_size: Cell::new(false),
     });
     let snapshot = Rc::new(snapshot);
-    refresh(&view, parent, terminal, snapshot());
+    let initial_snapshot = snapshot();
+    if let Some(snapshot) = initial_snapshot.as_ref() {
+        view.override_title
+            .set_text(snapshot.title_override.as_deref().unwrap_or_default());
+        if let Some(background) = snapshot.background_override {
+            view.override_background.set_rgba(&background);
+            view.override_background_enabled.set_active(true);
+        }
+    }
+    refresh(&view, parent, terminal, initial_snapshot);
 
     let profile_view = Rc::downgrade(&view);
     let profile_snapshot = snapshot.clone();
@@ -280,6 +336,49 @@ where
         view.status.set_text(&format!(
             "Requested {columns} columns × {rows} rows. Current Size shows the actual result."
         ));
+    });
+    let reset_view = Rc::downgrade(&view);
+    view.reset.connect_clicked(move |_| {
+        let Some(view) = reset_view.upgrade() else {
+            return;
+        };
+        if reset_terminal() {
+            view.status
+                .set_text("Terminal modes reset; scrollback was preserved.");
+        } else {
+            close_session_view(&view);
+        }
+    });
+    let overrides_view = Rc::downgrade(&view);
+    view.apply_overrides.connect_clicked(move |_| {
+        let Some(view) = overrides_view.upgrade() else {
+            return;
+        };
+        let title = view.override_title.text().to_string();
+        let background = view
+            .override_background_enabled
+            .is_active()
+            .then(|| view.override_background.rgba());
+        if apply_overrides(title, background) {
+            view.status
+                .set_text("Temporary overrides applied to this terminal.");
+        } else {
+            close_session_view(&view);
+        }
+    });
+    let reset_profile_view = Rc::downgrade(&view);
+    view.reset_profile.connect_clicked(move |_| {
+        let Some(view) = reset_profile_view.upgrade() else {
+            return;
+        };
+        if reset_profile() {
+            view.override_title.set_text("");
+            view.override_background_enabled.set_active(false);
+            view.status
+                .set_text("Temporary overrides cleared; profile values restored.");
+        } else {
+            close_session_view(&view);
+        }
     });
 
     // Only the timeout owns `view`; widget signal handlers hold weak references.

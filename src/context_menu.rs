@@ -116,6 +116,10 @@ fn menu_model(context: &Context) -> gio::Menu {
     let clipboard = gio::Menu::new();
     clipboard.append(Some("Copy"), Some("context.copy"));
     clipboard.append(Some("Copy as HTML"), Some("context.copy-html"));
+    clipboard.append(
+        Some("Copy Command Output"),
+        Some("context.copy-command-output"),
+    );
     clipboard.append(Some("Paste"), Some("context.paste"));
     clipboard.append(Some("Paste Selection"), Some("context.paste-selection"));
     clipboard.append(Some("Paste Escaped Text"), Some("context.paste-escaped"));
@@ -186,6 +190,16 @@ impl Marks {
         } else {
             matching.next_back()
         }
+    }
+    fn command_bounds(&self, row: i64) -> Option<(i64, i64)> {
+        let start = self.0.range(..=row).next_back().map(|(row, _)| *row)?;
+        let end = self
+            .0
+            .range((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+            .next()
+            .map(|(row, _)| row.saturating_sub(1))
+            .unwrap_or(row.max(start));
+        Some((start, end.max(start)))
     }
 }
 
@@ -466,6 +480,30 @@ pub fn install(terminal: &vte4::Terminal, hooks: ContextMenuHooks) {
         });
     }
     {
+        let terminal = weak_terminal.clone();
+        let marks = marks.clone();
+        let context = context.clone();
+        action(&group, "copy-command-output", move || {
+            let Some(terminal) = terminal.upgrade() else {
+                return;
+            };
+            let row = context.borrow().first_row;
+            let Some((start, end)) = marks.borrow().command_bounds(row) else {
+                return;
+            };
+            let (text, _) = terminal.text_range_format(
+                vte4::Format::Text,
+                start,
+                0,
+                end,
+                terminal.column_count().saturating_sub(1),
+            );
+            if let Some(text) = text.filter(|text| !text.is_empty()) {
+                terminal.display().clipboard().set_text(&text);
+            }
+        });
+    }
+    {
         let paste_hooks = hooks.clone();
         action(&group, "paste", move || (paste_hooks.paste)());
         let hooks = hooks.clone();
@@ -599,6 +637,11 @@ pub fn install(terminal: &vte4::Terminal, hooks: ContextMenuHooks) {
             let context = context.borrow();
             enable(&group, "copy", !context.text.is_empty());
             enable(&group, "copy-html", terminal.has_selection());
+            enable(
+                &group,
+                "copy-command-output",
+                marks.borrow().command_bounds(context.first_row).is_some(),
+            );
             enable(
                 &group,
                 "man",
@@ -756,6 +799,15 @@ mod tests {
     fn automatic_marks_use_the_live_scrollback_page_not_the_viewport() {
         assert_eq!(cursor_scrollback_row(3, 400.0, 24.0), 379);
         assert_eq!(cursor_scrollback_row(-1, 12.0, 24.0), 0);
+    }
+
+    #[test]
+    fn command_bounds_copy_between_adjacent_marks() {
+        let mut marks = Marks::default();
+        marks.mark(10, 10, false);
+        marks.mark(25, 25, false);
+        assert_eq!(marks.command_bounds(20), Some((10, 24)));
+        assert_eq!(marks.command_bounds(9), None);
     }
     #[test]
     fn context_menu_has_platform_limits_and_conditional_targets() {
