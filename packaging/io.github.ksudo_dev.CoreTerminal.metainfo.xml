@@ -29,6 +29,12 @@
   <url type="bugtracker">https://github.com/ksudo-dev/core-terminal/issues</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.2.3-rc.2" date="2026-10-06">
+      <description>
+        <p>Release candidate: add native file-drop paste, saved SSH/SFTP
+        launching, and bounded read-only split scrollback review.</p>
+      </description>
+    </release>
     <release version="0.2.3-rc.1" date="2026-10-05">
       <description>
         <p>Release candidate: safely serialize temporary session restoration
