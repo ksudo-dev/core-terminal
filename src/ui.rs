@@ -5060,6 +5060,7 @@ struct TabLaunchSpec {
     size: Option<(u32, u32)>,
     command: Option<String>,
     run_command_inside_shell: bool,
+    suppress_profile_command: bool,
     restore: bool,
     restored_text: String,
 }
@@ -5072,6 +5073,7 @@ impl TabLaunchSpec {
             size: None,
             command: None,
             run_command_inside_shell: true,
+            suppress_profile_command: false,
             restore: false,
             restored_text: String::new(),
         }
@@ -5089,6 +5091,7 @@ impl TabLaunchSpec {
             size: None,
             command: Some(command.into()),
             run_command_inside_shell,
+            suppress_profile_command: false,
             restore: false,
             restored_text: String::new(),
         }
@@ -5101,6 +5104,10 @@ impl TabLaunchSpec {
             size: Some((entry.columns, entry.rows)),
             command: None,
             run_command_inside_shell: true,
+            // A reusable group stores layout, not process state. In
+            // particular, opening it must not replay a profile's custom
+            // command from whichever session happened to define the group.
+            suppress_profile_command: true,
             restore: false,
             restored_text: String::new(),
         }
@@ -7432,86 +7439,91 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     && terminal.cjk_ambiguous_width() == 2
                     && !terminal.is_mouse_autohide()
             });
-        let (group_to_launch, windows_before_group) = state
+        let group_to_launch = state
             .try_borrow_mut()
             .map(|mut state| {
                 // Deliberately conflict with the group's profiles: explicit
                 // group entries must win over normal new-tab policy.
                 state.settings.new_tab_profile = "Ocean".into();
-                (
-                    Some(WindowGroup {
-                        name: "Acceptance launch probe".into(),
-                        entries: Vec::new(),
-                        windows: vec![
-                            WindowGroupWindow {
-                                active_tab: 1,
-                                entries: vec![
-                                    WindowGroupEntry {
-                                        profile: "Homebrew".into(),
-                                        working_directory: Some("/tmp".into()),
-                                        columns: 80,
-                                        rows: 24,
-                                    },
-                                    WindowGroupEntry {
-                                        profile: "Acceptance Profile".into(),
-                                        working_directory: None,
-                                        columns: 100,
-                                        rows: 30,
-                                    },
-                                ],
-                            },
-                            WindowGroupWindow {
-                                active_tab: 0,
-                                entries: vec![WindowGroupEntry {
+                // Saved groups create fresh top-level windows, which load the
+                // persisted profile document just like a normal new window.
+                // Keep the acceptance fixture on that real code path.
+                let _ = save_user_profiles(&state.profiles);
+                Some(WindowGroup {
+                    name: "Acceptance launch probe".into(),
+                    entries: Vec::new(),
+                    windows: vec![
+                        WindowGroupWindow {
+                            active_tab: 1,
+                            entries: vec![
+                                WindowGroupEntry {
+                                    profile: "Homebrew".into(),
+                                    working_directory: Some("/tmp".into()),
+                                    columns: 80,
+                                    rows: 24,
+                                },
+                                WindowGroupEntry {
                                     profile: "Acceptance Profile".into(),
-                                    working_directory: Some("/tmp/core-terminal-third".into()),
-                                    columns: 120,
-                                    rows: 40,
-                                }],
-                            },
-                        ],
-                        active_window: 1,
-                    }),
-                    session_ui_states().len(),
-                )
+                                    working_directory: None,
+                                    columns: 100,
+                                    rows: 30,
+                                },
+                            ],
+                        },
+                        WindowGroupWindow {
+                            active_tab: 0,
+                            entries: vec![WindowGroupEntry {
+                                profile: "Acceptance Profile".into(),
+                                working_directory: Some("/tmp/core-terminal-third".into()),
+                                columns: 120,
+                                rows: 40,
+                            }],
+                        },
+                    ],
+                    active_window: 1,
+                })
             })
-            .unwrap_or((None, 0));
+            .unwrap_or(None);
         let group_launch_explicit = group_to_launch.is_some_and(|group| {
             let expected = group.windows.clone();
-            launch_window_group(&state, group);
-            wait_for_condition(Duration::from_secs(4), || {
-                session_ui_states().len() >= windows_before_group + expected.len()
-            }) && session_ui_states()
-                .into_iter()
-                .skip(windows_before_group)
-                .zip(expected.iter())
-                .all(|(launched, expected_window)| {
-                    let launched = launched.borrow();
-                    let active = launched.sessions.active().map(|tab| tab.id);
-                    let expected_active = expected_window
-                        .entries
-                        .get(expected_window.active_tab)
-                        .map(|entry| &entry.profile);
-                    launched.sessions.tabs().len() == expected_window.entries.len()
-                        && launched
-                            .sessions
-                            .tabs()
-                            .iter()
-                            .zip(&expected_window.entries)
-                            .all(|(tab, entry)| {
-                                tab.profile_name == entry.profile
-                                    && tab.working_directory == entry.working_directory
+            let launched = launch_window_group(&state, group);
+            let state_count_matches =
+                wait_for_condition(Duration::from_secs(4), || launched.len() == expected.len());
+            let group_matches = state_count_matches
+                && launched
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(launched, expected_window)| {
+                        let launched = launched.borrow();
+                        let active = launched.sessions.active().map(|tab| tab.id);
+                        let expected_active = expected_window
+                            .entries
+                            .get(expected_window.active_tab)
+                            .map(|entry| &entry.profile);
+                        launched.sessions.tabs().len() == expected_window.entries.len()
+                            && launched
+                                .sessions
+                                .tabs()
+                                .iter()
+                                .zip(&expected_window.entries)
+                                .all(|(tab, entry)| {
+                                    tab.profile_name == entry.profile
+                                        && tab.working_directory == entry.working_directory
+                                })
+                            && expected_active.is_some_and(|profile| {
+                                active.is_some_and(|id| {
+                                    launched
+                                        .sessions
+                                        .tab(id)
+                                        .is_some_and(|tab| tab.profile_name == *profile)
+                                })
                             })
-                        && expected_active.is_some_and(|profile| {
-                            active.is_some_and(|id| {
-                                launched
-                                    .sessions
-                                    .tab(id)
-                                    .is_some_and(|tab| tab.profile_name == *profile)
-                            })
-                        })
-                })
+                    });
+            group_matches
         });
+        // The group deliberately launches into separate windows. Exercise
+        // active-profile synchronization on a real sibling in this window.
+        open_tab_with_spec(&state, TabLaunchSpec::new("Homebrew", None));
         let active_profile_synced_after_close = state
             .try_borrow()
             .ok()
@@ -8347,7 +8359,9 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
                 update_tab_title(&save_state, id, &terminal);
             }
         },
-        move |group| launch_window_group(&launch_state, group),
+        move |group| {
+            launch_window_group(&launch_state, group);
+        },
     );
     state.borrow_mut().settings_window = Some(window.downgrade());
 
@@ -8383,7 +8397,10 @@ fn clear_settings_window_if_current(
 
 /// Launch every saved top-level window through the explicit tab/PTY path.
 /// Group entries never mutate or depend on normal new-tab preferences.
-fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
+fn launch_window_group(
+    state: &Rc<RefCell<UiState>>,
+    group: WindowGroup,
+) -> Vec<Rc<RefCell<UiState>>> {
     let (app, display_name) = {
         let state = state.borrow();
         (
@@ -8395,9 +8412,10 @@ fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
         )
     };
     let Some(app) = app else {
-        return;
+        return Vec::new();
     };
     let mut active = None;
+    let mut launched = Vec::with_capacity(group.windows.len());
     for (index, group_window) in group.windows.into_iter().enumerate() {
         let window = build_session_window(
             &app,
@@ -8408,6 +8426,15 @@ fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
             None,
             Some(group_window),
         );
+        // `session_ui_states` is a weak, process-wide lifecycle registry.
+        // Associate this exact window with its state while the launch owns the
+        // result instead of inferring it later from registry insertion order.
+        if let Some(launched_state) = session_ui_states()
+            .into_iter()
+            .find(|candidate| candidate.borrow().window == window)
+        {
+            launched.push(launched_state);
+        }
         if index == group.active_window {
             active = Some(window);
         }
@@ -8415,6 +8442,7 @@ fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
     if let Some(window) = active {
         window.present();
     }
+    launched
 }
 
 /// Capture the live top-level windows as a reusable named group. Only profile,
@@ -9057,6 +9085,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         size,
         command,
         run_command_inside_shell,
+        suppress_profile_command,
         restore,
         mut restored_text,
     } = spec;
@@ -9106,7 +9135,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
             if !profile.shell.trim().is_empty() {
                 spawn_options.shell = profile_options.shell;
             }
-            if !profile.shell_command.trim().is_empty() {
+            if !suppress_profile_command && !profile.shell_command.trim().is_empty() {
                 spawn_options.custom_command = profile_options.custom_command;
                 spawn_options.run_command_inside_shell = profile_options.run_command_inside_shell;
             }
