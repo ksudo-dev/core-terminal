@@ -28,7 +28,7 @@ dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 'core-terminal*' 
 The Debian package targets Ubuntu 26.04 and `amd64`:
 
 ```sh
-sudo apt install ./core-terminal_0.2.3~rc1_amd64.deb
+sudo apt install ./core-terminal_0.2.3~rc2_amd64.deb
 ```
 
 The published Flatpak bundle targets x86_64 Linux distributions with Flatpak
@@ -90,7 +90,7 @@ The script uses an isolated D-Bus session so an installed Core Terminal process
 cannot intercept the test activation. Weston is not a substitute for the
 Ubuntu GNOME Wayland test.
 
-## Features in 0.2.3-rc.1
+## Features in 0.2.3-rc.2
 
 Core Terminal currently includes:
 
@@ -112,6 +112,11 @@ Core Terminal currently includes:
   fullscreen, and Ctrl+1 through Ctrl+9 tab switching
 - XML and binary plist import for supported `.terminal` fields, with
   deterministic export and clear fallback reporting for unsupported fields
+- Saved SSH and SFTP connection metadata with an explicit **Launch new
+  terminal** action. Records contain labels, host, user, port, protocol, and
+  an optional terminal profile only; Core Terminal does not store passwords,
+  tokens, or private keys. The installed OpenSSH client receives direct argv,
+  so its usual host-key and authentication prompts remain intact.
 - Visual bells, background notifications, exit notifications, and tab activity
   indicators where the desktop provides the required integration
 - JSON persistence under the user's XDG configuration directory
@@ -165,10 +170,10 @@ depend on the desktop and are treated as optional Linux integrations.
 ## Debian package
 
 Build and inspect a local release-candidate package. The script defaults to
-the Debian-correct prerelease version `0.2.3~rc1`:
+the Debian-correct prerelease version `0.2.3~rc2`:
 
 ```sh
-scripts/build-deb.sh && scripts/check-deb.sh dist/core-terminal_0.2.3~rc1_$(dpkg --print-architecture).deb && lintian --pedantic dist/core-terminal_0.2.3~rc1_$(dpkg --print-architecture).deb
+scripts/build-deb.sh && scripts/check-deb.sh dist/core-terminal_0.2.3~rc2_$(dpkg --print-architecture).deb && lintian --pedantic dist/core-terminal_0.2.3~rc2_$(dpkg --print-architecture).deb
 ```
 
 Remove it with administrator permission:

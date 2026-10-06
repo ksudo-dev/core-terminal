@@ -6,6 +6,7 @@
 
 use crate::session_restore as restore;
 use crate::{
+    connections::{self, ConnectionStore, Protocol, SavedConnection},
     core::{self, SessionId, SessionManager},
     profiles::{
         AskBeforeClosePolicy, BackgroundImageMode, CloseOnExit, CursorShape, KeyMapping,
@@ -22,7 +23,7 @@ use gtk::{gio, glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -34,6 +35,10 @@ use vte4::prelude::{TerminalExt, TerminalExtManual};
 
 const SETTINGS_PAGE_IDS: [&str; 4] = ["general", "profiles", "window-groups", "encodings"];
 const PROFILE_PAGE_IDS: [&str; 6] = ["text", "window", "tab", "shell", "keyboard", "advanced"];
+/// A split pane is a review aid, not a second terminal. Keep its capture
+/// bounded even when a profile intentionally keeps unlimited VTE scrollback.
+const SNAPSHOT_MAX_ROWS: usize = 10_000;
+const SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
 static ACCEPTANCE_CLOSED_SPAWN_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn compatibility_profile<'a>(
@@ -94,14 +99,17 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 mod structural_tests {
     use super::{
         adjust_font_scale, clear_inspector_overrides, compatibility_profile,
+        connection_profile_or_fallback, dropped_file_paths, format_dropped_paths, gio,
         inspector_title_override, is_supported_terminal_link, menu_item_action,
         menu_item_action_and_target, menu_submenu_named, migrate_legacy_profile_flags,
         replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
         runtime_profile_requires_reapply, runtime_terminal_settings_changed,
-        set_inspector_overrides, settings_page_ids, shell_escape_for_paste, spawn_callback_action,
-        startup_profile_after_deletion, startup_window_group, terminal_menu_labels,
-        terminal_menu_model, window_group_entry_summary, ProfileStore, SessionManager, Settings,
-        SpawnCallbackAction, WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        set_inspector_overrides, settings_page_ids, shell_escape_for_paste, snapshot_row_bounds,
+        spawn_callback_action, spawn_options_for_tab, startup_profile_after_deletion,
+        startup_window_group, terminal_menu_labels, terminal_menu_model,
+        window_group_entry_summary, PathBuf, ProfileStore, SessionManager, Settings,
+        SpawnCallbackAction, TerminalProfile, WindowGroup, WindowGroupEntry, APPLICATION_ID,
+        PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -109,6 +117,15 @@ mod structural_tests {
         assert_eq!(
             settings_page_ids(),
             &["general", "profiles", "window-groups", "encodings"]
+        );
+    }
+
+    #[test]
+    fn saved_connection_missing_profile_uses_current_profile() {
+        let profiles = ProfileStore::defaults();
+        assert_eq!(
+            connection_profile_or_fallback(&profiles, "removed profile"),
+            profiles.selected_name()
         );
     }
 
@@ -218,6 +235,24 @@ mod structural_tests {
     }
 
     #[test]
+    fn view_menu_exposes_split_scrollback_toggle() {
+        let menu = terminal_menu_model(&ProfileStore::defaults());
+        let view = menu_submenu_named(&menu, "View").unwrap();
+        assert_eq!(
+            menu_item_action(&view, "Toggle Split Scrollback"),
+            Some("win.toggle-split-scrollback".into())
+        );
+    }
+
+    #[test]
+    fn split_snapshot_is_bounded_for_large_scrollback() {
+        let (first, last, rows) = snapshot_row_bounds(900_000, 80);
+        assert_eq!(last, 900_000);
+        assert!(rows <= 10_000);
+        assert_eq!(last - first + 1, rows as libc::c_long);
+    }
+
+    #[test]
     fn terminal_links_allow_only_browser_and_mail_uris() {
         for uri in [
             "https://example.com/docs?q=core-terminal",
@@ -302,6 +337,49 @@ mod structural_tests {
         assert_eq!(shell_escape_for_paste("hello world"), "'hello world'");
         assert_eq!(shell_escape_for_paste("a'b"), "'a'\\''b'");
         assert_eq!(shell_escape_for_paste(""), "''");
+    }
+
+    #[test]
+    fn dropped_paths_are_shell_quoted_separated_and_never_end_in_a_newline() {
+        let text = format_dropped_paths(&[
+            PathBuf::from("/tmp/with spaces"),
+            PathBuf::from("/tmp/it's-unicode-😀"),
+            PathBuf::from("/tmp/line\nbreak"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            text,
+            "'/tmp/with spaces' '/tmp/it'\\''s-unicode-😀' '/tmp/line\nbreak' "
+        );
+        assert!(text.ends_with(' '));
+        assert!(!text.ends_with('\n'));
+    }
+
+    #[test]
+    fn native_file_drop_acceptance_rejects_remote_and_mixed_payloads() {
+        let local = gio::File::for_path("/tmp/drop target");
+        let other_local = gio::File::for_path("/tmp/other");
+        let encoded_local = gio::File::for_uri("file:///tmp/space%20%E2%98%83");
+        let remote = gio::File::for_uri("https://example.invalid/not-a-file");
+
+        assert_eq!(
+            dropped_file_paths(&[local.clone(), other_local]),
+            Some(vec![
+                PathBuf::from("/tmp/drop target"),
+                PathBuf::from("/tmp/other"),
+            ])
+        );
+        assert_eq!(dropped_file_paths(&[remote]), None);
+        assert_eq!(
+            dropped_file_paths(&[encoded_local]),
+            Some(vec![PathBuf::from("/tmp/space ☃")])
+        );
+        assert_eq!(
+            dropped_file_paths(&[local, gio::File::for_uri("sftp://host/tmp/x")]),
+            None
+        );
+        assert_eq!(dropped_file_paths(&[]), None);
     }
 
     #[test]
@@ -587,6 +665,46 @@ mod structural_tests {
             .is_some_and(|p| std::path::Path::new(p).is_absolute()));
     }
     #[test]
+    fn group_launch_suppresses_global_and_profile_commands() {
+        let settings = Settings {
+            use_custom_command: true,
+            custom_command: "global-sentinel".into(),
+            run_command_inside_shell: false,
+            ..Settings::default()
+        };
+        let mut profile = TerminalProfile::homebrew();
+        profile.shell_command = "profile-sentinel".into();
+        profile.run_inside_shell = false;
+        let with_profile = spawn_options_for_tab(&settings, Some(&profile), None, true);
+        let without_profile = spawn_options_for_tab(&settings, None, None, true);
+        assert_eq!(with_profile.custom_command, None);
+        assert!(with_profile.run_command_inside_shell);
+        assert_eq!(without_profile.custom_command, None);
+        assert!(without_profile.run_command_inside_shell);
+    }
+    #[test]
+    fn normal_new_tab_keeps_automatic_command_behavior() {
+        let settings = Settings {
+            use_custom_command: true,
+            custom_command: "global-sentinel".into(),
+            run_command_inside_shell: false,
+            ..Settings::default()
+        };
+        let mut profile = TerminalProfile::homebrew();
+        profile.shell_command = "profile-sentinel".into();
+        profile.run_inside_shell = false;
+        assert_eq!(
+            spawn_options_for_tab(&settings, None, None, false).custom_command,
+            Some("global-sentinel".into())
+        );
+        let profile_options = spawn_options_for_tab(&settings, Some(&profile), None, false);
+        assert_eq!(
+            profile_options.custom_command,
+            Some("profile-sentinel".into())
+        );
+        assert!(!profile_options.run_command_inside_shell);
+    }
+    #[test]
     fn restored_text_is_display_only_and_commands_are_cleared_last() {
         let source = include_str!("ui.rs");
         let start = source.rfind("fn open_tab_with_spec(").unwrap();
@@ -798,6 +916,7 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     );
     shell.append(Some("New Tab"), Some("win.new-tab"));
     shell.append(Some("New Command…"), Some("win.new-command"));
+    shell.append(Some("Saved SSH/SFTP Connections…"), Some("win.connections"));
     let new_tab_profiles = gio::Menu::new();
     for name in profiles.names() {
         append_string_target(
@@ -831,6 +950,10 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     view.append(Some("Zoom In"), Some("win.zoom-in"));
     view.append(Some("Zoom Out"), Some("win.zoom-out"));
     view.append(Some("Actual Size"), Some("win.zoom-reset"));
+    view.append(
+        Some("Toggle Split Scrollback"),
+        Some("win.toggle-split-scrollback"),
+    );
     view.append(Some("Show Tab Bar"), Some("win.show-tab-bar"));
     view.append(Some("Toggle Full Screen"), Some("win.toggle-fullscreen"));
     let window = gio::Menu::new();
@@ -4927,6 +5050,7 @@ fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
                             None,
                             Some(saved),
                             None,
+                            None,
                         );
                         if index == active {
                             active_window = Some(window);
@@ -4954,7 +5078,16 @@ fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
                 }],
                 ..Default::default()
             };
-            build_session_window(app, display_name, false, None, None, Some(fallback), None);
+            build_session_window(
+                app,
+                display_name,
+                false,
+                None,
+                None,
+                Some(fallback),
+                None,
+                None,
+            );
             return;
         }
     }
@@ -4974,6 +5107,7 @@ struct UiState {
     tab_bar: gtk::Box,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
+    scrollback_snapshots: HashMap<u64, ScrollbackSnapshot>,
     inspector_overrides: HashMap<u64, InspectorOverrides>,
     pending_spawns: HashSet<u64>,
     exited_before_spawn_callbacks: HashSet<u64>,
@@ -4984,6 +5118,15 @@ struct UiState {
     active_close_request: Option<CloseRequest>,
     pending_close_request: Option<CloseRequest>,
     window_close_authorization: Option<core::ClosePlan>,
+}
+
+/// Widgets owned by one tab's optional, read-only scrollback review pane.
+/// No VTE or PTY is created for this view.
+#[derive(Clone)]
+struct ScrollbackSnapshot {
+    split: gtk::Paned,
+    panel: gtk::Box,
+    text: gtk::TextView,
 }
 
 /// Runtime-only customizations owned by one terminal tab. These are never
@@ -5059,6 +5202,7 @@ struct TabLaunchSpec {
     working_directory: Option<String>,
     size: Option<(u32, u32)>,
     command: Option<String>,
+    explicit_argv: Option<Vec<String>>,
     run_command_inside_shell: bool,
     suppress_profile_command: bool,
     restore: bool,
@@ -5072,6 +5216,7 @@ impl TabLaunchSpec {
             working_directory,
             size: None,
             command: None,
+            explicit_argv: None,
             run_command_inside_shell: true,
             suppress_profile_command: false,
             restore: false,
@@ -5090,6 +5235,7 @@ impl TabLaunchSpec {
             working_directory,
             size: None,
             command: Some(command.into()),
+            explicit_argv: None,
             run_command_inside_shell,
             suppress_profile_command: false,
             restore: false,
@@ -5103,6 +5249,7 @@ impl TabLaunchSpec {
             working_directory: entry.working_directory,
             size: Some((entry.columns, entry.rows)),
             command: None,
+            explicit_argv: None,
             run_command_inside_shell: true,
             // A reusable group stores layout, not process state. In
             // particular, opening it must not replay a profile's custom
@@ -5123,6 +5270,36 @@ impl TabLaunchSpec {
             ..Self::new(tab.profile, directory)
         }
     }
+}
+
+fn spawn_options_for_tab(
+    settings: &Settings,
+    profile: Option<&TerminalProfile>,
+    working_directory: Option<&str>,
+    suppress_profile_command: bool,
+) -> core::SpawnOptions {
+    let mut spawn_options = core::SpawnOptions::from_settings(settings, working_directory);
+    if suppress_profile_command {
+        // Saved groups represent layout only. They must start fresh login
+        // shells instead of inheriting either global or profile commands.
+        spawn_options.custom_command = None;
+        spawn_options.run_command_inside_shell = true;
+    }
+    if let Some(profile) = profile {
+        let profile_options = core::SpawnOptions::from_profile(profile, working_directory);
+        spawn_options.terminal_type = profile_options.terminal_type;
+        if !profile.shell.trim().is_empty() {
+            spawn_options.shell = profile_options.shell;
+        }
+        if !suppress_profile_command && !profile.shell_command.trim().is_empty() {
+            spawn_options.custom_command = profile_options.custom_command;
+            spawn_options.run_command_inside_shell = profile_options.run_command_inside_shell;
+        }
+        if profile.set_locale_environment {
+            spawn_options.locale = profile_options.locale;
+        }
+    }
+    spawn_options
 }
 
 fn resolve_window_profile(
@@ -5173,6 +5350,13 @@ fn resolve_new_tab_profile(
         })
         .unwrap_or(profiles.selected_name())
         .to_owned()
+}
+
+fn connection_profile_or_fallback(profiles: &ProfileStore, requested: &str) -> String {
+    profiles
+        .profile(requested)
+        .map(|_| requested.to_owned())
+        .unwrap_or_else(|| profiles.selected_name().to_owned())
 }
 
 /// Start the GTK application.  The application keeps terminal/session state
@@ -5231,8 +5415,10 @@ fn build_window_with_profile_and_directory(
         requested_profile_override,
         None,
         None,
+        None,
     );
 }
+#[allow(clippy::too_many_arguments)]
 fn build_session_window(
     app: &gtk::Application,
     display_name: &str,
@@ -5241,6 +5427,7 @@ fn build_session_window(
     requested_profile_override: Option<String>,
     restored: Option<restore::WindowSnapshot>,
     saved_group_window: Option<WindowGroupWindow>,
+    initial_tab: Option<TabLaunchSpec>,
 ) -> gtk::ApplicationWindow {
     gtk::Window::set_default_icon_name(APPLICATION_ID);
     let mut profiles = load_user_profiles();
@@ -5315,6 +5502,7 @@ fn build_session_window(
         tab_bar: tab_bar.clone(),
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
+        scrollback_snapshots: HashMap::new(),
         inspector_overrides: HashMap::new(),
         pending_spawns: HashSet::new(),
         exited_before_spawn_callbacks: HashSet::new(),
@@ -5436,6 +5624,8 @@ fn build_session_window(
         switch_tab_index(&state, active);
     } else if let Some(group) = startup_group {
         launch_window_group(&state, group);
+    } else if let Some(spec) = initial_tab {
+        open_tab_with_spec(&state, spec);
     } else {
         open_tab_with_spec(
             &state,
@@ -7804,6 +7994,11 @@ fn install_window_actions(
     new_command.connect_activate(move |_, _| show_new_command(&action_state));
     window.add_action(&new_command);
 
+    let connections = gio::SimpleAction::new("connections", None);
+    let action_state = state.clone();
+    connections.connect_activate(move |_, _| show_connections(&action_state));
+    window.add_action(&connections);
+
     let new_window_with_profile = gio::SimpleAction::new("new-window-with-profile", None);
     let action_state = state.clone();
     let action_app = app.clone();
@@ -8024,6 +8219,13 @@ fn install_window_actions(
         }
     });
     window.add_action(&clear_scrollback);
+
+    let split_scrollback_action = gio::SimpleAction::new("toggle-split-scrollback", None);
+    let action_state = state.clone();
+    split_scrollback_action.connect_activate(move |_, _| {
+        toggle_split_scrollback(&action_state);
+    });
+    window.add_action(&split_scrollback_action);
 
     let reset_terminal = gio::SimpleAction::new("reset-terminal", None);
     let action_state = state.clone();
@@ -8395,6 +8597,286 @@ fn clear_settings_window_if_current(
     }
 }
 
+/// Editor and explicit launcher for saved SSH/SFTP metadata. It never opens a
+/// connection by itself: the user must press Launch for one selected record.
+#[allow(deprecated)]
+fn show_connections(state: &Rc<RefCell<UiState>>) {
+    let parent = state.borrow().window.clone();
+    let window = gtk::Window::builder()
+        .title("Saved SSH/SFTP Connections")
+        .transient_for(&parent)
+        .destroy_with_parent(true)
+        .modal(false)
+        .default_width(700)
+        .default_height(480)
+        .build();
+    enforce_non_modal(&window);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.set_margin_start(18);
+    root.set_margin_end(18);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    let hint = gtk::Label::new(Some("Core Terminal stores no passwords, keys, or tokens. OpenSSH handles host-key and authentication prompts in the new terminal."));
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    root.append(&hint);
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.set_vexpand(true);
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_child(Some(&list));
+    scroll.set_vexpand(true);
+    root.append(&scroll);
+    let form = gtk::Grid::builder()
+        .column_spacing(8)
+        .row_spacing(8)
+        .build();
+    let label = gtk::Entry::new();
+    let host = gtk::Entry::new();
+    let user = gtk::Entry::new();
+    let port = gtk::Entry::new();
+    let profile = gtk::Entry::new();
+    port.set_text("22");
+    profile.set_placeholder_text(Some("Current profile fallback"));
+    let protocols = gtk::StringList::new(&["SSH", "SFTP"]);
+    let protocol = gtk::DropDown::new(Some(protocols), None::<&gtk::Expression>);
+    for (row, title, widget) in [
+        (0, "Label", label.clone().upcast::<gtk::Widget>()),
+        (1, "Host", host.clone().upcast()),
+        (2, "User", user.clone().upcast()),
+        (3, "Port", port.clone().upcast()),
+        (4, "Protocol", protocol.clone().upcast()),
+        (5, "Profile", profile.clone().upcast()),
+    ] {
+        let caption = gtk::Label::new(Some(title));
+        caption.set_xalign(0.0);
+        form.attach(&caption, 0, row, 1, 1);
+        form.attach(&widget, 1, row, 1, 1);
+    }
+    root.append(&form);
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.add_css_class("error");
+    root.append(&status);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    let aliases = gtk::Button::with_label("Read SSH aliases");
+    let save = gtk::Button::with_label("Save");
+    let delete = gtk::Button::with_label("Delete");
+    let launch = gtk::Button::with_label("Launch new terminal");
+    actions.append(&aliases);
+    actions.append(&delete);
+    actions.append(&save);
+    actions.append(&launch);
+    root.append(&actions);
+    window.set_child(Some(&root));
+
+    let store = Rc::new(RefCell::new(ConnectionStore::load_user()));
+    let selected = Rc::new(RefCell::new(None::<String>));
+    let refresh: Rc<dyn Fn()> = {
+        let list = list.clone();
+        let store = store.clone();
+        Rc::new(move || {
+            while let Some(row) = list.row_at_index(0) {
+                list.remove(&row);
+            }
+            for connection in &store.borrow().connections {
+                let protocol = match connection.protocol {
+                    Protocol::Ssh => "SSH",
+                    Protocol::Sftp => "SFTP",
+                };
+                let profile = if connection.profile.is_empty() {
+                    "current profile"
+                } else {
+                    &connection.profile
+                };
+                let summary = format!(
+                    "{} — {protocol} {}@{}:{} ({profile})",
+                    connection.label, connection.user, connection.host, connection.port
+                );
+                let row = gtk::ListBoxRow::new();
+                row.set_child(Some(&gtk::Label::new(Some(&summary))));
+                list.append(&row);
+            }
+        })
+    };
+    refresh();
+    let select_label = label.clone();
+    let select_host = host.clone();
+    let select_user = user.clone();
+    let select_port = port.clone();
+    let select_profile = profile.clone();
+    let select_protocol = protocol.clone();
+    let select_store = store.clone();
+    let select_selected = selected.clone();
+    list.connect_row_selected(move |_, row| {
+        let Some(row) = row else {
+            return;
+        };
+        let Some(connection) = select_store
+            .borrow()
+            .connections
+            .get(row.index() as usize)
+            .cloned()
+        else {
+            return;
+        };
+        *select_selected.borrow_mut() = Some(connection.label.clone());
+        select_label.set_text(&connection.label);
+        select_host.set_text(&connection.host);
+        select_user.set_text(&connection.user);
+        select_port.set_text(&connection.port.to_string());
+        select_profile.set_text(&connection.profile);
+        select_protocol.set_selected(if connection.protocol == Protocol::Ssh {
+            0
+        } else {
+            1
+        });
+    });
+    let alias_host = host.clone();
+    let alias_status = status.clone();
+    aliases.connect_clicked(move |_| {
+        let path = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ssh/config"));
+        match path
+            .and_then(|path| connections::read_ssh_host_aliases(path).ok())
+            .and_then(|aliases| aliases.into_iter().next())
+        {
+            Some(alias) => {
+                alias_host.set_text(&alias);
+                alias_status.set_text("Read a host alias; review and save it if desired.");
+            }
+            None => alias_status.set_text("No simple aliases were found in ~/.ssh/config."),
+        }
+    });
+    let save_store = store.clone();
+    let save_selected = selected.clone();
+    let save_refresh = refresh.clone();
+    let save_status = status.clone();
+    let save_label = label.clone();
+    let save_host = host.clone();
+    let save_user = user.clone();
+    let save_port = port.clone();
+    let save_protocol = protocol.clone();
+    let save_profile = profile.clone();
+    save.connect_clicked(move |_| {
+        let connection = SavedConnection {
+            label: save_label.text().to_string(),
+            host: save_host.text().to_string(),
+            user: save_user.text().to_string(),
+            port: save_port.text().parse().unwrap_or(0),
+            protocol: if save_protocol.selected() == 0 {
+                Protocol::Ssh
+            } else {
+                Protocol::Sftp
+            },
+            profile: save_profile.text().to_string(),
+        };
+        let old = save_selected.borrow().clone();
+        let result = {
+            let mut store = save_store.borrow_mut();
+            store.upsert(connection.clone(), old.as_deref())
+        };
+        let result = result.and_then(|_| save_store.borrow().save_user());
+        match result {
+            Ok(()) => {
+                *save_selected.borrow_mut() = Some(connection.label);
+                save_status.set_text("Saved.");
+                save_refresh();
+            }
+            Err(error) => save_status.set_text(&error.to_string()),
+        }
+    });
+    let delete_store = store.clone();
+    let delete_selected = selected.clone();
+    let delete_refresh = refresh.clone();
+    let delete_status = status.clone();
+    delete.connect_clicked(move |_| {
+        if let Some(label) = delete_selected.borrow_mut().take() {
+            delete_store.borrow_mut().delete(&label);
+            match delete_store.borrow().save_user() {
+                Ok(()) => {
+                    delete_status.set_text("Deleted.");
+                    delete_refresh();
+                }
+                Err(error) => delete_status.set_text(&error.to_string()),
+            }
+        }
+    });
+    let launch_state = state.clone();
+    let launch_store = store.clone();
+    let launch_selected = selected.clone();
+    let launch_status = status.clone();
+    let launch_window = window.clone();
+    launch.connect_clicked(move |_| {
+        let Some(label) = launch_selected.borrow().clone() else {
+            launch_status.set_text("Select a saved connection first.");
+            return;
+        };
+        let Some(connection) = launch_store
+            .borrow()
+            .connections
+            .iter()
+            .find(|c| c.label == label)
+            .cloned()
+        else {
+            return;
+        };
+        let executable = match connections::resolve_client(connection.protocol) {
+            Ok(path) => path,
+            Err(error) => {
+                launch_status.set_text(&error.to_string());
+                return;
+            }
+        };
+        let argv = match connection.argv(&executable) {
+            Ok(argv) => argv,
+            Err(error) => {
+                launch_status.set_text(&error.to_string());
+                return;
+            }
+        };
+        let (app, display_name, requested_profile, profiles) = {
+            let state = launch_state.borrow();
+            (
+                state.window.application(),
+                state
+                    .window
+                    .title()
+                    .unwrap_or_else(|| "Core Terminal".into()),
+                connection.profile.clone(),
+                state.profiles.clone(),
+            )
+        };
+        let Some(app) = app else {
+            return;
+        };
+        let profile = connection_profile_or_fallback(&profiles, &requested_profile);
+        let spec = TabLaunchSpec {
+            profile_name: profile,
+            working_directory: None,
+            size: None,
+            command: None,
+            explicit_argv: Some(argv),
+            run_command_inside_shell: false,
+            suppress_profile_command: false,
+            restore: false,
+            restored_text: String::new(),
+        };
+        build_session_window(
+            &app,
+            &display_name,
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(spec),
+        );
+        launch_window.close();
+    });
+    window.present();
+}
+
 /// Launch every saved top-level window through the explicit tab/PTY path.
 /// Group entries never mutate or depend on normal new-tab preferences.
 fn launch_window_group(
@@ -8425,6 +8907,7 @@ fn launch_window_group(
             None,
             None,
             Some(group_window),
+            None,
         );
         // `session_ui_states` is a weak, process-wide lifecycle registry.
         // Associate this exact window with its state while the launch owns the
@@ -9084,6 +9567,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         working_directory,
         size,
         command,
+        explicit_argv,
         run_command_inside_shell,
         suppress_profile_command,
         restore,
@@ -9126,26 +9610,20 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         // precedence only when the profile actually specifies them, so the
         // global custom command and login shell remain useful for profiles
         // that leave those fields at their defaults.
-        let mut spawn_options =
-            core::SpawnOptions::from_settings(&state_mut.settings, working_directory.as_deref());
-        if let Some(profile) = &profile {
-            let profile_options =
-                core::SpawnOptions::from_profile(profile, working_directory.as_deref());
-            spawn_options.terminal_type = profile_options.terminal_type;
-            if !profile.shell.trim().is_empty() {
-                spawn_options.shell = profile_options.shell;
-            }
-            if !suppress_profile_command && !profile.shell_command.trim().is_empty() {
-                spawn_options.custom_command = profile_options.custom_command;
-                spawn_options.run_command_inside_shell = profile_options.run_command_inside_shell;
-            }
-            if profile.set_locale_environment {
-                spawn_options.locale = profile_options.locale;
-            }
-        }
+        let mut spawn_options = spawn_options_for_tab(
+            &state_mut.settings,
+            profile.as_ref(),
+            working_directory.as_deref(),
+            suppress_profile_command,
+        );
         if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
             spawn_options.custom_command = Some(command);
             spawn_options.run_command_inside_shell = run_command_inside_shell;
+        }
+        if let Some(argv) = explicit_argv.filter(|argv| !argv.is_empty()) {
+            // A connection launcher supplies a complete, validated argv. Do
+            // not route it through shell parsing or profile command text.
+            spawn_options.explicit_argv = Some(argv);
         }
         // Restoration must override every global, profile and explicit command merge.
         if restore {
@@ -9164,7 +9642,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
                 .unwrap_or_default();
         }
 
-        let surface = terminal_surface(
+        let (surface, snapshot) = split_scrollback_surface(
             &terminal,
             profile
                 .as_ref()
@@ -9183,6 +9661,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
             .add_titled(&surface, Some(&page_name), "Terminal");
         state_mut.stack.set_visible_child_name(&page_name);
         state_mut.terminals.insert(id.get(), terminal.clone());
+        state_mut.scrollback_snapshots.insert(id.get(), snapshot);
         state_mut.pending_spawns.insert(id.get());
         if spawn_options.custom_command.is_none() {
             let login_shell = spawn_options
@@ -9196,6 +9675,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         (id, terminal, spawn_options)
     };
     install_context_actions(&terminal, state, id);
+    install_terminal_file_drop(&terminal);
     sync_active_profile_ui(state);
     connect_terminal_shortcuts(&terminal, state.clone(), id);
     let title_state = state.clone();
@@ -9611,6 +10091,149 @@ fn terminal_surface(
     overlay
 }
 
+/// Wrap the live terminal with an initially hidden review pane. The pane has
+/// no terminal widget: it can only display a copy of already-rendered VTE
+/// text, so opening or refreshing it cannot send bytes to the shell.
+fn split_scrollback_surface(
+    terminal: &vte4::Terminal,
+    profile_image: Option<&str>,
+    image_mode: Option<BackgroundImageMode>,
+    background_alpha: f64,
+) -> (gtk::Paned, ScrollbackSnapshot) {
+    let live_surface = terminal_surface(terminal, profile_image, image_mode, background_alpha);
+    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    split.set_widget_name("terminal-split-scrollback");
+    split.set_hexpand(true);
+    split.set_vexpand(true);
+    split.set_resize_start_child(true);
+    split.set_shrink_start_child(true);
+    split.set_start_child(Some(&live_surface));
+
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    panel.set_widget_name("scrollback-snapshot-pane");
+    panel.set_hexpand(true);
+    panel.set_vexpand(true);
+    panel.set_margin_start(8);
+    panel.set_margin_end(8);
+    panel.set_margin_top(8);
+    panel.set_margin_bottom(8);
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let label = gtk::Label::new(Some("Scrollback snapshot (read-only)"));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_tooltip_text(Some(
+        "A bounded copy of prior output. Refresh to capture the latest output; this is not a second shell.",
+    ));
+    let refresh = gtk::Button::with_label("Refresh");
+    refresh.set_widget_name("scrollback-snapshot-refresh");
+    refresh.set_tooltip_text(Some(
+        "Capture a new read-only snapshot from this terminal's scrollback",
+    ));
+    let close = gtk::Button::with_label("Close");
+    close.set_widget_name("scrollback-snapshot-close");
+    close.set_tooltip_text(Some("Close split scrollback"));
+    header.append(&label);
+    header.append(&refresh);
+    header.append(&close);
+    panel.append(&header);
+
+    let note =
+        hint_label("Shows the latest 10,000 rows at most. It does not update until refreshed.");
+    panel.append(&note);
+    let text = gtk::TextView::new();
+    text.set_widget_name("scrollback-snapshot-text");
+    text.set_editable(false);
+    text.set_monospace(true);
+    text.set_wrap_mode(gtk::WrapMode::None);
+    text.set_cursor_visible(true);
+    text.set_hexpand(true);
+    text.set_vexpand(true);
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_widget_name("scrollback-snapshot-scroller");
+    scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&text));
+    panel.append(&scroller);
+
+    let snapshot = ScrollbackSnapshot {
+        split: split.clone(),
+        panel: panel.clone(),
+        text: text.clone(),
+    };
+    let refresh_terminal = terminal.clone();
+    let refresh_text = text.clone();
+    refresh.connect_clicked(move |_| refresh_scrollback_snapshot(&refresh_text, &refresh_terminal));
+    let close_split = split.clone();
+    close.connect_clicked(move |_| close_split.set_end_child(None::<&gtk::Widget>));
+    (split, snapshot)
+}
+
+fn snapshot_scrollback_text(terminal: &vte4::Terminal) -> String {
+    let columns = terminal.column_count().max(1);
+    let visible_rows = terminal.row_count().max(1);
+    let last_row = terminal
+        .vadjustment()
+        .map(|adjustment| {
+            ((adjustment.upper() - adjustment.page_size()).max(0.0) as libc::c_long)
+                .saturating_add(visible_rows.saturating_sub(1))
+        })
+        .unwrap_or_else(|| visible_rows.saturating_sub(1));
+    let (first_row, last_row, rows) = snapshot_row_bounds(last_row, columns);
+    terminal
+        .text_range_format(vte4::Format::Text, first_row, 0, last_row, columns)
+        .0
+        .map(|text| restore::sanitize_text(&text, SNAPSHOT_MAX_BYTES, rows))
+        .unwrap_or_default()
+}
+
+fn snapshot_row_bounds(
+    last_row: libc::c_long,
+    columns: libc::c_long,
+) -> (libc::c_long, libc::c_long, usize) {
+    let byte_rows =
+        (SNAPSHOT_MAX_BYTES / (columns.max(1) as usize).saturating_mul(4).max(1)).max(1);
+    let rows = SNAPSHOT_MAX_ROWS.min(byte_rows);
+    let first_row = last_row
+        .saturating_sub(rows.saturating_sub(1) as libc::c_long)
+        .max(0);
+    let captured_rows = (last_row.saturating_sub(first_row) as usize).saturating_add(1);
+    (first_row, last_row, captured_rows)
+}
+
+fn refresh_scrollback_snapshot(text: &gtk::TextView, terminal: &vte4::Terminal) {
+    text.buffer().set_text(&snapshot_scrollback_text(terminal));
+}
+
+fn toggle_split_scrollback(state: &Rc<RefCell<UiState>>) {
+    let (terminal, snapshot) = {
+        let state = state.borrow();
+        let Some(id) = state.sessions.active().map(|tab| tab.id.get()) else {
+            return;
+        };
+        let Some(terminal) = state.terminals.get(&id).cloned() else {
+            return;
+        };
+        let Some(snapshot) = state.scrollback_snapshots.get(&id).cloned() else {
+            return;
+        };
+        (terminal, snapshot)
+    };
+    if snapshot.split.end_child().is_some() {
+        snapshot.split.set_end_child(None::<&gtk::Widget>);
+    } else {
+        refresh_scrollback_snapshot(&snapshot.text, &terminal);
+        snapshot.split.set_end_child(Some(&snapshot.panel));
+        snapshot
+            .split
+            .set_position((snapshot.split.width() / 2).max(1));
+        // Preserve command entry continuity: opening the review pane never
+        // steals focus from the live prompt.
+        terminal.grab_focus();
+    }
+}
+
 fn apply_profile(terminal: &vte4::Terminal, profile: &TerminalProfile, settings: &Settings) {
     apply_profile_properties(terminal, profile, settings, true);
 }
@@ -9920,6 +10543,74 @@ fn paste_escaped_clipboard(terminal: &vte4::Terminal) {
         };
         terminal.feed_child(shell_escape_for_paste(text.as_str()).as_bytes());
     });
+}
+
+/// Accept native files from a GTK file-list drop. This deliberately only
+/// handles local `file:` objects: reading remote URIs here would turn a drag
+/// operation into unexpected network I/O, and their URI text is not a shell
+/// path. Reject the complete list if any item is unsuitable so a mixed drag
+/// cannot silently omit an argument.
+fn dropped_file_paths(files: &[gio::File]) -> Option<Vec<PathBuf>> {
+    (!files.is_empty())
+        .then(|| {
+            files
+                .iter()
+                .map(|file| {
+                    (file.is_native() && file.has_uri_scheme("file"))
+                        .then(|| file.path())
+                        .flatten()
+                        .filter(|path| path.is_absolute())
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten()
+}
+
+/// Format a native path list as POSIX-style shell words. A final space makes
+/// it easy to continue composing a command, but is never an Enter/newline.
+/// Embedded newlines remain inside single quotes, so they cannot terminate a
+/// quoted shell word; VTE's `paste_text` also uses its bracketed-paste path
+/// whenever the foreground program supports it.
+fn format_dropped_paths(paths: &[PathBuf]) -> Option<String> {
+    (!paths.is_empty())
+        .then(|| {
+            paths
+                .iter()
+                .map(|path| {
+                    path.is_absolute()
+                        .then(|| path.to_str())
+                        .flatten()
+                        .map(shell_escape_for_paste)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten()
+        .map(|paths| format!("{} ", paths.join(" ")))
+}
+
+/// Install a native GTK4 `GdkFileList` target for file-manager drops. We use
+/// VTE's paste API instead of `feed_child`: it preserves VTE safe/bracketed
+/// paste behaviour and never appends an execution-triggering line ending.
+fn install_terminal_file_drop(terminal: &vte4::Terminal) {
+    let target = gtk::DropTarget::new(
+        gtk::gdk::FileList::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    let drop_terminal = terminal.clone();
+    target.connect_drop(move |_, value, _, _| {
+        let Ok(files) = value.get::<gtk::gdk::FileList>() else {
+            return false;
+        };
+        let Some(paths) = dropped_file_paths(&files.files()) else {
+            return false;
+        };
+        let Some(text) = format_dropped_paths(&paths) else {
+            return false;
+        };
+        drop_terminal.paste_text(&text);
+        true
+    });
+    terminal.add_controller(target);
 }
 
 fn shell_escape_for_paste(text: &str) -> String {
@@ -10265,6 +10956,7 @@ fn finish_window_close(state: &Rc<RefCell<UiState>>) {
             .collect::<Vec<_>>();
         state.sessions = SessionManager::empty();
         state.terminals.clear();
+        state.scrollback_snapshots.clear();
         state.pending_spawns.clear();
         state.child_process_identities.clear();
         state.login_shell_identities.clear();
@@ -10288,6 +10980,7 @@ fn force_close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
     };
     if let Some(tab) = state_mut.sessions.close_tab(id) {
         state_mut.pending_spawns.remove(&id.get());
+        state_mut.scrollback_snapshots.remove(&id.get());
         clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
         let child_identity = state_mut.child_process_identities.remove(&id.get());
         state_mut.login_shell_identities.remove(&id.get());

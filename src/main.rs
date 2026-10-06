@@ -1,4 +1,5 @@
 mod appearance;
+mod connections;
 mod context_menu;
 mod core;
 mod inspector;

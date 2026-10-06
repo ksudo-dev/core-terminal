@@ -253,6 +253,10 @@ pub struct SpawnOptions {
     pub terminal_type: String,
     pub shell: Option<String>,
     pub run_command_inside_shell: bool,
+    /// Complete argv for a user-confirmed launcher. This bypasses all command
+    /// parsing and is used for clients such as ssh that must receive exact
+    /// arguments rather than shell text.
+    pub explicit_argv: Option<Vec<String>>,
     pub locale: Option<String>,
 }
 
@@ -264,6 +268,7 @@ impl Default for SpawnOptions {
             terminal_type: "xterm-256color".into(),
             shell: None,
             run_command_inside_shell: true,
+            explicit_argv: None,
             locale: None,
         }
     }
@@ -284,6 +289,7 @@ impl SpawnOptions {
             terminal_type: sanitize_terminal_type(terminal_type),
             shell: None,
             run_command_inside_shell: true,
+            explicit_argv: None,
             locale: None,
         }
     }
@@ -415,11 +421,17 @@ where
         return;
     }
     let shell = options.shell.clone().unwrap_or_else(login_shell);
-    let command = startup_argv(
-        &shell,
-        options.custom_command.as_deref(),
-        options.run_command_inside_shell,
-    );
+    let command = options
+        .explicit_argv
+        .clone()
+        .filter(|argv| !argv.is_empty())
+        .unwrap_or_else(|| {
+            startup_argv(
+                &shell,
+                options.custom_command.as_deref(),
+                options.run_command_inside_shell,
+            )
+        });
     let working_directory = options.working_directory.clone();
     let argv: Vec<&str> = command.iter().map(String::as_str).collect();
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
@@ -497,6 +509,13 @@ fn flatpak_host_argv(options: &SpawnOptions, sandbox_home: Option<&str>) -> Vec<
 }
 
 fn flatpak_host_command(options: &SpawnOptions) -> Vec<String> {
+    if let Some(argv) = options
+        .explicit_argv
+        .as_ref()
+        .filter(|argv| !argv.is_empty())
+    {
+        return argv.clone();
+    }
     if let Some(shell) = &options.shell {
         return startup_argv(
             shell,
@@ -1471,6 +1490,7 @@ mod tests {
             terminal_type: "xterm-256color".into(),
             shell: Some("/bin/bash".into()),
             run_command_inside_shell: true,
+            explicit_argv: None,
             locale: Some("C.UTF-8".into()),
         };
         let argv = flatpak_host_argv(&options, Some("/home/user"));

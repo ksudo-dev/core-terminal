@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Version 0.2.3-rc.1 is the current local release-candidate line; it is not a
+Version 0.2.3-rc.2 is the current local release-candidate line; it is not a
 published supported release. Older package files are not
 maintained.
 
