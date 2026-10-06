@@ -10,6 +10,7 @@ use crate::{
     profiles::{
         AskBeforeClosePolicy, BackgroundImageMode, CloseOnExit, CursorShape, KeyMapping,
         ProfileStore, ShellExitAction, TerminalProfile, WindowGroup, WindowGroupEntry,
+        WindowGroupWindow,
     },
     settings::{Settings, CURRENT_SCHEMA_VERSION},
     shortcuts::{
@@ -244,6 +245,8 @@ mod structural_tests {
         profiles
             .add_window_group(WindowGroup {
                 name: "Development".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: "Homebrew".into(),
                     working_directory: None,
@@ -274,6 +277,8 @@ mod structural_tests {
         profiles
             .add_window_group(WindowGroup {
                 name: "Development".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: "Homebrew".into(),
                     working_directory: None,
@@ -365,6 +370,8 @@ mod structural_tests {
             window_groups: vec![
                 WindowGroup {
                     name: " Development ".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: "Homebrew".into(),
                         working_directory: Some(" /tmp/original ".into()),
@@ -374,6 +381,8 @@ mod structural_tests {
                 },
                 WindowGroup {
                     name: "Development".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: "Homebrew".into(),
                         working_directory: Some("/tmp/later-duplicate".into()),
@@ -3142,7 +3151,7 @@ impl SettingsControls {
         entry_heading.set_halign(gtk::Align::Start);
         window_groups.append(&entry_heading);
         window_groups.append(&hint_label(
-            "Each row launches as one tab, in the order shown. Select a row to edit its profile, directory, and terminal size above.",
+            "Rows edit the first saved window. Capture open windows to save a reusable multiwindow layout, including each window's active tab.",
         ));
         let group_entry_list = gtk::ListBox::new();
         group_entry_list.set_widget_name("window-group-entries");
@@ -3196,7 +3205,9 @@ impl SettingsControls {
         remove_group.set_widget_name("window-group-remove");
         let launch_group = gtk::Button::with_label("Launch selected group");
         launch_group.set_widget_name("window-group-launch");
-        for (index, button) in [&add_group, &remove_group, &launch_group]
+        let capture_group = gtk::Button::with_label("Capture open windows");
+        capture_group.set_widget_name("window-group-capture");
+        for (index, button) in [&add_group, &remove_group, &launch_group, &capture_group]
             .into_iter()
             .enumerate()
         {
@@ -3242,7 +3253,12 @@ impl SettingsControls {
                 }
                 let group = WindowGroup {
                     name: new_name.clone(),
-                    entries: edited_entries,
+                    entries: Vec::new(),
+                    windows: vec![WindowGroupWindow {
+                        active_tab: 0,
+                        entries: edited_entries,
+                    }],
+                    active_window: 0,
                 };
                 let result = store.borrow_mut().rename_window_group(&old_name, group);
                 result.map_err(|error| error.to_string())?;
@@ -3442,7 +3458,7 @@ impl SettingsControls {
             *selected_group_for_select.borrow_mut() = Some(name);
             name_for_select.set_text(&group.name);
             *selected_entry_for_group_select.borrow_mut() = None;
-            *entries_for_group_select.borrow_mut() = group.entries;
+            *entries_for_group_select.borrow_mut() = group.first_window_entries().to_vec();
             let entries = entries_for_group_select.borrow().clone();
             rebuild_window_group_entry_list(&entry_list_for_group_select, &entries, Some(0));
             status_for_group_select.set_text(
@@ -3480,12 +3496,17 @@ impl SettingsControls {
             let profile = profile_selection_for_add.borrow().clone();
             let group = WindowGroup {
                 name: name.clone(),
-                entries: vec![WindowGroupEntry {
-                    profile,
-                    working_directory: None,
-                    columns: 80,
-                    rows: 24,
+                entries: Vec::new(),
+                windows: vec![WindowGroupWindow {
+                    active_tab: 0,
+                    entries: vec![WindowGroupEntry {
+                        profile,
+                        working_directory: None,
+                        columns: 80,
+                        rows: 24,
+                    }],
                 }],
+                active_window: 0,
             };
             if group_store_for_add
                 .borrow_mut()
@@ -3577,6 +3598,41 @@ impl SettingsControls {
                 launch_callback(group);
             }
         });
+        let capture_store = group_store.clone();
+        let capture_selection = selected_group.clone();
+        let capture_entries = group_entries.clone();
+        let capture_selected_entry = selected_group_entry.clone();
+        let capture_list = group_entry_list.clone();
+        let commit_for_capture = commit_window_group.clone();
+        let status_for_capture = group_status.clone();
+        capture_group.connect_clicked(move |_| {
+            if let Err(error) = commit_for_capture() {
+                status_for_capture.set_text(&error);
+                return;
+            }
+            let Some(name) = capture_selection.borrow().clone() else {
+                status_for_capture.set_text("Select a saved group before capturing windows.");
+                return;
+            };
+            let Some(group) = capture_window_group(name.clone()) else {
+                status_for_capture.set_text("No open terminal windows could be captured.");
+                return;
+            };
+            if let Err(error) = capture_store.borrow_mut().update_window_group(group.clone()) {
+                status_for_capture.set_text(&error.to_string());
+                return;
+            }
+            *capture_entries.borrow_mut() = group.first_window_entries().to_vec();
+            *capture_selected_entry.borrow_mut() = None;
+            rebuild_window_group_entry_list(
+                &capture_list,
+                &capture_entries.borrow(),
+                Some(0),
+            );
+            status_for_capture.set_text(
+                "Captured all open terminal windows. Launch recreates their tabs and active window without replaying commands.",
+            );
+        });
         let groups_scroll = gtk::ScrolledWindow::new();
         groups_scroll.set_widget_name("window-groups-scroll");
         groups_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -3585,7 +3641,7 @@ impl SettingsControls {
         window_groups.append(&groups_scroll);
         window_groups.append(&group_actions);
         window_groups.append(&group_status);
-        window_groups.append(&hint_label("Core Terminal stores each group's profile, directory, and grid geometry. Launch opens one tab per entry; the Linux compositor owns final window placement and grouping."));
+        window_groups.append(&hint_label("Core Terminal stores each group's windows, profile, directory, grid geometry, and active tabs. Launch recreates separate top-level windows; commands are never saved or replayed."));
         top_stack.add_titled(
             &scroll_page(&window_groups),
             Some("window-groups"),
@@ -4852,8 +4908,15 @@ fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
                         .with(|r| r.borrow_mut().last_saved = Some(snapshot.clone()));
                     let mut active_window = None;
                     for (index, saved) in snapshot.windows.into_iter().enumerate() {
-                        let window =
-                            build_session_window(app, display_name, false, None, None, Some(saved));
+                        let window = build_session_window(
+                            app,
+                            display_name,
+                            false,
+                            None,
+                            None,
+                            Some(saved),
+                            None,
+                        );
                         if index == active {
                             active_window = Some(window);
                         }
@@ -4880,7 +4943,7 @@ fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
                 }],
                 ..Default::default()
             };
-            build_session_window(app, display_name, false, None, None, Some(fallback));
+            build_session_window(app, display_name, false, None, None, Some(fallback), None);
             return;
         }
     }
@@ -5149,6 +5212,7 @@ fn build_window_with_profile_and_directory(
         pending_working_directory,
         requested_profile_override,
         None,
+        None,
     );
 }
 fn build_session_window(
@@ -5158,6 +5222,7 @@ fn build_session_window(
     pending_working_directory: Option<String>,
     requested_profile_override: Option<String>,
     restored: Option<restore::WindowSnapshot>,
+    saved_group_window: Option<WindowGroupWindow>,
 ) -> gtk::ApplicationWindow {
     gtk::Window::set_default_icon_name(APPLICATION_ID);
     let mut profiles = load_user_profiles();
@@ -5341,6 +5406,14 @@ fn build_session_window(
             .min(restored.tabs.len().saturating_sub(1));
         for tab in restored.tabs {
             open_tab_with_spec(&state, TabLaunchSpec::from_snapshot(tab));
+        }
+        switch_tab_index(&state, active);
+    } else if let Some(group_window) = saved_group_window {
+        let active = group_window
+            .active_tab
+            .min(group_window.entries.len().saturating_sub(1));
+        for entry in group_window.entries {
+            open_tab_with_spec(&state, TabLaunchSpec::from_window_group_entry(entry));
         }
         switch_tab_index(&state, active);
     } else if let Some(group) = startup_group {
@@ -6334,20 +6407,25 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             if state.profiles.window_group("Acceptance Group").is_none() {
                 let _ = state.profiles.add_window_group(WindowGroup {
                     name: "Acceptance Group".into(),
-                    entries: vec![
-                        WindowGroupEntry {
-                            profile: "Homebrew".into(),
-                            working_directory: Some("/tmp".into()),
-                            columns: 80,
-                            rows: 24,
-                        },
-                        WindowGroupEntry {
-                            profile: "Acceptance Profile".into(),
-                            working_directory: None,
-                            columns: 100,
-                            rows: 30,
-                        },
-                    ],
+                    entries: Vec::new(),
+                    windows: vec![WindowGroupWindow {
+                        active_tab: 0,
+                        entries: vec![
+                            WindowGroupEntry {
+                                profile: "Homebrew".into(),
+                                working_directory: Some("/tmp".into()),
+                                columns: 80,
+                                rows: 24,
+                            },
+                            WindowGroupEntry {
+                                profile: "Acceptance Profile".into(),
+                                working_directory: None,
+                                columns: 100,
+                                rows: 30,
+                            },
+                        ],
+                    }],
+                    active_window: 0,
                 });
             }
             if let Some(model) = state
@@ -8236,15 +8314,104 @@ fn clear_settings_window_if_current(
     }
 }
 
-/// Launch every entry in a saved group through the explicit tab/PTY path.
+/// Launch every saved top-level window through the explicit tab/PTY path.
 /// Group entries never mutate or depend on normal new-tab preferences.
 fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
-    for entry in group.entries {
-        if state.borrow().profiles.profile(&entry.profile).is_none() {
+    let (app, display_name) = {
+        let state = state.borrow();
+        (
+            state.window.application(),
+            state
+                .window
+                .title()
+                .unwrap_or_else(|| "Core Terminal".into()),
+        )
+    };
+    let Some(app) = app else {
+        return;
+    };
+    let mut active = None;
+    for (index, group_window) in group.windows.into_iter().enumerate() {
+        let window = build_session_window(
+            &app,
+            &display_name,
+            true,
+            None,
+            None,
+            None,
+            Some(group_window),
+        );
+        if index == group.active_window {
+            active = Some(window);
+        }
+    }
+    if let Some(window) = active {
+        window.present();
+    }
+}
+
+/// Capture the live top-level windows as a reusable named group. Only profile,
+/// directory, terminal grid, and selection state are stored; processes and
+/// commands are deliberately never replayed.
+fn capture_window_group(name: String) -> Option<WindowGroup> {
+    let mut windows = Vec::new();
+    let mut active_window = 0;
+    for state in session_ui_states() {
+        let state = state.try_borrow().ok()?;
+        if state.closing || state.sessions.is_empty() {
             continue;
         }
-        open_tab_with_spec(state, TabLaunchSpec::from_window_group_entry(entry));
+        let entries = state
+            .sessions
+            .tabs()
+            .iter()
+            .map(|tab| {
+                let (columns, rows) = state
+                    .terminals
+                    .get(&tab.id.get())
+                    .map(|terminal| {
+                        (
+                            terminal.column_count().max(1) as u32,
+                            terminal.row_count().max(1) as u32,
+                        )
+                    })
+                    .unwrap_or((80, 24));
+                WindowGroupEntry {
+                    profile: tab.profile_name.clone(),
+                    working_directory: snapshot_working_directory(&state, tab),
+                    columns,
+                    rows,
+                }
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            continue;
+        }
+        let active_tab = state
+            .sessions
+            .active()
+            .and_then(|active| {
+                state
+                    .sessions
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.id == active.id)
+            })
+            .unwrap_or(0);
+        if state.window.is_active() {
+            active_window = windows.len();
+        }
+        windows.push(WindowGroupWindow {
+            active_tab,
+            entries,
+        });
     }
+    (!windows.is_empty()).then_some(WindowGroup {
+        name,
+        entries: Vec::new(),
+        windows,
+        active_window,
+    })
 }
 
 /// Rebuild the profile and window-group submenus after settings mutate the

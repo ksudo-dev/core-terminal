@@ -677,6 +677,21 @@ impl WindowGroupEntry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct WindowGroup {
     pub name: String,
+    /// Legacy single-window representation. It is accepted on load and
+    /// migrated into `windows`; newly written groups use the latter.
+    #[serde(default)]
+    pub entries: Vec<WindowGroupEntry>,
+    #[serde(default)]
+    pub windows: Vec<WindowGroupWindow>,
+    #[serde(default)]
+    pub active_window: usize,
+}
+
+/// One top-level window in a saved window group.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct WindowGroupWindow {
+    #[serde(default)]
+    pub active_tab: usize,
     #[serde(default)]
     pub entries: Vec<WindowGroupEntry>,
 }
@@ -684,12 +699,44 @@ pub struct WindowGroup {
 impl WindowGroup {
     fn normalized(mut self) -> Self {
         self.name = self.name.trim().to_owned();
-        self.entries = self
-            .entries
+        if self.windows.is_empty() && !self.entries.is_empty() {
+            self.windows.push(WindowGroupWindow {
+                active_tab: 0,
+                entries: std::mem::take(&mut self.entries),
+            });
+        }
+        self.windows = self
+            .windows
             .into_iter()
-            .map(WindowGroupEntry::normalized)
+            .filter_map(|mut window| {
+                window.entries = window
+                    .entries
+                    .into_iter()
+                    .map(WindowGroupEntry::normalized)
+                    .collect();
+                (!window.entries.is_empty()).then(|| {
+                    window.active_tab = window.active_tab.min(window.entries.len() - 1);
+                    window
+                })
+            })
             .collect();
+        self.active_window = self.active_window.min(self.windows.len().saturating_sub(1));
+        // Keep the deprecated field available to in-process callers during
+        // the transition. It is always a copy of the first window, while
+        // `windows` remains the authoritative serialized layout.
+        self.entries = self
+            .windows
+            .first()
+            .map(|window| window.entries.clone())
+            .unwrap_or_default();
         self
+    }
+
+    pub fn first_window_entries(&self) -> &[WindowGroupEntry] {
+        self.windows
+            .first()
+            .map(|window| window.entries.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -758,22 +805,34 @@ fn validate_window_group_shape(group: &WindowGroup) -> Result<(), ProfileMutatio
     if !valid_menu_name(name) {
         return Err(ProfileMutationError::InvalidWindowGroupName);
     }
-    if group.entries.is_empty() {
+    let windows = if group.windows.is_empty() {
+        vec![WindowGroupWindow {
+            active_tab: 0,
+            entries: group.entries.clone(),
+        }]
+    } else {
+        group.windows.clone()
+    };
+    if windows.iter().any(|window| window.entries.is_empty()) {
         return Err(ProfileMutationError::EmptyWindowGroup);
     }
-    if group
-        .entries
+    if windows
         .iter()
+        .flat_map(|window| &window.entries)
         .any(|entry| !(1..=1_000).contains(&entry.columns) || !(1..=1_000).contains(&entry.rows))
     {
         return Err(ProfileMutationError::InvalidWindowGroupDimensions);
     }
-    if group.entries.iter().any(|entry| {
-        entry
-            .working_directory
-            .as_deref()
-            .is_some_and(|path| !valid_window_group_directory(path))
-    }) {
+    if windows
+        .iter()
+        .flat_map(|window| &window.entries)
+        .any(|entry| {
+            entry
+                .working_directory
+                .as_deref()
+                .is_some_and(|path| !valid_window_group_directory(path))
+        })
+    {
         return Err(ProfileMutationError::InvalidWindowGroupDirectory);
     }
     Ok(())
@@ -879,16 +938,24 @@ impl ProfileStore {
             .map(WindowGroup::normalized)
             .filter(|group| {
                 valid_menu_name(&group.name)
-                    && !group.entries.is_empty()
-                    && group.entries.iter().all(|entry| {
-                        profile_names.contains(entry.profile.as_str())
-                            && (1..=1_000).contains(&entry.columns)
-                            && (1..=1_000).contains(&entry.rows)
-                            && entry
-                                .working_directory
-                                .as_deref()
-                                .is_none_or(valid_window_group_directory)
-                    })
+                    && !group.windows.is_empty()
+                    && group
+                        .windows
+                        .iter()
+                        .all(|window| !window.entries.is_empty())
+                    && group
+                        .windows
+                        .iter()
+                        .flat_map(|window| &window.entries)
+                        .all(|entry| {
+                            profile_names.contains(entry.profile.as_str())
+                                && (1..=1_000).contains(&entry.columns)
+                                && (1..=1_000).contains(&entry.rows)
+                                && entry
+                                    .working_directory
+                                    .as_deref()
+                                    .is_none_or(valid_window_group_directory)
+                        })
             })
             .collect();
         let window_groups = normalize_window_group_names(window_groups);
@@ -1159,7 +1226,7 @@ impl ProfileStore {
     }
 
     fn validate_window_group(&self, group: &WindowGroup) -> Result<(), ProfileMutationError> {
-        for entry in &group.entries {
+        for entry in group.windows.iter().flat_map(|window| &window.entries) {
             if self.profile(&entry.profile).is_none() {
                 return Err(ProfileMutationError::MissingWindowGroupProfile(
                     entry.profile.clone(),
@@ -2519,18 +2586,26 @@ mod tests {
             window_groups: vec![
                 WindowGroup {
                     name: " Development ".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![entry(" /tmp/first ", 80)],
                 },
                 WindowGroup {
                     name: "Development".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![entry("/tmp/second", 90)],
                 },
                 WindowGroup {
                     name: "Development 2".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![entry("/tmp/existing-suffix", 100)],
                 },
                 WindowGroup {
                     name: " Development ".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![entry("/tmp/fourth", 110)],
                 },
             ],
@@ -2587,10 +2662,14 @@ mod tests {
             window_groups: vec![
                 WindowGroup {
                     name: long_name.clone(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![entry("/tmp/long-first", 80)],
                 },
                 WindowGroup {
                     name: long_name.clone(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![entry("/tmp/long-second", 81)],
                 },
             ],
@@ -2610,6 +2689,8 @@ mod tests {
         let mut store = ProfileStore::defaults();
         let group = WindowGroup {
             name: "  Development  ".into(),
+            windows: Vec::new(),
+            active_window: 0,
             entries: vec![WindowGroupEntry {
                 profile: DEFAULT_PROFILE_NAME.into(),
                 working_directory: Some(" /tmp/project ".into()),
@@ -2631,6 +2712,8 @@ mod tests {
         assert_eq!(
             store.add_window_group(WindowGroup {
                 name: "Development".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: DEFAULT_PROFILE_NAME.into(),
                     working_directory: None,
@@ -2645,6 +2728,8 @@ mod tests {
         assert_eq!(
             store.add_window_group(WindowGroup {
                 name: "bad".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: "missing".into(),
                     working_directory: None,
@@ -2659,6 +2744,8 @@ mod tests {
         assert_eq!(
             store.add_window_group(WindowGroup {
                 name: "bad-size".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: DEFAULT_PROFILE_NAME.into(),
                     working_directory: None,
@@ -2671,6 +2758,8 @@ mod tests {
         assert_eq!(
             store.add_window_group(WindowGroup {
                 name: "bad-directory".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: DEFAULT_PROFILE_NAME.into(),
                     working_directory: Some("relative/path".into()),
@@ -2687,6 +2776,8 @@ mod tests {
             assert_eq!(
                 store.add_window_group(WindowGroup {
                     name,
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: DEFAULT_PROFILE_NAME.into(),
                         working_directory: None,
@@ -2705,6 +2796,8 @@ mod tests {
             assert_eq!(
                 store.add_window_group(WindowGroup {
                     name: "invalid-directory".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: DEFAULT_PROFILE_NAME.into(),
                         working_directory: Some(directory),
@@ -2718,6 +2811,8 @@ mod tests {
         store
             .add_window_group(WindowGroup {
                 name: "Whitespace directory".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: DEFAULT_PROFILE_NAME.into(),
                     working_directory: Some("   ".into()),
@@ -2735,6 +2830,8 @@ mod tests {
                 "Whitespace directory",
                 WindowGroup {
                     name: "Renamed group".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: DEFAULT_PROFILE_NAME.into(),
                         working_directory: Some(format!("/{}", "x".repeat(4095))),
@@ -2754,6 +2851,8 @@ mod tests {
                 "Renamed group",
                 WindowGroup {
                     name: "Development".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: DEFAULT_PROFILE_NAME.into(),
                         working_directory: None,
@@ -2802,6 +2901,8 @@ mod tests {
         store
             .add_window_group(WindowGroup {
                 name: "Development".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: "Project".into(),
                     working_directory: None,
@@ -2819,5 +2920,81 @@ mod tests {
             })
         );
         assert!(store.profile("Project").is_some());
+    }
+
+    #[test]
+    fn window_groups_migrate_legacy_entries_and_round_trip_multiwindow_layouts() {
+        let legacy = serde_json::json!({
+            "profiles": [serde_json::to_value(TerminalProfile::homebrew()).unwrap()],
+            "window_groups": [{
+                "name": "Legacy",
+                "entries": [{"profile": "Homebrew", "columns": 80, "rows": 24}]
+            }]
+        });
+        let legacy = ProfileStore::load_from_str(&legacy.to_string()).unwrap();
+        let legacy_group = legacy.window_group("Legacy").unwrap();
+        assert_eq!(legacy_group.windows.len(), 1);
+        assert_eq!(legacy_group.windows[0].entries.len(), 1);
+
+        let mut store = ProfileStore::defaults();
+        store
+            .add_window_group(WindowGroup {
+                name: "Two windows".into(),
+                entries: Vec::new(),
+                windows: vec![
+                    WindowGroupWindow {
+                        active_tab: 1,
+                        entries: vec![
+                            WindowGroupEntry {
+                                profile: DEFAULT_PROFILE_NAME.into(),
+                                working_directory: Some("/tmp/one".into()),
+                                columns: 80,
+                                rows: 24,
+                            },
+                            WindowGroupEntry {
+                                profile: DEFAULT_PROFILE_NAME.into(),
+                                working_directory: Some("/tmp/two".into()),
+                                columns: 100,
+                                rows: 30,
+                            },
+                        ],
+                    },
+                    WindowGroupWindow {
+                        active_tab: 0,
+                        entries: vec![WindowGroupEntry {
+                            profile: DEFAULT_PROFILE_NAME.into(),
+                            working_directory: Some("/tmp/three".into()),
+                            columns: 120,
+                            rows: 40,
+                        }],
+                    },
+                ],
+                active_window: 1,
+            })
+            .unwrap();
+        let encoded = serde_json::to_string(&ProfileDocument {
+            default_profile: Some(store.selected().name.clone()),
+            profiles: store.profiles().to_vec(),
+            window_groups: store.window_groups().to_vec(),
+        })
+        .unwrap();
+        assert!(encoded.contains("\"windows\""));
+        let encoded_value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            encoded_value["window_groups"][0]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let restored = ProfileStore::load_from_str(&encoded).unwrap();
+        let group = restored.window_group("Two windows").unwrap();
+        assert_eq!(group.windows.len(), 2);
+        assert_eq!(group.active_window, 1);
+        assert_eq!(group.windows[0].active_tab, 1);
+        assert_eq!(
+            group.windows[1].entries[0].working_directory.as_deref(),
+            Some("/tmp/three")
+        );
     }
 }
