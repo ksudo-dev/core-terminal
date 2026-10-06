@@ -112,6 +112,11 @@ Core Terminal currently includes:
   fullscreen, and Ctrl+1 through Ctrl+9 tab switching
 - XML and binary plist import for supported `.terminal` fields, with
   deterministic export and clear fallback reporting for unsupported fields
+- Saved SSH and SFTP connection metadata with an explicit **Launch new
+  terminal** action. Records contain labels, host, user, port, protocol, and
+  an optional terminal profile only; Core Terminal does not store passwords,
+  tokens, or private keys. The installed OpenSSH client receives direct argv,
+  so its usual host-key and authentication prompts remain intact.
 - Visual bells, background notifications, exit notifications, and tab activity
   indicators where the desktop provides the required integration
 - JSON persistence under the user's XDG configuration directory

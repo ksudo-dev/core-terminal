@@ -6,6 +6,7 @@
 
 use crate::session_restore as restore;
 use crate::{
+    connections::{self, ConnectionStore, Protocol, SavedConnection},
     core::{self, SessionId, SessionManager},
     profiles::{
         AskBeforeClosePolicy, BackgroundImageMode, CloseOnExit, CursorShape, KeyMapping,
@@ -93,16 +94,17 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        adjust_font_scale, clear_inspector_overrides, compatibility_profile, dropped_file_paths,
-        format_dropped_paths, gio, inspector_title_override, is_supported_terminal_link,
-        menu_item_action, menu_item_action_and_target, menu_submenu_named,
-        migrate_legacy_profile_flags, replace_menu_model_contents, resolve_new_tab_profile,
-        resolve_window_profile, runtime_profile_requires_reapply,
-        runtime_terminal_settings_changed, set_inspector_overrides, settings_page_ids,
-        shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
-        startup_window_group, terminal_menu_labels, terminal_menu_model,
-        window_group_entry_summary, PathBuf, ProfileStore, SessionManager, Settings,
-        SpawnCallbackAction, WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        adjust_font_scale, clear_inspector_overrides, compatibility_profile,
+        connection_profile_or_fallback, dropped_file_paths, format_dropped_paths, gio,
+        inspector_title_override, is_supported_terminal_link, menu_item_action,
+        menu_item_action_and_target, menu_submenu_named, migrate_legacy_profile_flags,
+        replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
+        runtime_profile_requires_reapply, runtime_terminal_settings_changed,
+        set_inspector_overrides, settings_page_ids, shell_escape_for_paste, spawn_callback_action,
+        startup_profile_after_deletion, startup_window_group, terminal_menu_labels,
+        terminal_menu_model, window_group_entry_summary, PathBuf, ProfileStore, SessionManager,
+        Settings, SpawnCallbackAction, WindowGroup, WindowGroupEntry, APPLICATION_ID,
+        PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -110,6 +112,15 @@ mod structural_tests {
         assert_eq!(
             settings_page_ids(),
             &["general", "profiles", "window-groups", "encodings"]
+        );
+    }
+
+    #[test]
+    fn saved_connection_missing_profile_uses_current_profile() {
+        let profiles = ProfileStore::defaults();
+        assert_eq!(
+            connection_profile_or_fallback(&profiles, "removed profile"),
+            profiles.selected_name()
         );
     }
 
@@ -842,6 +853,7 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     );
     shell.append(Some("New Tab"), Some("win.new-tab"));
     shell.append(Some("New Command…"), Some("win.new-command"));
+    shell.append(Some("Saved SSH/SFTP Connections…"), Some("win.connections"));
     let new_tab_profiles = gio::Menu::new();
     for name in profiles.names() {
         append_string_target(
@@ -4971,6 +4983,7 @@ fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
                             None,
                             Some(saved),
                             None,
+                            None,
                         );
                         if index == active {
                             active_window = Some(window);
@@ -4998,7 +5011,16 @@ fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
                 }],
                 ..Default::default()
             };
-            build_session_window(app, display_name, false, None, None, Some(fallback), None);
+            build_session_window(
+                app,
+                display_name,
+                false,
+                None,
+                None,
+                Some(fallback),
+                None,
+                None,
+            );
             return;
         }
     }
@@ -5103,6 +5125,7 @@ struct TabLaunchSpec {
     working_directory: Option<String>,
     size: Option<(u32, u32)>,
     command: Option<String>,
+    explicit_argv: Option<Vec<String>>,
     run_command_inside_shell: bool,
     restore: bool,
     restored_text: String,
@@ -5115,6 +5138,7 @@ impl TabLaunchSpec {
             working_directory,
             size: None,
             command: None,
+            explicit_argv: None,
             run_command_inside_shell: true,
             restore: false,
             restored_text: String::new(),
@@ -5132,6 +5156,7 @@ impl TabLaunchSpec {
             working_directory,
             size: None,
             command: Some(command.into()),
+            explicit_argv: None,
             run_command_inside_shell,
             restore: false,
             restored_text: String::new(),
@@ -5144,6 +5169,7 @@ impl TabLaunchSpec {
             working_directory: entry.working_directory,
             size: Some((entry.columns, entry.rows)),
             command: None,
+            explicit_argv: None,
             run_command_inside_shell: true,
             restore: false,
             restored_text: String::new(),
@@ -5212,6 +5238,13 @@ fn resolve_new_tab_profile(
         .to_owned()
 }
 
+fn connection_profile_or_fallback(profiles: &ProfileStore, requested: &str) -> String {
+    profiles
+        .profile(requested)
+        .map(|_| requested.to_owned())
+        .unwrap_or_else(|| profiles.selected_name().to_owned())
+}
+
 /// Start the GTK application.  The application keeps terminal/session state
 /// in one small reference-counted model; VTE remains responsible for PTYs,
 /// rendering, selection, scrollback and terminal protocol handling.
@@ -5268,8 +5301,10 @@ fn build_window_with_profile_and_directory(
         requested_profile_override,
         None,
         None,
+        None,
     );
 }
+#[allow(clippy::too_many_arguments)]
 fn build_session_window(
     app: &gtk::Application,
     display_name: &str,
@@ -5278,6 +5313,7 @@ fn build_session_window(
     requested_profile_override: Option<String>,
     restored: Option<restore::WindowSnapshot>,
     saved_group_window: Option<WindowGroupWindow>,
+    initial_tab: Option<TabLaunchSpec>,
 ) -> gtk::ApplicationWindow {
     gtk::Window::set_default_icon_name(APPLICATION_ID);
     let mut profiles = load_user_profiles();
@@ -5473,6 +5509,8 @@ fn build_session_window(
         switch_tab_index(&state, active);
     } else if let Some(group) = startup_group {
         launch_window_group(&state, group);
+    } else if let Some(spec) = initial_tab {
+        open_tab_with_spec(&state, spec);
     } else {
         open_tab_with_spec(
             &state,
@@ -7836,6 +7874,11 @@ fn install_window_actions(
     new_command.connect_activate(move |_, _| show_new_command(&action_state));
     window.add_action(&new_command);
 
+    let connections = gio::SimpleAction::new("connections", None);
+    let action_state = state.clone();
+    connections.connect_activate(move |_, _| show_connections(&action_state));
+    window.add_action(&connections);
+
     let new_window_with_profile = gio::SimpleAction::new("new-window-with-profile", None);
     let action_state = state.clone();
     let action_app = app.clone();
@@ -8425,6 +8468,284 @@ fn clear_settings_window_if_current(
     }
 }
 
+/// Editor and explicit launcher for saved SSH/SFTP metadata. It never opens a
+/// connection by itself: the user must press Launch for one selected record.
+#[allow(deprecated)]
+fn show_connections(state: &Rc<RefCell<UiState>>) {
+    let parent = state.borrow().window.clone();
+    let window = gtk::Window::builder()
+        .title("Saved SSH/SFTP Connections")
+        .transient_for(&parent)
+        .destroy_with_parent(true)
+        .modal(false)
+        .default_width(700)
+        .default_height(480)
+        .build();
+    enforce_non_modal(&window);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.set_margin_start(18);
+    root.set_margin_end(18);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    let hint = gtk::Label::new(Some("Core Terminal stores no passwords, keys, or tokens. OpenSSH handles host-key and authentication prompts in the new terminal."));
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    root.append(&hint);
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.set_vexpand(true);
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_child(Some(&list));
+    scroll.set_vexpand(true);
+    root.append(&scroll);
+    let form = gtk::Grid::builder()
+        .column_spacing(8)
+        .row_spacing(8)
+        .build();
+    let label = gtk::Entry::new();
+    let host = gtk::Entry::new();
+    let user = gtk::Entry::new();
+    let port = gtk::Entry::new();
+    let profile = gtk::Entry::new();
+    port.set_text("22");
+    profile.set_placeholder_text(Some("Current profile fallback"));
+    let protocols = gtk::StringList::new(&["SSH", "SFTP"]);
+    let protocol = gtk::DropDown::new(Some(protocols), None::<&gtk::Expression>);
+    for (row, title, widget) in [
+        (0, "Label", label.clone().upcast::<gtk::Widget>()),
+        (1, "Host", host.clone().upcast()),
+        (2, "User", user.clone().upcast()),
+        (3, "Port", port.clone().upcast()),
+        (4, "Protocol", protocol.clone().upcast()),
+        (5, "Profile", profile.clone().upcast()),
+    ] {
+        let caption = gtk::Label::new(Some(title));
+        caption.set_xalign(0.0);
+        form.attach(&caption, 0, row, 1, 1);
+        form.attach(&widget, 1, row, 1, 1);
+    }
+    root.append(&form);
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.add_css_class("error");
+    root.append(&status);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    let aliases = gtk::Button::with_label("Read SSH aliases");
+    let save = gtk::Button::with_label("Save");
+    let delete = gtk::Button::with_label("Delete");
+    let launch = gtk::Button::with_label("Launch new terminal");
+    actions.append(&aliases);
+    actions.append(&delete);
+    actions.append(&save);
+    actions.append(&launch);
+    root.append(&actions);
+    window.set_child(Some(&root));
+
+    let store = Rc::new(RefCell::new(ConnectionStore::load_user()));
+    let selected = Rc::new(RefCell::new(None::<String>));
+    let refresh: Rc<dyn Fn()> = {
+        let list = list.clone();
+        let store = store.clone();
+        Rc::new(move || {
+            while let Some(row) = list.row_at_index(0) {
+                list.remove(&row);
+            }
+            for connection in &store.borrow().connections {
+                let protocol = match connection.protocol {
+                    Protocol::Ssh => "SSH",
+                    Protocol::Sftp => "SFTP",
+                };
+                let profile = if connection.profile.is_empty() {
+                    "current profile"
+                } else {
+                    &connection.profile
+                };
+                let summary = format!(
+                    "{} — {protocol} {}@{}:{} ({profile})",
+                    connection.label, connection.user, connection.host, connection.port
+                );
+                let row = gtk::ListBoxRow::new();
+                row.set_child(Some(&gtk::Label::new(Some(&summary))));
+                list.append(&row);
+            }
+        })
+    };
+    refresh();
+    let select_label = label.clone();
+    let select_host = host.clone();
+    let select_user = user.clone();
+    let select_port = port.clone();
+    let select_profile = profile.clone();
+    let select_protocol = protocol.clone();
+    let select_store = store.clone();
+    let select_selected = selected.clone();
+    list.connect_row_selected(move |_, row| {
+        let Some(row) = row else {
+            return;
+        };
+        let Some(connection) = select_store
+            .borrow()
+            .connections
+            .get(row.index() as usize)
+            .cloned()
+        else {
+            return;
+        };
+        *select_selected.borrow_mut() = Some(connection.label.clone());
+        select_label.set_text(&connection.label);
+        select_host.set_text(&connection.host);
+        select_user.set_text(&connection.user);
+        select_port.set_text(&connection.port.to_string());
+        select_profile.set_text(&connection.profile);
+        select_protocol.set_selected(if connection.protocol == Protocol::Ssh {
+            0
+        } else {
+            1
+        });
+    });
+    let alias_host = host.clone();
+    let alias_status = status.clone();
+    aliases.connect_clicked(move |_| {
+        let path = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ssh/config"));
+        match path
+            .and_then(|path| connections::read_ssh_host_aliases(path).ok())
+            .and_then(|aliases| aliases.into_iter().next())
+        {
+            Some(alias) => {
+                alias_host.set_text(&alias);
+                alias_status.set_text("Read a host alias; review and save it if desired.");
+            }
+            None => alias_status.set_text("No simple aliases were found in ~/.ssh/config."),
+        }
+    });
+    let save_store = store.clone();
+    let save_selected = selected.clone();
+    let save_refresh = refresh.clone();
+    let save_status = status.clone();
+    let save_label = label.clone();
+    let save_host = host.clone();
+    let save_user = user.clone();
+    let save_port = port.clone();
+    let save_protocol = protocol.clone();
+    let save_profile = profile.clone();
+    save.connect_clicked(move |_| {
+        let connection = SavedConnection {
+            label: save_label.text().to_string(),
+            host: save_host.text().to_string(),
+            user: save_user.text().to_string(),
+            port: save_port.text().parse().unwrap_or(0),
+            protocol: if save_protocol.selected() == 0 {
+                Protocol::Ssh
+            } else {
+                Protocol::Sftp
+            },
+            profile: save_profile.text().to_string(),
+        };
+        let old = save_selected.borrow().clone();
+        let result = save_store
+            .borrow_mut()
+            .upsert(connection.clone(), old.as_deref())
+            .and_then(|_| save_store.borrow().save_user());
+        match result {
+            Ok(()) => {
+                *save_selected.borrow_mut() = Some(connection.label);
+                save_status.set_text("Saved.");
+                save_refresh();
+            }
+            Err(error) => save_status.set_text(&error.to_string()),
+        }
+    });
+    let delete_store = store.clone();
+    let delete_selected = selected.clone();
+    let delete_refresh = refresh.clone();
+    let delete_status = status.clone();
+    delete.connect_clicked(move |_| {
+        if let Some(label) = delete_selected.borrow_mut().take() {
+            delete_store.borrow_mut().delete(&label);
+            match delete_store.borrow().save_user() {
+                Ok(()) => {
+                    delete_status.set_text("Deleted.");
+                    delete_refresh();
+                }
+                Err(error) => delete_status.set_text(&error.to_string()),
+            }
+        }
+    });
+    let launch_state = state.clone();
+    let launch_store = store.clone();
+    let launch_selected = selected.clone();
+    let launch_status = status.clone();
+    let launch_window = window.clone();
+    launch.connect_clicked(move |_| {
+        let Some(label) = launch_selected.borrow().clone() else {
+            launch_status.set_text("Select a saved connection first.");
+            return;
+        };
+        let Some(connection) = launch_store
+            .borrow()
+            .connections
+            .iter()
+            .find(|c| c.label == label)
+            .cloned()
+        else {
+            return;
+        };
+        let executable = match connections::resolve_client(connection.protocol) {
+            Ok(path) => path,
+            Err(error) => {
+                launch_status.set_text(&error.to_string());
+                return;
+            }
+        };
+        let argv = match connection.argv(&executable) {
+            Ok(argv) => argv,
+            Err(error) => {
+                launch_status.set_text(&error.to_string());
+                return;
+            }
+        };
+        let (app, display_name, requested_profile, profiles) = {
+            let state = launch_state.borrow();
+            (
+                state.window.application(),
+                state
+                    .window
+                    .title()
+                    .unwrap_or_else(|| "Core Terminal".into()),
+                connection.profile.clone(),
+                state.profiles.clone(),
+            )
+        };
+        let Some(app) = app else {
+            return;
+        };
+        let profile = connection_profile_or_fallback(&profiles, &requested_profile);
+        let spec = TabLaunchSpec {
+            profile_name: profile,
+            working_directory: None,
+            size: None,
+            command: None,
+            explicit_argv: Some(argv),
+            run_command_inside_shell: false,
+            restore: false,
+            restored_text: String::new(),
+        };
+        build_session_window(
+            &app,
+            &display_name,
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(spec),
+        );
+        launch_window.close();
+    });
+    window.present();
+}
+
 /// Launch every saved top-level window through the explicit tab/PTY path.
 /// Group entries never mutate or depend on normal new-tab preferences.
 fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
@@ -8451,6 +8772,7 @@ fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
             None,
             None,
             Some(group_window),
+            None,
         );
         if index == group.active_window {
             active = Some(window);
@@ -9100,6 +9422,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         working_directory,
         size,
         command,
+        explicit_argv,
         run_command_inside_shell,
         restore,
         mut restored_text,
@@ -9161,6 +9484,11 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
             spawn_options.custom_command = Some(command);
             spawn_options.run_command_inside_shell = run_command_inside_shell;
+        }
+        if let Some(argv) = explicit_argv.filter(|argv| !argv.is_empty()) {
+            // A connection launcher supplies a complete, validated argv. Do
+            // not route it through shell parsing or profile command text.
+            spawn_options.explicit_argv = Some(argv);
         }
         // Restoration must override every global, profile and explicit command merge.
         if restore {
