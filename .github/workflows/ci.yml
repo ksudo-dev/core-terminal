@@ -13,8 +13,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  PACKAGE_VERSION: 0.2.3-rc.1
-  DEB_VERSION: 0.2.3~rc1
+  PACKAGE_VERSION: 0.2.3-rc.2
+  DEB_VERSION: 0.2.3~rc2
 
 jobs:
   fmt:

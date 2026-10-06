@@ -125,8 +125,8 @@ and the Debian package.
 ## Debian package
 
 ```sh
-scripts/build-deb.sh 0.2.3~rc1
-deb=dist/core-terminal_0.2.3~rc1_$(dpkg --print-architecture).deb
+scripts/build-deb.sh 0.2.3~rc2
+deb=dist/core-terminal_0.2.3~rc2_$(dpkg --print-architecture).deb
 scripts/check-deb.sh "$deb"
 scripts/check-private-data.sh "$deb"
 scripts/security-audit.sh "$deb"

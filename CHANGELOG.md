@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3-rc.2
+
+- Add quoted native file-drop paste, saved SSH/SFTP connection launching, and
+  bounded read-only split scrollback snapshots.
+- Preserve saved multi-window layouts without replaying profile commands.
+
 ## 0.2.3-rc.1
 
 - Serialize session save and opt-out clear through a retained private advisory
