@@ -3,13 +3,13 @@
 Audit date: 2026-09-04
 
 This matrix compares the requested Terminal.app settings layout with Core
-Terminal 0.2.2 on Ubuntu GNOME Wayland. A control counts as implemented only
+Terminal 0.2.3-rc.1 on Ubuntu GNOME Wayland. A control counts as implemented only
 when it has a GTK control, persists its value, and changes application or VTE
 behavior. A value that is only stored does not count.
 
 ## Current status
 
-| Area | Status in 0.2.2 |
+| Area | Status in 0.2.3-rc.1 |
 | --- | --- |
 | Native terminal | GTK4 application with one VTE PTY per tab, login-shell startup, and child-process cleanup |
 | Windows and tabs | New window, new tab, profile-picked tabs, a New Command launcher, close tab, tab navigation, per-tab zoom, a per-window show/hide tab bar control, fullscreen, Ctrl+1 through Ctrl+9 switching, a standard menubar, and a terminal right-click menu with safe browser and mail links plus link-address copying |
@@ -37,8 +37,9 @@ outside this process.
 
 Implemented controls include startup profile, login shell path, optional
 custom command, new-window profile, new-tab profile, same-directory behavior,
-and Ctrl+1 through Ctrl+9 tab switching. The shell path must be an absolute
-path. A custom command runs through the login shell when that mode is selected.
+Ctrl+1 through Ctrl+9 tab switching, and opt-in session restoration. The shell
+path must be absolute. Custom commands apply to ordinary launches; restoration
+and recovery always start fresh shells after all command settings are resolved.
 
 ### Profiles
 
@@ -80,8 +81,9 @@ color escape handling are disabled and labeled as VTE-owned.
 
 The page exposes title text, optional background image and placement mode,
 title components, columns, rows, resize behavior, a read-only scrollback mirror,
-restored rows, and a bookmark field. VTE receives the requested columns and
-rows.
+optional recent-text restoration with a row limit, and a disabled bookmark
+metadata field. Text restoration requires General's session-restoration option.
+VTE receives the requested columns and rows.
 Profile, shell, directory, process-reported title, and dimensions feed each tab
 title. The top-level window title remains `Core Terminal` so the compositor
 titlebar stays stable and uncluttered. TTY and Ctrl-key title components are
@@ -177,6 +179,14 @@ validated before entering the child environment. VTE owns application keypad
 mode and UTF-8 decoding, so those controls are disabled and labeled. Visual
 bell output can be limited to profiles where the app's audible bell is off.
 
+### Session restoration
+
+Opt-in snapshots restore windows, tabs, current profile references, last-known
+folders, selections, and window geometry. Missing profiles and folders fall
+back safely. Saved output is sanitized and separated from the fresh shell.
+See [session restoration](../README.md#session-restoration) for privacy,
+retention, size limits, and periodic-save behavior.
+
 ### Window Groups
 
 The data model validates group names, profile references, directories, and
@@ -205,7 +215,7 @@ tab bar control; fullscreen; a New
 Command launcher with direct or shell execution; scrollback clearing; terminal
 reset; and an explicit Ctrl-C interrupt action. It does not claim parity for
 split panes,
-Inspector, marks and bookmarks, print or content export, dragged-file quoting,
+full macOS Inspector behavior, automatic command marks, print, dragged-file quoting,
 dragged-file quoting, remote-connection browsing, or a D-Bus automation API.
 These belong in a later feature plan rather than a release claim.
 
@@ -222,8 +232,8 @@ These belong in a later feature plan rather than a release claim.
   overrides for those modes.
 - Background blur and inactive-window blur depend on compositor APIs that are
   not portable across Wayland desktops.
-- The application can restore text and launch settings, not arbitrary live
-  process state after logout.
+- Session restoration reopens fresh shells and bounded display-only text; it
+  does not resume commands or running processes. Bookmark restoration is unavailable.
 - Apple fonts, symbols, icons, source, and undocumented private profile data
   are not redistributed.
 
@@ -258,9 +268,9 @@ cargo test --locked --all-targets --no-fail-fast
 cargo audit
 scripts/native-acceptance.sh target/release/core-terminal
 scripts/build-deb.sh
-scripts/check-deb.sh dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
-lintian --pedantic dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
-scripts/check-private-data.sh dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
+scripts/check-deb.sh dist/core-terminal_0.2.3~rc1_$(dpkg --print-architecture).deb
+lintian --pedantic dist/core-terminal_0.2.3~rc1_$(dpkg --print-architecture).deb
+scripts/check-private-data.sh dist/core-terminal_0.2.3~rc1_$(dpkg --print-architecture).deb
 ```
 
 Launch the installed package with `GDK_BACKEND=wayland` from the Ubuntu GNOME
@@ -274,3 +284,13 @@ desktop. Weston is not an acceptance environment for this project.
 - GNOME, [VTE Terminal API](https://gnome.pages.gitlab.gnome.org/vte/gtk4/class.Terminal.html)
 - Wayland, [XDG shell protocol](https://wayland.app/protocols/xdg-shell)
 - GL.iNet, [Comet Console Guide](https://docs.gl-inet.com/kvm/en/user_guide/gl-rm1/console_guide/)
+
+## Context menu update
+
+The menu now includes selection and word actions, safe URL handling, local
+folder sessions, manual-page lookup, encoded web search, and per-tab row
+marks and bookmarks. Shift+F10 and the Menu key also open it. Manual lookup
+requires man and apropos on PATH. Marks are session-only row anchors.
+Inspector changes the live profile and window grid, and shows verified
+process information read-only. It does not send process signals. macOS
+Dictionary and Services have no built-in Linux implementation.

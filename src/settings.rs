@@ -32,6 +32,8 @@ pub struct Settings {
     /// Empty starts one profile window; otherwise names a saved window group.
     #[serde(default)]
     pub startup_window_group: String,
+    #[serde(default)]
+    pub restore_session: bool,
     /// Profile selection policy for newly-created windows and tabs.
     #[serde(default = "default_new_window_profile")]
     pub new_window_profile: String,
@@ -139,6 +141,7 @@ impl Default for Settings {
             selected_profile: default_selected_profile(),
             startup_profile: default_selected_profile(),
             startup_window_group: String::new(),
+            restore_session: false,
             new_window_profile: default_new_window_profile(),
             new_tab_profile: default_new_tab_profile(),
             new_window_same_directory: false,
@@ -365,6 +368,19 @@ pub enum SettingsError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn session_restore_is_opt_in_and_round_trips() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.restore_session);
+        assert!(!Settings::default().restore_session);
+        let settings = Settings {
+            restore_session: true,
+            ..Settings::default()
+        };
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: Settings = serde_json::from_str(&saved).unwrap();
+        assert!(loaded.normalize().restore_session);
+    }
     #[test]
     fn defaults_start_with_homebrew() {
         assert_eq!(Settings::default().selected_profile, DEFAULT_PROFILE_NAME);

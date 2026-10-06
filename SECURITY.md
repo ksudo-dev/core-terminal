@@ -2,7 +2,8 @@
 
 ## Supported versions
 
-Version 0.2.2 is the supported release line. Older package files are not
+Version 0.2.3-rc.1 is the current local release-candidate line; it is not a
+published supported release. Older package files are not
 maintained.
 
 ## Reporting a vulnerability
