@@ -3254,11 +3254,22 @@ impl SettingsControls {
                 let group = WindowGroup {
                     name: new_name.clone(),
                     entries: Vec::new(),
-                    windows: vec![WindowGroupWindow {
-                        active_tab: 0,
-                        entries: edited_entries,
-                    }],
-                    active_window: 0,
+                    windows: vec![
+                        WindowGroupWindow {
+                            active_tab: 1,
+                            entries: edited_entries,
+                        },
+                        WindowGroupWindow {
+                            active_tab: 0,
+                            entries: vec![WindowGroupEntry {
+                                profile: "Acceptance Profile".into(),
+                                working_directory: Some("/tmp/core-terminal-third".into()),
+                                columns: 120,
+                                rows: 40,
+                            }],
+                        },
+                    ],
+                    active_window: 1,
                 };
                 let result = store.borrow_mut().rename_window_group(&old_name, group);
                 result.map_err(|error| error.to_string())?;
@@ -7394,8 +7405,10 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             .as_ref()
             .and_then(|store| store.window_group("Acceptance Group"))
             .is_some_and(|group| {
-                group.entries.len() == 3
-                    && group.entries[1].working_directory.as_deref()
+                group.windows.len() == 2
+                    && group.active_window == 1
+                    && group.windows[0].active_tab == 1
+                    && group.windows[1].entries[0].working_directory.as_deref()
                         == Some("/tmp/core-terminal-third")
             });
         let standard_mappings_present = root
@@ -7419,31 +7432,85 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     && terminal.cjk_ambiguous_width() == 2
                     && !terminal.is_mouse_autohide()
             });
-        let (group_to_launch, sessions_before_group) = state
+        let (group_to_launch, windows_before_group) = state
             .try_borrow_mut()
             .map(|mut state| {
                 // Deliberately conflict with the group's profiles: explicit
                 // group entries must win over normal new-tab policy.
                 state.settings.new_tab_profile = "Ocean".into();
                 (
-                    state.profiles.window_group("Acceptance Group").cloned(),
-                    state.sessions.tabs().len(),
+                    Some(WindowGroup {
+                        name: "Acceptance launch probe".into(),
+                        entries: Vec::new(),
+                        windows: vec![
+                            WindowGroupWindow {
+                                active_tab: 1,
+                                entries: vec![
+                                    WindowGroupEntry {
+                                        profile: "Homebrew".into(),
+                                        working_directory: Some("/tmp".into()),
+                                        columns: 80,
+                                        rows: 24,
+                                    },
+                                    WindowGroupEntry {
+                                        profile: "Acceptance Profile".into(),
+                                        working_directory: None,
+                                        columns: 100,
+                                        rows: 30,
+                                    },
+                                ],
+                            },
+                            WindowGroupWindow {
+                                active_tab: 0,
+                                entries: vec![WindowGroupEntry {
+                                    profile: "Acceptance Profile".into(),
+                                    working_directory: Some("/tmp/core-terminal-third".into()),
+                                    columns: 120,
+                                    rows: 40,
+                                }],
+                            },
+                        ],
+                        active_window: 1,
+                    }),
+                    session_ui_states().len(),
                 )
             })
             .unwrap_or((None, 0));
         let group_launch_explicit = group_to_launch.is_some_and(|group| {
-            let expected = group.entries.clone();
+            let expected = group.windows.clone();
             launch_window_group(&state, group);
-            state.try_borrow().is_ok_and(|state| {
-                let launched = state.sessions.tabs().get(sessions_before_group..);
-                launched.is_some_and(|launched| {
-                    launched.len() == expected.len()
-                        && launched.iter().zip(&expected).all(|(tab, entry)| {
-                            tab.profile_name == entry.profile
-                                && tab.working_directory == entry.working_directory
+            wait_for_condition(Duration::from_secs(4), || {
+                session_ui_states().len() >= windows_before_group + expected.len()
+            }) && session_ui_states()
+                .into_iter()
+                .skip(windows_before_group)
+                .zip(expected.iter())
+                .all(|(launched, expected_window)| {
+                    let launched = launched.borrow();
+                    let active = launched.sessions.active().map(|tab| tab.id);
+                    let expected_active = expected_window
+                        .entries
+                        .get(expected_window.active_tab)
+                        .map(|entry| &entry.profile);
+                    launched.sessions.tabs().len() == expected_window.entries.len()
+                        && launched
+                            .sessions
+                            .tabs()
+                            .iter()
+                            .zip(&expected_window.entries)
+                            .all(|(tab, entry)| {
+                                tab.profile_name == entry.profile
+                                    && tab.working_directory == entry.working_directory
+                            })
+                        && expected_active.is_some_and(|profile| {
+                            active.is_some_and(|id| {
+                                launched
+                                    .sessions
+                                    .tab(id)
+                                    .is_some_and(|tab| tab.profile_name == *profile)
+                            })
                         })
                 })
-            })
         });
         let active_profile_synced_after_close = state
             .try_borrow()
