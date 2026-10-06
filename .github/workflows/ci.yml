@@ -13,7 +13,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  PACKAGE_VERSION: 0.2.2
+  PACKAGE_VERSION: 0.2.3-rc.1
+  DEB_VERSION: 0.2.3~rc1
 
 jobs:
   fmt:
@@ -81,14 +82,14 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             appstream build-essential desktop-file-utils dpkg-dev fakeroot \
             libgtk-4-dev libvte-2.91-gtk4-dev lintian pkg-config
-      - run: scripts/build-deb.sh "$PACKAGE_VERSION"
-      - run: scripts/check-deb.sh dist/core-terminal_${PACKAGE_VERSION}_$(dpkg --print-architecture).deb
-      - run: scripts/security-audit.sh dist/core-terminal_${PACKAGE_VERSION}_$(dpkg --print-architecture).deb
-      - run: lintian --pedantic dist/core-terminal_${PACKAGE_VERSION}_$(dpkg --print-architecture).deb
+      - run: scripts/build-deb.sh "$DEB_VERSION"
+      - run: scripts/check-deb.sh dist/core-terminal_${DEB_VERSION}_$(dpkg --print-architecture).deb
+      - run: scripts/security-audit.sh dist/core-terminal_${DEB_VERSION}_$(dpkg --print-architecture).deb
+      - run: lintian --pedantic dist/core-terminal_${DEB_VERSION}_$(dpkg --print-architecture).deb
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: core-terminal-deb
-          path: dist/core-terminal_${{ env.PACKAGE_VERSION }}_*.deb
+          path: dist/core-terminal_${{ env.DEB_VERSION }}_*.deb
 
   debian-13:
     needs: package
@@ -101,7 +102,7 @@ jobs:
           path: package
       - run: |
           apt-get update
-          apt-get install --no-install-recommends -y ./package/core-terminal_${PACKAGE_VERSION}_amd64.deb
+          apt-get install --no-install-recommends -y ./package/core-terminal_${DEB_VERSION}_amd64.deb
           dpkg --audit
           ldd /usr/bin/core-terminal
           ! ldd /usr/bin/core-terminal | grep -F 'not found'
@@ -262,7 +263,8 @@ jobs:
       - notices
       - sbom
       - cargo-audit
-    if: github.ref == 'refs/tags/v0.2.2'
+    # A local RC must never create a public release or attestation.
+    if: ${{ false }}
     runs-on: ubuntu-26.04
     permissions:
       actions: read

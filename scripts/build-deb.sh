@@ -2,12 +2,10 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-version=${1:-0.2.2}
 arch=$(dpkg --print-architecture)
 app_id=io.github.ksudo_dev.CoreTerminal
 build_root="$repo_root/target/debian/core-terminal"
 deps_root="$repo_root/target/debian/shlibdeps"
-deb_path="$repo_root/dist/core-terminal_${version}_${arch}.deb"
 
 if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
   SOURCE_DATE_EPOCH=$(git -C "$repo_root" show -s --format=%ct HEAD 2>/dev/null || printf '0')
@@ -23,21 +21,33 @@ if [[ ! -f "$repo_root/Cargo.toml" ]]; then
   exit 1
 fi
 
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+~.-][0-9A-Za-z.+~-]+)?$ ]]; then
-  echo "invalid Debian version: $version" >&2
-  exit 1
-fi
-
 manifest_package_id=$(cargo pkgid --manifest-path "$repo_root/Cargo.toml")
 if [[ "$manifest_package_id" == *"@"* ]]; then
   manifest_version=${manifest_package_id##*@}
 else
   manifest_version=${manifest_package_id##*#}
 fi
-if [[ "$manifest_version" != "$version" ]]; then
-  echo "package version $version does not match Cargo.toml version $manifest_version" >&2
+
+# Cargo uses SemVer prereleases (0.2.3-rc.1); Debian needs a tilde
+# prerelease (0.2.3~rc1) so the eventual 0.2.3 package supersedes this RC.
+if [[ "$manifest_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.([1-9][0-9]*)$ ]]; then
+  derived_debian_version="${BASH_REMATCH[1]}~rc${BASH_REMATCH[2]}"
+elif [[ "$manifest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  derived_debian_version="$manifest_version"
+else
+  echo "unsupported Cargo package version: $manifest_version" >&2
   exit 1
 fi
+version=${1:-$derived_debian_version}
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+~.-][0-9A-Za-z.+~-]+)?$ ]]; then
+  echo "invalid Debian version: $version" >&2
+  exit 1
+fi
+if [[ "$version" != "$derived_debian_version" ]]; then
+  echo "Debian package version $version does not match Cargo.toml $manifest_version (expected $derived_debian_version)" >&2
+  exit 1
+fi
+deb_path="$repo_root/dist/core-terminal_${version}_${arch}.deb"
 
 for required in \
   "$repo_root/packaging/core-terminal.desktop" \

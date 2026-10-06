@@ -29,6 +29,12 @@
   <url type="bugtracker">https://github.com/ksudo-dev/core-terminal/issues</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.2.3-rc.1" date="2026-10-05">
+      <description>
+        <p>Release candidate: safely serialize temporary session restoration
+        writes and opt-out cleanup without touching unrelated private state.</p>
+      </description>
+    </release>
     <release version="0.2.2" date="2026-09-04">
       <description>
         <p>Profile scrollback is canonical on the Text page, legacy global

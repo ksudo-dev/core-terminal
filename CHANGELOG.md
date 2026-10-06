@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3-rc.1
+
+- Serialize session save and opt-out clear through a retained private advisory
+  lock, including cleanup, atomic rename, and directory sync.
+- Preserve unrelated private state and snapshots; reject symlinks and remove
+  only strict Core Terminal interrupted temporary-file names.
+- Keep the native acceptance harness from treating terminated `/proc` entries
+  as live session children.
+
 ## 0.2.2
 
 Released 2026-09-04.
