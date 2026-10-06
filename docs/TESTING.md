@@ -125,8 +125,8 @@ and the Debian package.
 ## Debian package
 
 ```sh
-scripts/build-deb.sh 0.2.2
-deb=dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
+scripts/build-deb.sh 0.2.3~rc1
+deb=dist/core-terminal_0.2.3~rc1_$(dpkg --print-architecture).deb
 scripts/check-deb.sh "$deb"
 scripts/check-private-data.sh "$deb"
 scripts/security-audit.sh "$deb"
@@ -183,7 +183,6 @@ flatpak uninstall --user io.github.ksudo_dev.CoreTerminal
 
 ## GitHub release order
 
-The release workflow publishes only from a `v0.2.2` tag whose commit is already
-reachable from `main`. Merge the reviewed release branch into `main`, verify
-the commit on `main`, then create and push the tag. Do not tag an unmerged
-release branch: the workflow rejects it before publishing artifacts.
+This release candidate deliberately has no enabled publication workflow. Do not
+tag, push, or publish it. A later final release must restore a final package
+version and an explicit final-tag workflow condition after review.
