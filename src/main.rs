@@ -1,3 +1,4 @@
+mod appearance;
 mod context_menu;
 mod core;
 mod inspector;
