@@ -996,6 +996,7 @@ fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
     };
     let snapshot_state = Rc::downgrade(state);
     let profile_state = Rc::downgrade(state);
+    let reset_state = Rc::downgrade(state);
     let inspector = crate::inspector::build_inspector(
         &parent,
         &terminal,
@@ -1035,6 +1036,17 @@ fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
             drop(state_mut);
             sync_active_profile_ui(&state);
             update_tab_title(&state, id, &terminal);
+            true
+        },
+        move || {
+            let Some(state) = reset_state.upgrade() else {
+                return false;
+            };
+            let terminal = state.borrow().terminals.get(&id.get()).cloned();
+            let Some(terminal) = terminal else {
+                return false;
+            };
+            terminal.reset(false, false);
             true
         },
     );

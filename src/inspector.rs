@@ -48,6 +48,7 @@ struct InspectorView {
     columns: gtk::SpinButton,
     rows: gtk::SpinButton,
     resize: gtk::Button,
+    reset: gtk::Button,
     resize_note: gtk::Label,
     status: gtk::Label,
     size_edited: Cell<bool>,
@@ -61,15 +62,17 @@ struct InspectorView {
 ///
 /// Process information is deliberately read-only: exposing a signal control
 /// would require per-process identity checks and a separate confirmation flow.
-pub(crate) fn build_inspector<F, P>(
+pub(crate) fn build_inspector<F, P, R>(
     parent: &gtk::ApplicationWindow,
     terminal: &vte4::Terminal,
     snapshot: F,
     apply_profile: P,
+    reset_terminal: R,
 ) -> gtk::Window
 where
     F: Fn() -> Option<InspectorSnapshot> + 'static,
     P: Fn(&str) -> bool + 'static,
+    R: Fn() -> bool + 'static,
 {
     let window = gtk::Window::builder()
         .title("Inspector")
@@ -129,6 +132,10 @@ where
     controls.append(&size_row);
     let resize_note = note("Resizing changes this window only. The desktop may limit its size.");
     controls.append(&resize_note);
+    let reset = gtk::Button::with_label("Reset Terminal");
+    reset.set_widget_name("inspector-reset-terminal");
+    reset.set_tooltip_text(Some("Reset terminal modes without clearing scrollback."));
+    controls.append(&reset);
     controls.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     let processes_heading = gtk::Label::new(Some("Processes"));
@@ -190,6 +197,7 @@ where
         columns,
         rows,
         resize,
+        reset,
         resize_note,
         status,
         size_edited: Cell::new(false),
@@ -280,6 +288,18 @@ where
         view.status.set_text(&format!(
             "Requested {columns} columns × {rows} rows. Current Size shows the actual result."
         ));
+    });
+    let reset_view = Rc::downgrade(&view);
+    view.reset.connect_clicked(move |_| {
+        let Some(view) = reset_view.upgrade() else {
+            return;
+        };
+        if reset_terminal() {
+            view.status
+                .set_text("Terminal modes reset; scrollback was preserved.");
+        } else {
+            close_session_view(&view);
+        }
     });
 
     // Only the timeout owns `view`; widget signal handlers hold weak references.
