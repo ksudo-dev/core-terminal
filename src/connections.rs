@@ -90,9 +90,16 @@ impl SavedConnection {
     pub fn argv(&self, executable: &Path) -> Result<Vec<String>, ConnectionError> {
         self.validate()?;
         let target = format!("{}@{}", self.user.trim(), self.host.trim());
+        // OpenSSH uses a lowercase port option for ssh but an uppercase one
+        // for sftp. Passing `-p` to sftp preserves file attributes instead of
+        // accepting a port, which would make the numeric value a destination.
+        let port_flag = match self.protocol {
+            Protocol::Ssh => "-p",
+            Protocol::Sftp => "-P",
+        };
         Ok(vec![
             executable.to_string_lossy().into_owned(),
-            "-p".into(),
+            port_flag.into(),
             self.port.to_string(),
             "--".into(),
             target,
@@ -178,6 +185,10 @@ impl ConnectionStore {
     pub fn save_user(&self) -> Result<(), ConnectionError> {
         let path = Self::config_path()
             .ok_or_else(|| ConnectionError::Io("no user config directory is available".into()))?;
+        self.save(path)
+    }
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConnectionError> {
+        let path = path.as_ref();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| ConnectionError::Io(e.to_string()))?;
         }
@@ -237,7 +248,7 @@ pub fn read_ssh_host_aliases(path: impl AsRef<Path>) -> io::Result<Vec<String>> 
 mod tests {
     use super::*;
     #[test]
-    fn argv_is_direct_and_option_safe() {
+    fn ssh_argv_uses_lowercase_port_flag_and_is_option_safe() {
         let connection = SavedConnection {
             label: "Build".into(),
             host: "nuc.lan".into(),
@@ -256,6 +267,21 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+    #[test]
+    fn sftp_argv_uses_uppercase_port_flag() {
+        let connection = SavedConnection {
+            label: "BuildFiles".into(),
+            host: "nuc.lan".into(),
+            user: "kasey".into(),
+            port: 2222,
+            protocol: Protocol::Sftp,
+            profile: "Ocean".into(),
+        };
+        assert_eq!(
+            connection.argv(Path::new("/usr/bin/sftp")).unwrap(),
+            ["/usr/bin/sftp", "-P", "2222", "--", "kasey@nuc.lan"]
+        );
     }
     #[test]
     fn controls_and_duplicate_labels_are_rejected() {
@@ -285,6 +311,40 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+    #[test]
+    fn upsert_save_persists_and_allows_repeated_edits() {
+        let root = std::env::temp_dir().join(format!(
+            "core-terminal-connections-save-{}",
+            std::process::id()
+        ));
+        let path = root.join("connections.json");
+        let mut store = ConnectionStore::default();
+        let initial = SavedConnection {
+            label: "NUC".into(),
+            host: "nuc.lan".into(),
+            user: "kasey".into(),
+            port: 22,
+            protocol: Protocol::Ssh,
+            profile: "Ocean".into(),
+        };
+        store.upsert(initial.clone(), None).unwrap();
+        store.save(&path).unwrap();
+
+        let mut reloaded = ConnectionStore::load(&path).unwrap();
+        let edited = SavedConnection {
+            port: 2222,
+            protocol: Protocol::Sftp,
+            ..initial
+        };
+        reloaded.upsert(edited.clone(), Some("NUC")).unwrap();
+        reloaded.save(&path).unwrap();
+
+        assert_eq!(
+            ConnectionStore::load(&path).unwrap().connections,
+            vec![edited]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn persistence_round_trip_and_profile_fallback_field() {
