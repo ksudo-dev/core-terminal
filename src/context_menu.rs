@@ -198,6 +198,23 @@ fn viewport_row(terminal: &vte4::Terminal, y: f64) -> i64 {
     (top + ((y - padding).max(0.0) / terminal.char_height().max(1) as f64).floor()) as i64
 }
 
+fn cursor_scrollback_row(cursor_row: i64, upper: f64, page_size: f64) -> i64 {
+    // VTE reports the cursor relative to the visible terminal rows. The
+    // adjustment's final page is the live bottom of scrollback, even while a
+    // reader has scrolled the viewport away from it.
+    ((upper - page_size).max(0.0) as i64).saturating_add(cursor_row.max(0))
+}
+
+fn automatic_mark_row(terminal: &vte4::Terminal) -> Option<i64> {
+    let adjustment = terminal.vadjustment()?;
+    let (_, cursor_row) = terminal.cursor_position();
+    Some(cursor_scrollback_row(
+        cursor_row,
+        adjustment.upper(),
+        adjustment.page_size(),
+    ))
+}
+
 fn action(group: &gio::SimpleActionGroup, name: &str, callback: impl Fn() + 'static) {
     let action = gio::SimpleAction::new(name, None);
     action.connect_activate(move |_, _| callback());
@@ -280,6 +297,21 @@ pub fn install(terminal: &vte4::Terminal, hooks: ContextMenuHooks) {
             }
             if let Some(redraw) = redraw.upgrade() {
                 redraw.queue_draw();
+            }
+        });
+    }
+    // VTE shell integration publishes this immediately before a shell starts
+    // a command. It is unavailable for shells that do not opt in, in which
+    // case manual marks continue to work unchanged.
+    {
+        let marks = marks.clone();
+        let gutter = gutter.downgrade();
+        terminal.connect_termprop_changed(Some("shell-preexec"), move |terminal, _| {
+            if let Some(row) = automatic_mark_row(terminal) {
+                marks.borrow_mut().mark(row, row, false);
+                if let Some(gutter) = gutter.upgrade() {
+                    gutter.queue_draw();
+                }
             }
         });
     }
@@ -718,6 +750,12 @@ mod tests {
         marks.remove(0, 10);
         assert!(!marks.contains(4, 9));
         assert_eq!(marks.next(20, true, false), None);
+    }
+
+    #[test]
+    fn automatic_marks_use_the_live_scrollback_page_not_the_viewport() {
+        assert_eq!(cursor_scrollback_row(3, 400.0, 24.0), 379);
+        assert_eq!(cursor_scrollback_row(-1, 12.0, 24.0), 0);
     }
     #[test]
     fn context_menu_has_platform_limits_and_conditional_targets() {
