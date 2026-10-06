@@ -22,7 +22,7 @@ use gtk::{gio, glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -93,14 +93,15 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        adjust_font_scale, clear_inspector_overrides, compatibility_profile,
-        inspector_title_override, is_supported_terminal_link, menu_item_action,
-        menu_item_action_and_target, menu_submenu_named, migrate_legacy_profile_flags,
-        replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
-        runtime_profile_requires_reapply, runtime_terminal_settings_changed,
-        set_inspector_overrides, settings_page_ids, shell_escape_for_paste, spawn_callback_action,
-        startup_profile_after_deletion, startup_window_group, terminal_menu_labels,
-        terminal_menu_model, window_group_entry_summary, ProfileStore, SessionManager, Settings,
+        adjust_font_scale, clear_inspector_overrides, compatibility_profile, dropped_file_paths,
+        format_dropped_paths, gio, inspector_title_override, is_supported_terminal_link,
+        menu_item_action, menu_item_action_and_target, menu_submenu_named,
+        migrate_legacy_profile_flags, replace_menu_model_contents, resolve_new_tab_profile,
+        resolve_window_profile, runtime_profile_requires_reapply,
+        runtime_terminal_settings_changed, set_inspector_overrides, settings_page_ids,
+        shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
+        startup_window_group, terminal_menu_labels, terminal_menu_model,
+        window_group_entry_summary, PathBuf, ProfileStore, SessionManager, Settings,
         SpawnCallbackAction, WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
@@ -302,6 +303,49 @@ mod structural_tests {
         assert_eq!(shell_escape_for_paste("hello world"), "'hello world'");
         assert_eq!(shell_escape_for_paste("a'b"), "'a'\\''b'");
         assert_eq!(shell_escape_for_paste(""), "''");
+    }
+
+    #[test]
+    fn dropped_paths_are_shell_quoted_separated_and_never_end_in_a_newline() {
+        let text = format_dropped_paths(&[
+            PathBuf::from("/tmp/with spaces"),
+            PathBuf::from("/tmp/it's-unicode-😀"),
+            PathBuf::from("/tmp/line\nbreak"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            text,
+            "'/tmp/with spaces' '/tmp/it'\\''s-unicode-😀' '/tmp/line\nbreak' "
+        );
+        assert!(text.ends_with(' '));
+        assert!(!text.ends_with('\n'));
+    }
+
+    #[test]
+    fn native_file_drop_acceptance_rejects_remote_and_mixed_payloads() {
+        let local = gio::File::for_path("/tmp/drop target");
+        let other_local = gio::File::for_path("/tmp/other");
+        let encoded_local = gio::File::for_uri("file:///tmp/space%20%E2%98%83");
+        let remote = gio::File::for_uri("https://example.invalid/not-a-file");
+
+        assert_eq!(
+            dropped_file_paths(&[local.clone(), other_local]),
+            Some(vec![
+                PathBuf::from("/tmp/drop target"),
+                PathBuf::from("/tmp/other"),
+            ])
+        );
+        assert_eq!(dropped_file_paths(&[remote]), None);
+        assert_eq!(
+            dropped_file_paths(&[encoded_local]),
+            Some(vec![PathBuf::from("/tmp/space ☃")])
+        );
+        assert_eq!(
+            dropped_file_paths(&[local, gio::File::for_uri("sftp://host/tmp/x")]),
+            None
+        );
+        assert_eq!(dropped_file_paths(&[]), None);
     }
 
     #[test]
@@ -9167,6 +9211,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         (id, terminal, spawn_options)
     };
     install_context_actions(&terminal, state, id);
+    install_terminal_file_drop(&terminal);
     sync_active_profile_ui(state);
     connect_terminal_shortcuts(&terminal, state.clone(), id);
     let title_state = state.clone();
@@ -9891,6 +9936,74 @@ fn paste_escaped_clipboard(terminal: &vte4::Terminal) {
         };
         terminal.feed_child(shell_escape_for_paste(text.as_str()).as_bytes());
     });
+}
+
+/// Accept native files from a GTK file-list drop. This deliberately only
+/// handles local `file:` objects: reading remote URIs here would turn a drag
+/// operation into unexpected network I/O, and their URI text is not a shell
+/// path. Reject the complete list if any item is unsuitable so a mixed drag
+/// cannot silently omit an argument.
+fn dropped_file_paths(files: &[gio::File]) -> Option<Vec<PathBuf>> {
+    (!files.is_empty())
+        .then(|| {
+            files
+                .iter()
+                .map(|file| {
+                    (file.is_native() && file.has_uri_scheme("file"))
+                        .then(|| file.path())
+                        .flatten()
+                        .filter(|path| path.is_absolute())
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten()
+}
+
+/// Format a native path list as POSIX-style shell words. A final space makes
+/// it easy to continue composing a command, but is never an Enter/newline.
+/// Embedded newlines remain inside single quotes, so they cannot terminate a
+/// quoted shell word; VTE's `paste_text` also uses its bracketed-paste path
+/// whenever the foreground program supports it.
+fn format_dropped_paths(paths: &[PathBuf]) -> Option<String> {
+    (!paths.is_empty())
+        .then(|| {
+            paths
+                .iter()
+                .map(|path| {
+                    path.is_absolute()
+                        .then(|| path.to_str())
+                        .flatten()
+                        .map(shell_escape_for_paste)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten()
+        .map(|paths| format!("{} ", paths.join(" ")))
+}
+
+/// Install a native GTK4 `GdkFileList` target for file-manager drops. We use
+/// VTE's paste API instead of `feed_child`: it preserves VTE safe/bracketed
+/// paste behaviour and never appends an execution-triggering line ending.
+fn install_terminal_file_drop(terminal: &vte4::Terminal) {
+    let target = gtk::DropTarget::new(
+        gtk::gdk::FileList::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    let drop_terminal = terminal.clone();
+    target.connect_drop(move |_, value, _, _| {
+        let Ok(files) = value.get::<gtk::gdk::FileList>() else {
+            return false;
+        };
+        let Some(paths) = dropped_file_paths(&files.files()) else {
+            return false;
+        };
+        let Some(text) = format_dropped_paths(&paths) else {
+            return false;
+        };
+        drop_terminal.paste_text(&text);
+        true
+    });
+    terminal.add_controller(target);
 }
 
 fn shell_escape_for_paste(text: &str) -> String {
