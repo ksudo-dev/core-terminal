@@ -105,10 +105,11 @@ mod structural_tests {
         replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
         runtime_profile_requires_reapply, runtime_terminal_settings_changed,
         set_inspector_overrides, settings_page_ids, shell_escape_for_paste, snapshot_row_bounds,
-        spawn_callback_action, startup_profile_after_deletion, startup_window_group,
-        terminal_menu_labels, terminal_menu_model, window_group_entry_summary, PathBuf,
-        ProfileStore, SessionManager, Settings, SpawnCallbackAction, WindowGroup, WindowGroupEntry,
-        APPLICATION_ID, PROFILE_PAGE_IDS,
+        spawn_callback_action, spawn_options_for_tab, startup_profile_after_deletion,
+        startup_window_group, terminal_menu_labels, terminal_menu_model,
+        window_group_entry_summary, PathBuf, ProfileStore, SessionManager, Settings,
+        SpawnCallbackAction, TerminalProfile, WindowGroup, WindowGroupEntry, APPLICATION_ID,
+        PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -662,6 +663,46 @@ mod structural_tests {
             .working_directory
             .as_deref()
             .is_some_and(|p| std::path::Path::new(p).is_absolute()));
+    }
+    #[test]
+    fn group_launch_suppresses_global_and_profile_commands() {
+        let settings = Settings {
+            use_custom_command: true,
+            custom_command: "global-sentinel".into(),
+            run_command_inside_shell: false,
+            ..Settings::default()
+        };
+        let mut profile = TerminalProfile::homebrew();
+        profile.shell_command = "profile-sentinel".into();
+        profile.run_inside_shell = false;
+        let with_profile = spawn_options_for_tab(&settings, Some(&profile), None, true);
+        let without_profile = spawn_options_for_tab(&settings, None, None, true);
+        assert_eq!(with_profile.custom_command, None);
+        assert!(with_profile.run_command_inside_shell);
+        assert_eq!(without_profile.custom_command, None);
+        assert!(without_profile.run_command_inside_shell);
+    }
+    #[test]
+    fn normal_new_tab_keeps_automatic_command_behavior() {
+        let settings = Settings {
+            use_custom_command: true,
+            custom_command: "global-sentinel".into(),
+            run_command_inside_shell: false,
+            ..Settings::default()
+        };
+        let mut profile = TerminalProfile::homebrew();
+        profile.shell_command = "profile-sentinel".into();
+        profile.run_inside_shell = false;
+        assert_eq!(
+            spawn_options_for_tab(&settings, None, None, false).custom_command,
+            Some("global-sentinel".into())
+        );
+        let profile_options = spawn_options_for_tab(&settings, Some(&profile), None, false);
+        assert_eq!(
+            profile_options.custom_command,
+            Some("profile-sentinel".into())
+        );
+        assert!(!profile_options.run_command_inside_shell);
     }
     #[test]
     fn restored_text_is_display_only_and_commands_are_cleared_last() {
@@ -5231,6 +5272,36 @@ impl TabLaunchSpec {
     }
 }
 
+fn spawn_options_for_tab(
+    settings: &Settings,
+    profile: Option<&TerminalProfile>,
+    working_directory: Option<&str>,
+    suppress_profile_command: bool,
+) -> core::SpawnOptions {
+    let mut spawn_options = core::SpawnOptions::from_settings(settings, working_directory);
+    if suppress_profile_command {
+        // Saved groups represent layout only. They must start fresh login
+        // shells instead of inheriting either global or profile commands.
+        spawn_options.custom_command = None;
+        spawn_options.run_command_inside_shell = true;
+    }
+    if let Some(profile) = profile {
+        let profile_options = core::SpawnOptions::from_profile(profile, working_directory);
+        spawn_options.terminal_type = profile_options.terminal_type;
+        if !profile.shell.trim().is_empty() {
+            spawn_options.shell = profile_options.shell;
+        }
+        if !suppress_profile_command && !profile.shell_command.trim().is_empty() {
+            spawn_options.custom_command = profile_options.custom_command;
+            spawn_options.run_command_inside_shell = profile_options.run_command_inside_shell;
+        }
+        if profile.set_locale_environment {
+            spawn_options.locale = profile_options.locale;
+        }
+    }
+    spawn_options
+}
+
 fn resolve_window_profile(
     settings: &Settings,
     profiles: &ProfileStore,
@@ -8701,10 +8772,11 @@ fn show_connections(state: &Rc<RefCell<UiState>>) {
             profile: save_profile.text().to_string(),
         };
         let old = save_selected.borrow().clone();
-        let result = save_store
-            .borrow_mut()
-            .upsert(connection.clone(), old.as_deref())
-            .and_then(|_| save_store.borrow().save_user());
+        let result = {
+            let mut store = save_store.borrow_mut();
+            store.upsert(connection.clone(), old.as_deref())
+        };
+        let result = result.and_then(|_| save_store.borrow().save_user());
         match result {
             Ok(()) => {
                 *save_selected.borrow_mut() = Some(connection.label);
@@ -9538,23 +9610,12 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         // precedence only when the profile actually specifies them, so the
         // global custom command and login shell remain useful for profiles
         // that leave those fields at their defaults.
-        let mut spawn_options =
-            core::SpawnOptions::from_settings(&state_mut.settings, working_directory.as_deref());
-        if let Some(profile) = &profile {
-            let profile_options =
-                core::SpawnOptions::from_profile(profile, working_directory.as_deref());
-            spawn_options.terminal_type = profile_options.terminal_type;
-            if !profile.shell.trim().is_empty() {
-                spawn_options.shell = profile_options.shell;
-            }
-            if !suppress_profile_command && !profile.shell_command.trim().is_empty() {
-                spawn_options.custom_command = profile_options.custom_command;
-                spawn_options.run_command_inside_shell = profile_options.run_command_inside_shell;
-            }
-            if profile.set_locale_environment {
-                spawn_options.locale = profile_options.locale;
-            }
-        }
+        let mut spawn_options = spawn_options_for_tab(
+            &state_mut.settings,
+            profile.as_ref(),
+            working_directory.as_deref(),
+            suppress_profile_command,
+        );
         if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
             spawn_options.custom_command = Some(command);
             spawn_options.run_command_inside_shell = run_command_inside_shell;
