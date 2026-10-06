@@ -4,6 +4,7 @@
 //! own the profile store and settings, then connect the returned controls to
 //! their session model.
 
+use crate::session_restore as restore;
 use crate::{
     core::{self, SessionId, SessionManager},
     profiles::{
@@ -96,7 +97,7 @@ mod structural_tests {
         replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
         runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
         shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
-        startup_window_group, terminal_context_menu, terminal_menu_labels, terminal_menu_model,
+        startup_window_group, terminal_menu_labels, terminal_menu_model,
         window_group_entry_summary, ProfileStore, SessionManager, Settings, SpawnCallbackAction,
         WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
@@ -183,28 +184,6 @@ mod structural_tests {
         ] {
             assert!(!is_supported_terminal_link(uri), "{uri}");
         }
-    }
-
-    #[test]
-    fn terminal_context_menu_targets_safe_link_actions() {
-        let menu = terminal_context_menu(Some("https://example.com/core-terminal"));
-        assert_eq!(
-            menu_item_action_and_target(&menu, "Open Link"),
-            Some((
-                "win.open-link".into(),
-                "https://example.com/core-terminal".into()
-            ))
-        );
-        assert_eq!(
-            menu_item_action_and_target(&menu, "Copy Link Address"),
-            Some((
-                "win.copy-link-address".into(),
-                "https://example.com/core-terminal".into()
-            ))
-        );
-        let unsafe_menu = terminal_context_menu(Some("file:///home/user/.ssh/id_ed25519"));
-        assert!(menu_item_action(&unsafe_menu, "Open Link").is_none());
-        assert!(menu_item_action(&unsafe_menu, "Copy Link Address").is_none());
     }
 
     #[test]
@@ -532,6 +511,56 @@ mod structural_tests {
     }
 
     #[test]
+    fn restored_launch_spec_cannot_replay_a_command() {
+        let spec = super::TabLaunchSpec::from_snapshot(crate::session_restore::TabSnapshot {
+            profile: "Missing profile".into(),
+            working_directory: None,
+            transcript: "display only".into(),
+        });
+        assert!(spec.restore);
+        assert!(spec.command.is_none());
+        assert_eq!(spec.restored_text, "display only");
+        assert!(spec
+            .working_directory
+            .as_deref()
+            .is_some_and(|p| std::path::Path::new(p).is_absolute()));
+    }
+    #[test]
+    fn restored_text_is_display_only_and_commands_are_cleared_last() {
+        let source = include_str!("ui.rs");
+        let start = source.rfind("fn open_tab_with_spec(").unwrap();
+        let end = source.rfind("fn show_child_exit_prompt(").unwrap();
+        let body = source[start..end].split_whitespace().collect::<String>();
+        let merged = body.find("ifletSome(command)=command.filter").unwrap();
+        let guarded = body.find("ifrestore{").unwrap();
+        assert!(merged < guarded);
+        assert_eq!(
+            body.rfind("spawn_options.custom_command="),
+            body.find("spawn_options.custom_command=None;")
+        );
+        assert!(body[guarded..].contains("filter(|p|p.restore_rows)"));
+        assert!(
+            body.find("terminal.feed(&restore::display_bytes").unwrap()
+                < body.find("core::spawn_terminal(").unwrap()
+        );
+        assert!(!body.contains("terminal.feed_child("));
+        assert!(body.contains("ifrestore&&!requested_profile_exists{restored_text.clear();}"));
+    }
+    #[test]
+    fn restore_controls_are_read_and_loaded() {
+        let source = include_str!("ui.rs");
+        let a = source.rfind("fn read_profile_widgets(").unwrap();
+        let b = source.rfind("fn load_profile_widgets(").unwrap();
+        let reader = source[a..b].split_whitespace().collect::<String>();
+        assert!(reader.contains("profile.restore_rows=value"));
+        assert!(reader.contains("profile.restore_rows_limit=valueasu32"));
+        let c = source
+            .rfind("fn sync_profile_control_sensitivity(")
+            .unwrap();
+        let loader = source[b..c].split_whitespace().collect::<String>();
+        assert!(loader.contains("(\"profile-restore-rows\",profile.restore_rows)"));
+    }
+    #[test]
     fn profile_reader_preserves_permanently_unavailable_fields() {
         let source = include_str!("ui.rs");
         let start = source
@@ -552,8 +581,6 @@ mod structural_tests {
             "\"profile-title-show-tty\"",
             "\"profile-title-show-ctrl-key\"",
             "\"profile-smooth-resize\"",
-            "\"profile-restore-rows\"",
-            "\"profile-restore-rows-limit\"",
             "\"profile-restore-bookmark\"",
             "\"profile-alt-scroll\"",
             "\"profile-keypad\"",
@@ -633,7 +660,6 @@ mod structural_tests {
             "\"profile-tab-show-ctrl-key\"",
             "\"profile-title-show-tty\"",
             "\"profile-title-show-ctrl-key\"",
-            "\"profile-restore-rows\"",
         ] {
             assert!(
                 !loader.contains(name),
@@ -880,47 +906,139 @@ fn is_supported_terminal_link(uri: &str) -> bool {
         )
 }
 
-fn terminal_context_menu(link: Option<&str>) -> gio::Menu {
-    let menu = gio::Menu::new();
-    if let Some(link) = link.filter(|link| is_supported_terminal_link(link)) {
-        let open_item = gio::MenuItem::new(Some("Open Link"), None);
-        open_item.set_action_and_target_value(Some("win.open-link"), Some(&link.to_variant()));
-        menu.append_item(&open_item);
-        let copy_item = gio::MenuItem::new(Some("Copy Link Address"), None);
-        copy_item
-            .set_action_and_target_value(Some("win.copy-link-address"), Some(&link.to_variant()));
-        menu.append_item(&copy_item);
-    }
-    menu.append(Some("Copy"), Some("win.copy"));
-    menu.append(Some("Copy as HTML"), Some("win.copy-html"));
-    menu.append(Some("Paste"), Some("win.paste"));
-    menu.append(Some("Paste Selection"), Some("win.paste-selection"));
-    menu.append(Some("Paste Escaped"), Some("win.paste-escaped"));
-    menu.append(Some("Select All"), Some("win.select-all"));
-    menu.append(Some("Find"), Some("win.search"));
-    menu.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
-    menu.append(Some("Export Text…"), Some("win.export-text"));
-    menu.append(Some("New Tab"), Some("win.new-tab"));
-    menu.append(Some("Close Tab"), Some("win.close-tab"));
-    menu
+fn install_context_actions(terminal: &vte4::Terminal, state: &Rc<RefCell<UiState>>, id: SessionId) {
+    let directory_state = Rc::downgrade(state);
+    let new_state = Rc::downgrade(state);
+    let inspector_state = Rc::downgrade(state);
+    let paste_state = Rc::downgrade(state);
+    let paste_terminal = terminal.downgrade();
+    crate::context_menu::install(
+        terminal,
+        crate::context_menu::ContextMenuHooks {
+            directory: Box::new(move || {
+                let state = directory_state.upgrade()?;
+                let state = state.borrow();
+                state
+                    .sessions
+                    .tabs()
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .and_then(|tab| tab.working_directory.clone())
+            }),
+            new_session: Box::new(move |directory, argv, new_window| {
+                let Some(state) = new_state.upgrade() else {
+                    return;
+                };
+                let (app, profile) = {
+                    let state = state.borrow();
+                    (
+                        state.window.application(),
+                        resolve_new_tab_profile(&state.settings, &state.sessions, &state.profiles),
+                    )
+                };
+                if new_window {
+                    if let Some(app) = app {
+                        build_window_with_directory(&app, "Core Terminal", true, directory);
+                    }
+                } else {
+                    let spec = if let Some(argv) = argv {
+                        let command = argv
+                            .iter()
+                            .map(|arg| glib::shell_quote(arg).to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        TabLaunchSpec::with_command(profile, directory, command, false)
+                    } else {
+                        TabLaunchSpec::new(profile, directory)
+                    };
+                    open_tab_with_spec(&state, spec);
+                }
+            }),
+            inspector: Box::new(move || {
+                if let Some(state) = inspector_state.upgrade() {
+                    show_terminal_inspector(&state, id);
+                }
+            }),
+            paste: Box::new(move || {
+                let (Some(state), Some(terminal)) =
+                    (paste_state.upgrade(), paste_terminal.upgrade())
+                else {
+                    return;
+                };
+                let as_cr = {
+                    let state = state.borrow();
+                    state
+                        .sessions
+                        .tabs()
+                        .iter()
+                        .find(|tab| tab.id == id)
+                        .and_then(|tab| state.profiles.profile(&tab.profile_name))
+                        .is_some_and(|profile| profile.paste_newlines_as_cr)
+                };
+                if as_cr {
+                    paste_clipboard_with_carriage_returns(&terminal);
+                } else {
+                    terminal.paste_clipboard();
+                }
+            }),
+        },
+    );
 }
 
-fn install_terminal_context_menu(terminal: &vte4::Terminal) {
-    let popover = gtk::PopoverMenu::from_model(Some(&gio::Menu::new()));
-    popover.set_widget_name("terminal-context-menu");
-    popover.set_parent(terminal);
-    let click = gtk::GestureClick::builder().button(3).build();
-    let terminal_for_click = terminal.clone();
-    click.connect_pressed(move |_, _, x, y| {
-        let link = terminal_for_click
-            .check_hyperlink_at(x, y)
-            .map(|link| link.to_string());
-        let menu = terminal_context_menu(link.as_deref());
-        popover.set_menu_model(Some(&menu));
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        popover.popup();
-    });
-    terminal.add_controller(click);
+#[allow(deprecated)]
+fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
+    let (parent, terminal) = {
+        let state = state.borrow();
+        let Some(terminal) = state.terminals.get(&id.get()).cloned() else {
+            return;
+        };
+        (state.window.clone(), terminal)
+    };
+    let snapshot_state = Rc::downgrade(state);
+    let profile_state = Rc::downgrade(state);
+    let inspector = crate::inspector::build_inspector(
+        &parent,
+        &terminal,
+        move || {
+            let state = snapshot_state.upgrade()?;
+            let state = state.borrow();
+            let tab = state.sessions.tabs().iter().find(|tab| tab.id == id)?;
+            let terminal = state.terminals.get(&id.get())?;
+            Some(crate::inspector::InspectorSnapshot {
+                profile_names: state.profiles.names().map(str::to_owned).collect(),
+                profile_name: tab.profile_name.clone(),
+                title: terminal
+                    .window_title()
+                    .map(|title| title.to_string())
+                    .unwrap_or_default(),
+                working_directory: tab.working_directory.clone(),
+                process: state
+                    .child_process_identities
+                    .get(&id.get())
+                    .map(|child| core::running_process_identity(Some(terminal), child)),
+                pending: state.pending_spawns.contains(&id.get()),
+            })
+        },
+        move |profile_name| {
+            let Some(state) = profile_state.upgrade() else {
+                return false;
+            };
+            let mut state_mut = state.borrow_mut();
+            let Some(profile) = state_mut.profiles.profile(profile_name).cloned() else {
+                return false;
+            };
+            let Some(terminal) = state_mut.terminals.get(&id.get()).cloned() else {
+                return false;
+            };
+            state_mut.sessions.set_profile(id, &profile.name);
+            apply_profile(&terminal, &profile, &state_mut.settings);
+            drop(state_mut);
+            sync_active_profile_ui(&state);
+            update_tab_title(&state, id, &terminal);
+            true
+        },
+    );
+    inspector.present();
 }
 
 pub fn profile_selector(store: &ProfileStore, active_name: &str) -> gtk::DropDown {
@@ -1478,6 +1596,7 @@ where
             Settings {
                 schema_version: CURRENT_SCHEMA_VERSION,
                 startup_profile,
+                restore_session: controls.restore_session.is_active(),
                 startup_window_group: if controls.use_startup_group.is_active() {
                     dropdown_text(&controls.startup_window_group)
                         .filter(|name| name != "No groups saved")
@@ -1558,6 +1677,7 @@ struct SettingsControls {
     cancel_button: gtk::Button,
     startup_profile: gtk::DropDown,
     use_startup_group: gtk::CheckButton,
+    restore_session: gtk::CheckButton,
     startup_window_group: gtk::DropDown,
     new_window_profile: gtk::DropDown,
     new_tab_profile: gtk::DropDown,
@@ -1783,6 +1903,15 @@ impl SettingsControls {
             settings.new_window_same_directory,
         );
         general_grid.attach(&new_window_same_directory, 1, 10, 1, 1);
+        let restore_session = named_check(
+            "Restore windows and tabs when Core Terminal starts",
+            settings.restore_session,
+            "restore-session",
+        );
+        general_grid.attach(&restore_session, 1, 11, 1, 1);
+        let restore_hint=hint_label("Starts fresh shells in saved folders. Commands and programs are not resumed. Optional profile text may contain sensitive information. Saved sessions expire after seven days. Turning this off deletes the snapshot.");
+        general_grid.attach(&restore_hint, 1, 12, 1, 1);
+
         general.append(&general_grid);
         top_stack.add_titled(&scroll_page(&general), Some("general"), "General");
 
@@ -2235,20 +2364,27 @@ impl SettingsControls {
             bounded_scrollback.set_sensitive(!button.is_active());
         });
         window_page.0.append(&unlimited_scrollback);
-        window_page.0.append(&unavailable_check(
-            "Restore text after logout (live process state cannot be restored)",
+        let restore_rows = named_check(
+            "Restore recent text in fresh shells",
+            selected_defaults.restore_rows,
             "profile-restore-rows",
-        ));
+        );
+        restore_rows.set_tooltip_text(Some("Requires session restoration in General. Saved text may contain sensitive information. It is display-only; commands and programs are never resumed."));
+        window_page.0.append(&restore_rows);
         window_page.0.append(&unavailable_check(
             "Show live terminal contents in the dock (not portable across Linux docks)",
             "profile-minimized-dock-contents",
         ));
-        let restore_limit = gtk::SpinButton::with_range(1.0, 1_000_000.0, 100.0);
+        let restore_limit = gtk::SpinButton::with_range(100.0, 1_000_000.0, 100.0);
         restore_limit.set_widget_name("profile-restore-rows-limit");
         restore_limit.set_value(selected_defaults.restore_rows_limit as f64);
-        restore_limit.set_sensitive(false);
+        restore_limit.set_sensitive(selected_defaults.restore_rows);
+        let restore_limit_for_toggle = restore_limit.clone();
+        restore_rows.connect_toggled(move |button| {
+            restore_limit_for_toggle.set_sensitive(button.is_active())
+        });
         restore_limit.set_tooltip_text(Some(
-            "Live terminal text cannot be restored after logout on this platform.",
+            "At most 10,000 rows and 256 KiB per tab are saved; the session is also bounded.",
         ));
         window_page.0.append(&field_label("Restore rows limit"));
         window_page.0.append(&restore_limit);
@@ -2259,7 +2395,7 @@ impl SettingsControls {
         restore_bookmark.set_hexpand(true);
         restore_bookmark.set_sensitive(false);
         restore_bookmark.set_tooltip_text(Some(
-            "Live terminal text cannot be restored after logout on this platform.",
+            "Bookmark restoration is unavailable. Imported metadata is preserved.",
         ));
         window_page.0.append(&field_label("Restore bookmark"));
         window_page.0.append(&restore_bookmark);
@@ -3442,6 +3578,7 @@ impl SettingsControls {
             cancel_button,
             startup_profile: startup,
             use_startup_group,
+            restore_session,
             startup_window_group,
             new_window_profile,
             new_tab_profile,
@@ -3744,6 +3881,13 @@ fn read_profile_widgets(
     if let Some(value) = profile_spin(stack, "profile-rows") {
         profile.rows = value as u32;
     }
+    if let Some(value) = profile_check(stack, "profile-restore-rows") {
+        profile.restore_rows = value;
+    }
+    if let Some(value) = profile_spin(stack, "profile-restore-rows-limit") {
+        profile.restore_rows_limit = value as u32;
+    }
+
     // `profile-scrollback` is the canonical visible control. The older
     // Window-page widget remains a disabled compatibility mirror and must not
     // be allowed to overwrite a lower value selected on the Text page.
@@ -3996,6 +4140,7 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
             profile.title_show_dimensions,
         ),
         ("profile-unlimited-scrollback", profile.scrollback_unlimited),
+        ("profile-restore-rows", profile.restore_rows),
         ("profile-run-inside-shell", profile.run_inside_shell),
         ("profile-option-meta", profile.option_as_meta),
         ("profile-delete-control-h", profile.delete_sends_control_h),
@@ -4025,6 +4170,10 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
 }
 
 fn sync_profile_control_sensitivity(stack: &gtk::Stack, profile: &TerminalProfile) {
+    if let Some(widget) = profile_widget(stack, "profile-restore-rows-limit") {
+        widget.set_sensitive(profile.restore_rows);
+    }
+
     if let Some(widget) = profile_widget(stack, "profile-run-inside-shell")
         .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok())
     {
@@ -4313,6 +4462,310 @@ fn profile_page_with_checks(
     (page, checks)
 }
 
+#[derive(Default)]
+struct SessionRestoreRuntime {
+    states: Vec<std::rc::Weak<RefCell<UiState>>>,
+    enabled: Option<bool>,
+    timer_started: bool,
+    last_saved: Option<restore::Snapshot>,
+}
+thread_local! {
+static SESSION_RESTORE_RUNTIME:RefCell<SessionRestoreRuntime>=RefCell::new(SessionRestoreRuntime::default());
+}
+static SESSION_RESTORE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+fn session_ui_states() -> Vec<Rc<RefCell<UiState>>> {
+    SESSION_RESTORE_RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        runtime.states.retain(|state| state.strong_count() > 0);
+        runtime
+            .states
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect()
+    })
+}
+fn register_session_state(state: &Rc<RefCell<UiState>>) {
+    let configured = state.borrow().settings.restore_session;
+    let (enabled, start) = SESSION_RESTORE_RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let enabled = *runtime.enabled.get_or_insert(configured);
+        runtime.states.push(Rc::downgrade(state));
+        let start = !runtime.timer_started;
+        runtime.timer_started = true;
+        (enabled, start)
+    });
+    state.borrow_mut().settings.restore_session = enabled;
+    if start {
+        glib::timeout_add_local(Duration::from_secs(15), || {
+            persist_session_snapshot(None);
+            glib::ControlFlow::Continue
+        });
+    }
+}
+fn set_session_restore_enabled(enabled: bool) -> Result<(), restore::RestoreError> {
+    let clear = SESSION_RESTORE_RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let clear = runtime.enabled == Some(true) && !enabled;
+        runtime.enabled = Some(enabled);
+        if !enabled {
+            runtime.last_saved = None;
+        }
+        clear
+    });
+    // Release state borrows before GTK can emit widget signals.
+    let editors = session_ui_states()
+        .into_iter()
+        .filter_map(|state| {
+            let mut state = state.borrow_mut();
+            state.settings.restore_session = enabled;
+            state
+                .settings_window
+                .as_ref()
+                .and_then(glib::WeakRef::upgrade)
+        })
+        .collect::<Vec<_>>();
+    for editor in editors {
+        if let Some(button) =
+            find_widget_by_name(&editor.upcast::<gtk::Widget>(), "restore-session")
+                .and_downcast::<gtk::CheckButton>()
+        {
+            button.set_active(enabled);
+        }
+    }
+    if clear {
+        restore::clear_user()?;
+    }
+    Ok(())
+}
+fn capture_restore_text(terminal: &vte4::Terminal, requested: u32) -> String {
+    let columns = usize::try_from(terminal.column_count()).unwrap_or(1).max(1);
+    let byte_rows = (restore::MAX_TEXT_BYTES / columns.saturating_mul(4).max(1)).max(1);
+    let lines = (requested as usize)
+        .min(restore::MAX_TEXT_LINES)
+        .min(byte_rows);
+    if lines == 0 {
+        return String::new();
+    }
+    let (_, row) = terminal.cursor_position();
+    let end = row.max(0);
+    let start = end
+        .saturating_sub(lines.saturating_sub(1) as libc::c_long)
+        .max(0);
+    let (text, _) = terminal.text_range_format(
+        vte4::Format::Text,
+        start,
+        0,
+        end,
+        terminal.column_count().max(1),
+    );
+    text.map(|text| {
+        restore::sanitize_text(text.trim_end_matches('\n'), restore::MAX_TEXT_BYTES, lines)
+    })
+    .unwrap_or_default()
+}
+#[allow(deprecated)]
+fn snapshot_working_directory(state: &UiState, tab: &core::TerminalTab) -> Option<String> {
+    // Never use a Flatpak proxy cwd as the host shell cwd.
+    let native = state
+        .child_process_identities
+        .get(&tab.id.get())
+        .filter(|_| !core::running_in_flatpak())
+        .and_then(|identity| {
+            if core::child_process_identity(identity.pid()).as_ref() != Some(identity) {
+                return None;
+            }
+            let directory = std::fs::read_link(format!("/proc/{}/cwd", identity.pid().0)).ok()?;
+            if core::child_process_identity(identity.pid()).as_ref() != Some(identity) {
+                return None;
+            }
+            directory.to_str().map(str::to_owned)
+        });
+    let directory = native
+        .or_else(|| tab.working_directory.clone())
+        .or_else(|| {
+            state
+                .terminals
+                .get(&tab.id.get())
+                .and_then(|t| t.current_directory_uri())
+                .and_then(|uri| gio::File::for_uri(&uri).path())
+                .and_then(|p| p.to_str().map(str::to_owned))
+        });
+    restore::directory_or_home(directory.as_deref(), std::env::var("HOME").ok().as_deref())
+}
+fn persist_session_snapshot(closing: Option<&Rc<RefCell<UiState>>>) {
+    if !SESSION_RESTORE_RUNTIME.with(|r| r.borrow().enabled == Some(true)) {
+        return;
+    }
+    let states = session_ui_states();
+    // Defer rather than silently persist a partial window collection.
+    let Ok(borrowed) = states
+        .iter()
+        .map(|s| s.try_borrow())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return;
+    };
+    let live = borrowed
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.closing && !s.sessions.is_empty())
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    let exclude_closing = live.len() > 1;
+    let profiles = load_user_profiles();
+    let mut windows = Vec::new();
+    let mut active_window = SESSION_RESTORE_RUNTIME.with(|r| {
+        r.borrow()
+            .last_saved
+            .as_ref()
+            .map(|s| s.active_window)
+            .unwrap_or(0)
+    });
+    let mut remaining = restore::MAX_TABS;
+    let mut directory_updates = Vec::new();
+    for index in live {
+        if exclude_closing && closing.is_some_and(|s| Rc::ptr_eq(s, &states[index])) {
+            continue;
+        }
+        if windows.len() == restore::MAX_WINDOWS || remaining == 0 {
+            break;
+        }
+        let state = &borrowed[index];
+        let tabs = state
+            .sessions
+            .tabs()
+            .iter()
+            .take(remaining)
+            .map(|tab| {
+                let transcript = profiles
+                    .profile(&tab.profile_name)
+                    .filter(|p| p.restore_rows)
+                    .and_then(|p| {
+                        state
+                            .terminals
+                            .get(&tab.id.get())
+                            .map(|t| capture_restore_text(t, p.restore_rows_limit))
+                    })
+                    .unwrap_or_default();
+                let working_directory = snapshot_working_directory(state, tab);
+                if let Some(directory) = &working_directory {
+                    directory_updates.push((index, tab.id, directory.clone()));
+                }
+                restore::TabSnapshot {
+                    profile: tab.profile_name.clone(),
+                    working_directory,
+                    transcript,
+                }
+            })
+            .collect::<Vec<_>>();
+        remaining -= tabs.len();
+        let active_tab = state
+            .sessions
+            .active()
+            .and_then(|a| state.sessions.tabs().iter().position(|t| t.id == a.id))
+            .unwrap_or(0)
+            .min(tabs.len().saturating_sub(1));
+        if state.window.is_active() {
+            active_window = windows.len();
+        }
+        windows.push(restore::WindowSnapshot {
+            active_tab,
+            tabs,
+            width: if state.window.width() >= 320 {
+                state.window.width()
+            } else {
+                state.settings.window_width
+            },
+            height: if state.window.height() >= 240 {
+                state.window.height()
+            } else {
+                state.settings.window_height
+            },
+            maximized: state.window.is_maximized(),
+        });
+    }
+    drop(borrowed);
+    for (index, id, directory) in directory_updates {
+        if let Ok(mut state) = states[index].try_borrow_mut() {
+            if !state.closing && state.sessions.tab(id).is_some() {
+                state.sessions.set_working_directory(id, Some(&directory));
+            }
+        }
+    }
+    // Keep the last useful snapshot after the final window is destroyed.
+    if windows.is_empty() {
+        return;
+    }
+    let snapshot = match restore::Snapshot::new(windows, active_window).normalized() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Core Terminal: cannot prepare session restore: {e}");
+            return;
+        }
+    };
+    let changed = closing.is_some()
+        || SESSION_RESTORE_RUNTIME.with(|r| {
+            r.borrow().last_saved.as_ref().is_none_or(|old| {
+                old.windows != snapshot.windows
+                    || old.active_window != snapshot.active_window
+                    || restore::now_secs().saturating_sub(old.saved_at) >= 3600
+            })
+        });
+    if !changed {
+        return;
+    }
+    match restore::save_user(&snapshot) {
+        Ok(()) => SESSION_RESTORE_RUNTIME.with(|r| r.borrow_mut().last_saved = Some(snapshot)),
+        Err(e) => eprintln!("Core Terminal: cannot save session restore: {e}"),
+    }
+}
+fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
+    if !SESSION_RESTORE_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        let enabled = Settings::load_user().restore_session;
+        SESSION_RESTORE_RUNTIME.with(|r| r.borrow_mut().enabled = Some(enabled));
+        if enabled {
+            match restore::load_user() {
+                Ok(snapshot) if !snapshot.windows.is_empty() => {
+                    let active = snapshot.active_window.min(snapshot.windows.len() - 1);
+                    SESSION_RESTORE_RUNTIME
+                        .with(|r| r.borrow_mut().last_saved = Some(snapshot.clone()));
+                    let mut active_window = None;
+                    for (index, saved) in snapshot.windows.into_iter().enumerate() {
+                        let window =
+                            build_session_window(app, display_name, false, None, None, Some(saved));
+                        if index == active {
+                            active_window = Some(window);
+                        }
+                    }
+                    if let Some(window) = active_window {
+                        window.present();
+                    }
+                    return;
+                }
+                Err(restore::RestoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("Core Terminal: session restore ignored: {e}"),
+                _ => {}
+            }
+            // Missing or invalid resume data must not run configured commands either.
+            let settings = Settings::load_user();
+            let profiles = load_user_profiles();
+            let profile = resolve_window_profile(&settings, &profiles, false);
+            let fallback = restore::WindowSnapshot {
+                width: settings.window_width,
+                height: settings.window_height,
+                tabs: vec![restore::TabSnapshot {
+                    profile,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            build_session_window(app, display_name, false, None, None, Some(fallback));
+            return;
+        }
+    }
+    build_window(app, display_name, false);
+}
+
 struct UiState {
     profiles: ProfileStore,
     settings: Settings,
@@ -4375,6 +4828,8 @@ struct TabLaunchSpec {
     size: Option<(u32, u32)>,
     command: Option<String>,
     run_command_inside_shell: bool,
+    restore: bool,
+    restored_text: String,
 }
 
 impl TabLaunchSpec {
@@ -4385,6 +4840,8 @@ impl TabLaunchSpec {
             size: None,
             command: None,
             run_command_inside_shell: true,
+            restore: false,
+            restored_text: String::new(),
         }
     }
 
@@ -4400,6 +4857,8 @@ impl TabLaunchSpec {
             size: None,
             command: Some(command.into()),
             run_command_inside_shell,
+            restore: false,
+            restored_text: String::new(),
         }
     }
 
@@ -4410,6 +4869,19 @@ impl TabLaunchSpec {
             size: Some((entry.columns, entry.rows)),
             command: None,
             run_command_inside_shell: true,
+            restore: false,
+            restored_text: String::new(),
+        }
+    }
+    fn from_snapshot(tab: restore::TabSnapshot) -> Self {
+        let directory = restore::directory_or_home(
+            tab.working_directory.as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        );
+        Self {
+            restore: true,
+            restored_text: tab.transcript,
+            ..Self::new(tab.profile, directory)
         }
     }
 }
@@ -4477,7 +4949,7 @@ pub fn run(application_id: &str, display_name: &str) {
     });
     let display_name = display_name.to_owned();
     let activate_name = display_name.clone();
-    app.connect_activate(move |app| build_window(app, &activate_name, false));
+    app.connect_activate(move |app| activate_with_session_restore(app, &activate_name));
     // New-window is installed on each window so it can honor that window's
     // current directory policy. The application-level accelerator resolves
     // the action on the active window.
@@ -4511,6 +4983,23 @@ fn build_window_with_profile_and_directory(
     pending_working_directory: Option<String>,
     requested_profile_override: Option<String>,
 ) {
+    build_session_window(
+        app,
+        display_name,
+        new_window,
+        pending_working_directory,
+        requested_profile_override,
+        None,
+    );
+}
+fn build_session_window(
+    app: &gtk::Application,
+    display_name: &str,
+    new_window: bool,
+    pending_working_directory: Option<String>,
+    requested_profile_override: Option<String>,
+    restored: Option<restore::WindowSnapshot>,
+) -> gtk::ApplicationWindow {
     gtk::Window::set_default_icon_name(APPLICATION_ID);
     let mut profiles = load_user_profiles();
     let mut settings = Settings::load_user();
@@ -4534,8 +5023,18 @@ fn build_window_with_profile_and_directory(
         .application(app)
         .title(display_name)
         .icon_name(APPLICATION_ID)
-        .default_width(settings.window_width)
-        .default_height(settings.window_height)
+        .default_width(
+            restored
+                .as_ref()
+                .map(|s| s.width)
+                .unwrap_or(settings.window_width),
+        )
+        .default_height(
+            restored
+                .as_ref()
+                .map(|s| s.height)
+                .unwrap_or(settings.window_height),
+        )
         .build();
     if let Some(display) = gtk::gdk::Display::default() {
         install_style(&display);
@@ -4584,6 +5083,10 @@ fn build_window_with_profile_and_directory(
         pending_close_request: None,
         window_close_authorization: None,
     }));
+    register_session_state(&state);
+    if restored.as_ref().is_some_and(|s| s.maximized) {
+        window.maximize();
+    }
 
     let header = build_header_bar();
     header.set_widget_name("terminal-titlebar");
@@ -4672,7 +5175,15 @@ fn build_window_with_profile_and_directory(
         let state = state.borrow();
         startup_window_group(&state.profiles, &state.settings.startup_window_group)
     };
-    if let Some(group) = startup_group {
+    if let Some(restored) = restored {
+        let active = restored
+            .active_tab
+            .min(restored.tabs.len().saturating_sub(1));
+        for tab in restored.tabs {
+            open_tab_with_spec(&state, TabLaunchSpec::from_snapshot(tab));
+        }
+        switch_tab_index(&state, active);
+    } else if let Some(group) = startup_group {
         launch_window_group(&state, group);
     } else {
         open_tab_with_spec(
@@ -4710,6 +5221,7 @@ fn build_window_with_profile_and_directory(
     });
     window.present();
     schedule_acceptance_harness(app, &state);
+    window
 }
 
 /// Drive the same window/session helpers used by buttons and accelerators.
@@ -4780,7 +5292,10 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         let stat = std::str::from_utf8(&stat).ok()?;
         let fields = stat.rsplit_once(") ")?.1;
         let mut fields = fields.split_whitespace();
-        let _state = fields.next()?;
+        let state = fields.next()?;
+        if !acceptance_state_is_live(state) {
+            return None;
+        }
         let _parent = fields.next()?;
         let process_group = fields.next()?.parse().ok()?;
         let session = fields.next()?.parse().ok()?;
@@ -6479,7 +6994,6 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 "profile-tab-show-ctrl-key",
                 "profile-title-show-tty",
                 "profile-title-show-ctrl-key",
-                "profile-restore-rows",
             ]
             .into_iter()
             .all(|name| {
@@ -7430,6 +7944,7 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
     }
     let save_state = state.clone();
     let launch_state = state.clone();
+    let save_parent = parent.clone();
     let window = show_settings(
         &parent,
         &settings,
@@ -7479,8 +7994,13 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
             {
                 state.profile_dropdown.set_selected(index as u32);
             }
-            let _ = state.settings.save_user();
-            save_user_profiles(&state.profiles);
+            let settings_error = state.settings.save_user().err().map(|e| e.to_string());
+            let settings_saved = settings_error.is_none();
+            if !settings_saved {
+                state.settings.restore_session = old_settings.restore_session;
+                new_settings.restore_session = old_settings.restore_session;
+            }
+            let profiles_saved = save_user_profiles(&state.profiles);
             let terminals = state
                 .sessions
                 .tabs()
@@ -7500,6 +8020,22 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
                 })
                 .collect::<Vec<_>>();
             drop(state);
+            if let Some(error) = settings_error {
+                show_settings_error(&save_parent, "Settings could not be saved", error);
+            }
+            if !profiles_saved {
+                show_settings_error(&save_parent,"Profiles could not be saved","Profile changes were not persisted. Check configuration-directory access and try again.");
+            }
+            if settings_saved {
+                if let Err(error) = set_session_restore_enabled(new_settings.restore_session) {
+                    show_settings_error(
+                        &save_parent,
+                        "Saved session could not be deleted",
+                        error.to_string(),
+                    );
+                }
+                persist_session_snapshot(None);
+            }
             refresh_terminal_menu(&save_state);
             for (id, terminal, profile) in terminals {
                 reapply_profile_without_resize(&terminal, &profile, &new_settings);
@@ -8127,10 +8663,16 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         size,
         command,
         run_command_inside_shell,
+        restore,
+        mut restored_text,
     } = spec;
     let (id, terminal, spawn_options) = {
         let mut state_mut = state.borrow_mut();
-        let profile_name = if state_mut.profiles.profile(&requested_profile).is_some() {
+        let requested_profile_exists = state_mut.profiles.profile(&requested_profile).is_some();
+        if restore && !requested_profile_exists {
+            restored_text.clear();
+        }
+        let profile_name = if requested_profile_exists {
             requested_profile
         } else {
             resolve_new_tab_profile(
@@ -8156,7 +8698,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         // The profile grid supplies a useful natural size, but must never
         // turn its default columns and rows into a resize floor.
         terminal.set_size_request(1, 1);
-        install_terminal_context_menu(&terminal);
+
         // General settings provide the baseline. Profile-owned values take
         // precedence only when the profile actually specifies them, so the
         // global custom command and login shell remain useful for profiles
@@ -8182,6 +8724,23 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
             spawn_options.custom_command = Some(command);
             spawn_options.run_command_inside_shell = run_command_inside_shell;
         }
+        // Restoration must override every global, profile and explicit command merge.
+        if restore {
+            spawn_options.custom_command = None;
+            spawn_options.run_command_inside_shell = true;
+            restored_text = profile
+                .as_ref()
+                .filter(|p| p.restore_rows)
+                .map(|p| {
+                    restore::sanitize_text(
+                        &restored_text,
+                        restore::MAX_TEXT_BYTES,
+                        (p.restore_rows_limit as usize).min(restore::MAX_TEXT_LINES),
+                    )
+                })
+                .unwrap_or_default();
+        }
+
         let surface = terminal_surface(
             &terminal,
             profile
@@ -8213,6 +8772,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         }
         (id, terminal, spawn_options)
     };
+    install_context_actions(&terminal, state, id);
     sync_active_profile_ui(state);
     connect_terminal_shortcuts(&terminal, state.clone(), id);
     let title_state = state.clone();
@@ -8269,6 +8829,14 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
     // Connect all lifecycle observers before spawning. A direct command such
     // as `/bin/true` can exit before the next main-loop turn; registering the
     // child-exited handler only after spawn would lose that event.
+    if restore {
+        // Display-only bytes on a fresh UTF-8 terminal, before a PTY is attached.
+        if !restored_text.is_empty() {
+            terminal.feed(b"[Restored output, display only]\r\n");
+            terminal.feed(&restore::display_bytes(&restored_text));
+        }
+        terminal.feed(b"[Fresh shell starts here; commands were not resumed]\r\n");
+    }
     let spawn_state = state.clone();
     core::spawn_terminal(&terminal, &spawn_options, move |result| match result {
         Ok(pid) => {
@@ -9238,6 +9806,7 @@ fn confirm_close(state: &Rc<RefCell<UiState>>, request: CloseRequest, confirmed:
 }
 
 fn finish_window_close(state: &Rc<RefCell<UiState>>) {
+    persist_session_snapshot(Some(state));
     let child_identities = {
         let mut state = state.borrow_mut();
         state.closing = true;
@@ -9270,6 +9839,13 @@ fn finish_window_close(state: &Rc<RefCell<UiState>>) {
 }
 
 fn force_close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
+    if state
+        .try_borrow()
+        .is_ok_and(|s| s.sessions.tabs().len() == 1 && s.sessions.tab(id).is_some())
+    {
+        persist_session_snapshot(Some(state));
+    }
+
     let Ok(mut state_mut) = state.try_borrow_mut() else {
         return;
     };
@@ -9308,4 +9884,21 @@ fn stack_page_child(stack: &gtk::Stack, terminal: &vte4::Terminal) -> Option<gtk
         child = parent;
     }
     None
+}
+
+// Orphan zombies may persist under container PID 1 after successful termination.
+#[cfg(target_os = "linux")]
+fn acceptance_state_is_live(state: &str) -> bool {
+    !matches!(state, "Z" | "X" | "x")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn acceptance_process_liveness_excludes_terminated_states() {
+    for state in ["Z", "X", "x"] {
+        assert!(!acceptance_state_is_live(state));
+    }
+    for state in ["R", "S", "D", "T", "t", "I", "?"] {
+        assert!(acceptance_state_is_live(state));
+    }
 }
