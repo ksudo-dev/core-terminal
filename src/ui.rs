@@ -92,14 +92,15 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        adjust_font_scale, compatibility_profile, is_supported_terminal_link, menu_item_action,
+        adjust_font_scale, clear_inspector_overrides, compatibility_profile,
+        inspector_title_override, is_supported_terminal_link, menu_item_action,
         menu_item_action_and_target, menu_submenu_named, migrate_legacy_profile_flags,
         replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
-        runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
-        shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
-        startup_window_group, terminal_menu_labels, terminal_menu_model,
-        window_group_entry_summary, ProfileStore, SessionManager, Settings, SpawnCallbackAction,
-        WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        runtime_profile_requires_reapply, runtime_terminal_settings_changed,
+        set_inspector_overrides, settings_page_ids, shell_escape_for_paste, spawn_callback_action,
+        startup_profile_after_deletion, startup_window_group, terminal_menu_labels,
+        terminal_menu_model, window_group_entry_summary, ProfileStore, SessionManager, Settings,
+        SpawnCallbackAction, WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -124,6 +125,57 @@ mod structural_tests {
         assert_eq!(adjust_font_scale(1.1, -0.1), 1.0);
         assert_eq!(adjust_font_scale(0.5, -0.1), 0.5);
         assert_eq!(adjust_font_scale(2.0, 0.1), 2.0);
+    }
+
+    #[test]
+    fn inspector_overrides_apply_and_reset_without_changing_profiles() {
+        let profiles = ProfileStore::defaults();
+        let profile_snapshot = profiles.profiles().to_vec();
+        let mut sessions = SessionManager::empty();
+        let id = sessions.open_tab("Homebrew", None);
+        let mut overrides = std::collections::HashMap::new();
+        let background = gtk::gdk::RGBA::new(0.1, 0.2, 0.3, 1.0);
+
+        let applied =
+            set_inspector_overrides(&mut overrides, id, "  Build output\n", Some(background));
+        assert_eq!(applied.title.as_deref(), Some("Build output"));
+        assert!(applied.background.is_some());
+        assert_eq!(profiles.profiles(), profile_snapshot.as_slice());
+
+        clear_inspector_overrides(&mut overrides, id);
+        assert!(!overrides.contains_key(&id.get()));
+        assert_eq!(profiles.profiles(), profile_snapshot.as_slice());
+    }
+
+    #[test]
+    fn inspector_overrides_are_scoped_to_the_closed_tab() {
+        let mut sessions = SessionManager::empty();
+        let inspected = sessions.open_tab("Homebrew", None);
+        let sibling = sessions.open_tab("Homebrew", None);
+        let mut overrides = std::collections::HashMap::new();
+        set_inspector_overrides(&mut overrides, inspected, "Inspected", None);
+        set_inspector_overrides(&mut overrides, sibling, "Sibling", None);
+
+        clear_inspector_overrides(&mut overrides, inspected);
+        assert!(!overrides.contains_key(&inspected.get()));
+        assert_eq!(
+            overrides
+                .get(&sibling.get())
+                .and_then(|values| values.title.as_deref()),
+            Some("Sibling")
+        );
+    }
+
+    #[test]
+    fn inspector_title_override_is_bounded_and_control_free() {
+        assert_eq!(inspector_title_override(" \n "), None);
+        assert_eq!(inspector_title_override("A\u{1b}B"), Some("AB".into()));
+        assert_eq!(
+            inspector_title_override(&"x".repeat(300))
+                .as_deref()
+                .map(str::len),
+            Some(256)
+        );
     }
 
     #[test]
@@ -997,6 +1049,8 @@ fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
     let snapshot_state = Rc::downgrade(state);
     let profile_state = Rc::downgrade(state);
     let reset_state = Rc::downgrade(state);
+    let overrides_state = Rc::downgrade(state);
+    let reset_profile_state = Rc::downgrade(state);
     let inspector = crate::inspector::build_inspector(
         &parent,
         &terminal,
@@ -1018,6 +1072,14 @@ fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
                     .get(&id.get())
                     .map(|child| core::running_process_identity(Some(terminal), child)),
                 pending: state.pending_spawns.contains(&id.get()),
+                title_override: state
+                    .inspector_overrides
+                    .get(&id.get())
+                    .and_then(|overrides| overrides.title.clone()),
+                background_override: state
+                    .inspector_overrides
+                    .get(&id.get())
+                    .and_then(|overrides| overrides.background),
             })
         },
         move |profile_name| {
@@ -1032,6 +1094,7 @@ fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
                 return false;
             };
             state_mut.sessions.set_profile(id, &profile.name);
+            clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
             apply_profile(&terminal, &profile, &state_mut.settings);
             drop(state_mut);
             sync_active_profile_ui(&state);
@@ -1047,6 +1110,52 @@ fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
                 return false;
             };
             terminal.reset(false, false);
+            true
+        },
+        move |title, background| {
+            let Some(state) = overrides_state.upgrade() else {
+                return false;
+            };
+            let mut state_mut = state.borrow_mut();
+            let Some(profile) = state_mut
+                .sessions
+                .tab(id)
+                .and_then(|tab| state_mut.profiles.profile(&tab.profile_name))
+                .cloned()
+            else {
+                return false;
+            };
+            let Some(terminal) = state_mut.terminals.get(&id.get()).cloned() else {
+                return false;
+            };
+            let overrides =
+                set_inspector_overrides(&mut state_mut.inspector_overrides, id, &title, background);
+            apply_profile(&terminal, &profile, &state_mut.settings);
+            apply_inspector_background(&terminal, overrides.background);
+            drop(state_mut);
+            update_tab_title(&state, id, &terminal);
+            true
+        },
+        move || {
+            let Some(state) = reset_profile_state.upgrade() else {
+                return false;
+            };
+            let mut state_mut = state.borrow_mut();
+            let Some(profile) = state_mut
+                .sessions
+                .tab(id)
+                .and_then(|tab| state_mut.profiles.profile(&tab.profile_name))
+                .cloned()
+            else {
+                return false;
+            };
+            let Some(terminal) = state_mut.terminals.get(&id.get()).cloned() else {
+                return false;
+            };
+            clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
+            apply_profile(&terminal, &profile, &state_mut.settings);
+            drop(state_mut);
+            update_tab_title(&state, id, &terminal);
             true
         },
     );
@@ -4791,6 +4900,7 @@ struct UiState {
     tab_bar: gtk::Box,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
+    inspector_overrides: HashMap<u64, InspectorOverrides>,
     pending_spawns: HashSet<u64>,
     exited_before_spawn_callbacks: HashSet<u64>,
     child_process_identities: HashMap<u64, core::ChildProcessIdentity>,
@@ -4800,6 +4910,42 @@ struct UiState {
     active_close_request: Option<CloseRequest>,
     pending_close_request: Option<CloseRequest>,
     window_close_authorization: Option<core::ClosePlan>,
+}
+
+/// Runtime-only customizations owned by one terminal tab. These are never
+/// copied into a profile store or settings document.
+#[derive(Clone, Debug, Default)]
+struct InspectorOverrides {
+    title: Option<String>,
+    background: Option<gtk::gdk::RGBA>,
+}
+
+fn inspector_title_override(value: &str) -> Option<String> {
+    let title: String = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect();
+    (!title.is_empty()).then_some(title)
+}
+
+fn set_inspector_overrides(
+    overrides: &mut HashMap<u64, InspectorOverrides>,
+    id: SessionId,
+    title: &str,
+    background: Option<gtk::gdk::RGBA>,
+) -> InspectorOverrides {
+    let override_values = InspectorOverrides {
+        title: inspector_title_override(title),
+        background,
+    };
+    overrides.insert(id.get(), override_values.clone());
+    override_values
+}
+
+fn clear_inspector_overrides(overrides: &mut HashMap<u64, InspectorOverrides>, id: SessionId) {
+    overrides.remove(&id.get());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5086,6 +5232,7 @@ fn build_session_window(
         tab_bar: tab_bar.clone(),
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
+        inspector_overrides: HashMap::new(),
         pending_spawns: HashSet::new(),
         exited_before_spawn_callbacks: HashSet::new(),
         child_process_identities: HashMap::new(),
@@ -9068,7 +9215,7 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
             .map(|name| name.to_string_lossy().into_owned())
             .or_else(|| Some(directory.to_owned()))
     });
-    let (profile, active) = {
+    let (profile, active, title_override) = {
         let state = state.borrow();
         let profile = state
             .sessions
@@ -9076,7 +9223,11 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
             .and_then(|tab| state.profiles.profile(&tab.profile_name))
             .cloned();
         let active = state.sessions.active().is_some_and(|tab| tab.id == id);
-        (profile, active)
+        let title_override = state
+            .inspector_overrides
+            .get(&id.get())
+            .and_then(|overrides| overrides.title.clone());
+        (profile, active, title_override)
     };
     let Some(profile) = profile else {
         return;
@@ -9136,7 +9287,9 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
                 .unwrap_or_else(|| directory_name.as_deref().unwrap_or("Terminal")),
         );
     }
-    let tab_title = tab_parts.join(" — ");
+    let tab_title = title_override
+        .clone()
+        .unwrap_or_else(|| tab_parts.join(" — "));
 
     let mut state = state.borrow_mut();
     state.sessions.set_title(id, &tab_title);
@@ -9146,7 +9299,9 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
         }
     }
     if active {
-        state.window.set_title(Some("Core Terminal"));
+        state
+            .window
+            .set_title(Some(title_override.as_deref().unwrap_or("Core Terminal")));
     }
 }
 
@@ -9195,6 +9350,12 @@ fn terminal_surface(
 
 fn apply_profile(terminal: &vte4::Terminal, profile: &TerminalProfile, settings: &Settings) {
     apply_profile_properties(terminal, profile, settings, true);
+}
+
+fn apply_inspector_background(terminal: &vte4::Terminal, background: Option<gtk::gdk::RGBA>) {
+    if let Some(background) = background {
+        terminal.set_color_background(&background);
+    }
 }
 
 fn reapply_profile_without_resize(
@@ -9864,6 +10025,7 @@ fn force_close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
     };
     if let Some(tab) = state_mut.sessions.close_tab(id) {
         state_mut.pending_spawns.remove(&id.get());
+        clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
         let child_identity = state_mut.child_process_identities.remove(&id.get());
         state_mut.login_shell_identities.remove(&id.get());
         if tab.child_pid.is_some() {
