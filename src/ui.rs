@@ -4944,6 +4944,7 @@ pub fn run(application_id: &str, display_name: &str) {
         .application_id(application_id)
         .build();
     app.connect_startup(|app| {
+        crate::appearance::follow_system_appearance(app);
         let profiles = load_user_profiles();
         let _ = application_menu_model(app, &profiles);
     });
