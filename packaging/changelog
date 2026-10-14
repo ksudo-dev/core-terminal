@@ -1,3 +1,14 @@
+core-terminal (0.2.3~rc1) unstable; urgency=medium
+
+  * Serialize temporary session save and opt-out clear with a retained private
+    advisory lock, while preserving unrelated private state files.
+  * Reject session and lock symlinks and clean only recognized interrupted
+    application temporary files.
+  * Keep the native acceptance harness from treating terminated proc entries as
+    live children.
+
+ -- Kasey <211167966+ksudo-dev@users.noreply.github.com>  Mon, 05 Oct 2026 16:00:00 -0700
+
 core-terminal (0.2.2) unstable; urgency=medium
 
   * Restore the Text profile form and load its controls from the active
