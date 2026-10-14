@@ -96,7 +96,7 @@ mod structural_tests {
         replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
         runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
         shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
-        startup_window_group, terminal_context_menu, terminal_menu_labels, terminal_menu_model,
+        startup_window_group, terminal_menu_labels, terminal_menu_model,
         window_group_entry_summary, ProfileStore, SessionManager, Settings, SpawnCallbackAction,
         WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
     };
@@ -183,28 +183,6 @@ mod structural_tests {
         ] {
             assert!(!is_supported_terminal_link(uri), "{uri}");
         }
-    }
-
-    #[test]
-    fn terminal_context_menu_targets_safe_link_actions() {
-        let menu = terminal_context_menu(Some("https://example.com/core-terminal"));
-        assert_eq!(
-            menu_item_action_and_target(&menu, "Open Link"),
-            Some((
-                "win.open-link".into(),
-                "https://example.com/core-terminal".into()
-            ))
-        );
-        assert_eq!(
-            menu_item_action_and_target(&menu, "Copy Link Address"),
-            Some((
-                "win.copy-link-address".into(),
-                "https://example.com/core-terminal".into()
-            ))
-        );
-        let unsafe_menu = terminal_context_menu(Some("file:///home/user/.ssh/id_ed25519"));
-        assert!(menu_item_action(&unsafe_menu, "Open Link").is_none());
-        assert!(menu_item_action(&unsafe_menu, "Copy Link Address").is_none());
     }
 
     #[test]
@@ -880,47 +858,139 @@ fn is_supported_terminal_link(uri: &str) -> bool {
         )
 }
 
-fn terminal_context_menu(link: Option<&str>) -> gio::Menu {
-    let menu = gio::Menu::new();
-    if let Some(link) = link.filter(|link| is_supported_terminal_link(link)) {
-        let open_item = gio::MenuItem::new(Some("Open Link"), None);
-        open_item.set_action_and_target_value(Some("win.open-link"), Some(&link.to_variant()));
-        menu.append_item(&open_item);
-        let copy_item = gio::MenuItem::new(Some("Copy Link Address"), None);
-        copy_item
-            .set_action_and_target_value(Some("win.copy-link-address"), Some(&link.to_variant()));
-        menu.append_item(&copy_item);
-    }
-    menu.append(Some("Copy"), Some("win.copy"));
-    menu.append(Some("Copy as HTML"), Some("win.copy-html"));
-    menu.append(Some("Paste"), Some("win.paste"));
-    menu.append(Some("Paste Selection"), Some("win.paste-selection"));
-    menu.append(Some("Paste Escaped"), Some("win.paste-escaped"));
-    menu.append(Some("Select All"), Some("win.select-all"));
-    menu.append(Some("Find"), Some("win.search"));
-    menu.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
-    menu.append(Some("Export Text…"), Some("win.export-text"));
-    menu.append(Some("New Tab"), Some("win.new-tab"));
-    menu.append(Some("Close Tab"), Some("win.close-tab"));
-    menu
+fn install_context_actions(terminal: &vte4::Terminal, state: &Rc<RefCell<UiState>>, id: SessionId) {
+    let directory_state = Rc::downgrade(state);
+    let new_state = Rc::downgrade(state);
+    let inspector_state = Rc::downgrade(state);
+    let paste_state = Rc::downgrade(state);
+    let paste_terminal = terminal.downgrade();
+    crate::context_menu::install(
+        terminal,
+        crate::context_menu::ContextMenuHooks {
+            directory: Box::new(move || {
+                let state = directory_state.upgrade()?;
+                let state = state.borrow();
+                state
+                    .sessions
+                    .tabs()
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .and_then(|tab| tab.working_directory.clone())
+            }),
+            new_session: Box::new(move |directory, argv, new_window| {
+                let Some(state) = new_state.upgrade() else {
+                    return;
+                };
+                let (app, profile) = {
+                    let state = state.borrow();
+                    (
+                        state.window.application(),
+                        resolve_new_tab_profile(&state.settings, &state.sessions, &state.profiles),
+                    )
+                };
+                if new_window {
+                    if let Some(app) = app {
+                        build_window_with_directory(&app, "Core Terminal", true, directory);
+                    }
+                } else {
+                    let spec = if let Some(argv) = argv {
+                        let command = argv
+                            .iter()
+                            .map(|arg| glib::shell_quote(arg).to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        TabLaunchSpec::with_command(profile, directory, command, false)
+                    } else {
+                        TabLaunchSpec::new(profile, directory)
+                    };
+                    open_tab_with_spec(&state, spec);
+                }
+            }),
+            inspector: Box::new(move || {
+                if let Some(state) = inspector_state.upgrade() {
+                    show_terminal_inspector(&state, id);
+                }
+            }),
+            paste: Box::new(move || {
+                let (Some(state), Some(terminal)) =
+                    (paste_state.upgrade(), paste_terminal.upgrade())
+                else {
+                    return;
+                };
+                let as_cr = {
+                    let state = state.borrow();
+                    state
+                        .sessions
+                        .tabs()
+                        .iter()
+                        .find(|tab| tab.id == id)
+                        .and_then(|tab| state.profiles.profile(&tab.profile_name))
+                        .is_some_and(|profile| profile.paste_newlines_as_cr)
+                };
+                if as_cr {
+                    paste_clipboard_with_carriage_returns(&terminal);
+                } else {
+                    terminal.paste_clipboard();
+                }
+            }),
+        },
+    );
 }
 
-fn install_terminal_context_menu(terminal: &vte4::Terminal) {
-    let popover = gtk::PopoverMenu::from_model(Some(&gio::Menu::new()));
-    popover.set_widget_name("terminal-context-menu");
-    popover.set_parent(terminal);
-    let click = gtk::GestureClick::builder().button(3).build();
-    let terminal_for_click = terminal.clone();
-    click.connect_pressed(move |_, _, x, y| {
-        let link = terminal_for_click
-            .check_hyperlink_at(x, y)
-            .map(|link| link.to_string());
-        let menu = terminal_context_menu(link.as_deref());
-        popover.set_menu_model(Some(&menu));
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        popover.popup();
-    });
-    terminal.add_controller(click);
+#[allow(deprecated)]
+fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
+    let (parent, terminal) = {
+        let state = state.borrow();
+        let Some(terminal) = state.terminals.get(&id.get()).cloned() else {
+            return;
+        };
+        (state.window.clone(), terminal)
+    };
+    let snapshot_state = Rc::downgrade(state);
+    let profile_state = Rc::downgrade(state);
+    let inspector = crate::inspector::build_inspector(
+        &parent,
+        &terminal,
+        move || {
+            let state = snapshot_state.upgrade()?;
+            let state = state.borrow();
+            let tab = state.sessions.tabs().iter().find(|tab| tab.id == id)?;
+            let terminal = state.terminals.get(&id.get())?;
+            Some(crate::inspector::InspectorSnapshot {
+                profile_names: state.profiles.names().map(str::to_owned).collect(),
+                profile_name: tab.profile_name.clone(),
+                title: terminal
+                    .window_title()
+                    .map(|title| title.to_string())
+                    .unwrap_or_default(),
+                working_directory: tab.working_directory.clone(),
+                process: state
+                    .child_process_identities
+                    .get(&id.get())
+                    .map(|child| core::running_process_identity(Some(terminal), child)),
+                pending: state.pending_spawns.contains(&id.get()),
+            })
+        },
+        move |profile_name| {
+            let Some(state) = profile_state.upgrade() else {
+                return false;
+            };
+            let mut state_mut = state.borrow_mut();
+            let Some(profile) = state_mut.profiles.profile(profile_name).cloned() else {
+                return false;
+            };
+            let Some(terminal) = state_mut.terminals.get(&id.get()).cloned() else {
+                return false;
+            };
+            state_mut.sessions.set_profile(id, &profile.name);
+            apply_profile(&terminal, &profile, &state_mut.settings);
+            drop(state_mut);
+            sync_active_profile_ui(&state);
+            update_tab_title(&state, id, &terminal);
+            true
+        },
+    );
+    inspector.present();
 }
 
 pub fn profile_selector(store: &ProfileStore, active_name: &str) -> gtk::DropDown {
@@ -8156,7 +8226,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         // The profile grid supplies a useful natural size, but must never
         // turn its default columns and rows into a resize floor.
         terminal.set_size_request(1, 1);
-        install_terminal_context_menu(&terminal);
+
         // General settings provide the baseline. Profile-owned values take
         // precedence only when the profile actually specifies them, so the
         // global custom command and login shell remain useful for profiles
@@ -8213,6 +8283,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         }
         (id, terminal, spawn_options)
     };
+    install_context_actions(&terminal, state, id);
     sync_active_profile_ui(state);
     connect_terminal_shortcuts(&terminal, state.clone(), id);
     let title_state = state.clone();
