@@ -28,7 +28,7 @@ dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 'core-terminal*' 
 The Debian package targets Ubuntu 26.04 and `amd64`:
 
 ```sh
-sudo apt install ./core-terminal_0.2.2_amd64.deb
+sudo apt install ./core-terminal_0.2.3~rc1_amd64.deb
 ```
 
 The published Flatpak bundle targets x86_64 Linux distributions with Flatpak
@@ -90,7 +90,7 @@ The script uses an isolated D-Bus session so an installed Core Terminal process
 cannot intercept the test activation. Weston is not a substitute for the
 Ubuntu GNOME Wayland test.
 
-## Features in 0.2.2
+## Features in 0.2.3-rc.1
 
 Core Terminal currently includes:
 
@@ -122,6 +122,31 @@ independently instead of forcing an outer horizontal settings scroller. GTK
 and the compositor own window controls, focus, placement, and pointer behavior
 outside the application window.
 
+## Session restoration
+
+Enable **Restore windows and tabs when Core Terminal starts** in General.
+It is off by default. Saved windows, ordered tabs, active selections, profiles,
+and requested window sizes reopen in fresh shells. Missing profiles use a current
+fallback. Last-known folders are checked before launch; unavailable folders
+fall back to home or / (host-only Flatpak folders may be unavailable).
+
+Changed snapshots are saved on a best-effort 15-second interval, after settings
+saves, and before graceful close. Quiet active sessions are refreshed hourly.
+Recent changes can be lost after a crash. At most 16 windows and 64 tabs are
+saved, and snapshots older than seven days are ignored.
+
+Profiles separately enable recent-text restoration and set its row limit.
+Text is capped at 10,000 rows and 256 KiB per tab, with a 3 MiB aggregate cap.
+Wide terminals may retain fewer rows. Current profile permissions control
+capture and display; text from a deleted profile is not shown under a fallback.
+Sanitized text is labeled before a fresh shell starts. Commands and running
+processes are never resumed, including configured profile/global commands.
+
+Saved text may contain sensitive information. The local snapshot uses
+owner-only permissions. Turning restoration off deletes it; turning a profile's
+text option off removes its saved text after a successful settings save.
+Bookmark-based restoration and screen positions remain unsupported.
+
 ## Linux limits
 
 Core Terminal follows the useful parts of Terminal.app's profile model, but it
@@ -139,10 +164,11 @@ depend on the desktop and are treated as optional Linux integrations.
 
 ## Debian package
 
-Build and inspect a local package. The script defaults to version 0.2.2:
+Build and inspect a local release-candidate package. The script defaults to
+the Debian-correct prerelease version `0.2.3~rc1`:
 
 ```sh
-scripts/build-deb.sh && scripts/check-deb.sh dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb && lintian --pedantic dist/core-terminal_0.2.2_$(dpkg --print-architecture).deb
+scripts/build-deb.sh && scripts/check-deb.sh dist/core-terminal_0.2.3~rc1_$(dpkg --print-architecture).deb && lintian --pedantic dist/core-terminal_0.2.3~rc1_$(dpkg --print-architecture).deb
 ```
 
 Remove it with administrator permission:
