@@ -85,7 +85,7 @@ jobs:
       - run: scripts/check-deb.sh dist/core-terminal_${PACKAGE_VERSION}_$(dpkg --print-architecture).deb
       - run: scripts/security-audit.sh dist/core-terminal_${PACKAGE_VERSION}_$(dpkg --print-architecture).deb
       - run: lintian --pedantic dist/core-terminal_${PACKAGE_VERSION}_$(dpkg --print-architecture).deb
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: core-terminal-deb
           path: dist/core-terminal_${{ env.PACKAGE_VERSION }}_*.deb
@@ -193,11 +193,11 @@ jobs:
               acceptance_status=1
           fi
           exit "$acceptance_status"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: core-terminal-flatpak
           path: dist/io.github.ksudo_dev.CoreTerminal.flatpak
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: flatpak-acceptance-diagnostics
