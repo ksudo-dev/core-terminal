@@ -4,11 +4,14 @@
 //! own the profile store and settings, then connect the returned controls to
 //! their session model.
 
+use crate::session_restore as restore;
 use crate::{
+    connections::{self, ConnectionStore, Protocol, SavedConnection},
     core::{self, SessionId, SessionManager},
     profiles::{
         AskBeforeClosePolicy, BackgroundImageMode, CloseOnExit, CursorShape, KeyMapping,
         ProfileStore, ShellExitAction, TerminalProfile, WindowGroup, WindowGroupEntry,
+        WindowGroupWindow,
     },
     settings::{Settings, CURRENT_SCHEMA_VERSION},
     shortcuts::{
@@ -20,7 +23,7 @@ use gtk::{gio, glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -32,6 +35,10 @@ use vte4::prelude::{TerminalExt, TerminalExtManual};
 
 const SETTINGS_PAGE_IDS: [&str; 4] = ["general", "profiles", "window-groups", "encodings"];
 const PROFILE_PAGE_IDS: [&str; 6] = ["text", "window", "tab", "shell", "keyboard", "advanced"];
+/// A split pane is a review aid, not a second terminal. Keep its capture
+/// bounded even when a profile intentionally keeps unlimited VTE scrollback.
+const SNAPSHOT_MAX_ROWS: usize = 10_000;
+const SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
 static ACCEPTANCE_CLOSED_SPAWN_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn compatibility_profile<'a>(
@@ -91,14 +98,18 @@ fn settings_page_ids() -> &'static [&'static str; 4] {
 #[allow(clippy::items_after_test_module)]
 mod structural_tests {
     use super::{
-        adjust_font_scale, compatibility_profile, is_supported_terminal_link, menu_item_action,
+        adjust_font_scale, clear_inspector_overrides, compatibility_profile,
+        connection_profile_or_fallback, dropped_file_paths, format_dropped_paths, gio,
+        inspector_title_override, is_supported_terminal_link, menu_item_action,
         menu_item_action_and_target, menu_submenu_named, migrate_legacy_profile_flags,
         replace_menu_model_contents, resolve_new_tab_profile, resolve_window_profile,
-        runtime_profile_requires_reapply, runtime_terminal_settings_changed, settings_page_ids,
-        shell_escape_for_paste, spawn_callback_action, startup_profile_after_deletion,
-        startup_window_group, terminal_context_menu, terminal_menu_labels, terminal_menu_model,
-        window_group_entry_summary, ProfileStore, SessionManager, Settings, SpawnCallbackAction,
-        WindowGroup, WindowGroupEntry, APPLICATION_ID, PROFILE_PAGE_IDS,
+        runtime_profile_requires_reapply, runtime_terminal_settings_changed,
+        set_inspector_overrides, settings_page_ids, shell_escape_for_paste, snapshot_row_bounds,
+        spawn_callback_action, spawn_options_for_tab, startup_profile_after_deletion,
+        startup_window_group, terminal_menu_labels, terminal_menu_model,
+        window_group_entry_summary, PathBuf, ProfileStore, SessionManager, Settings,
+        SpawnCallbackAction, TerminalProfile, WindowGroup, WindowGroupEntry, APPLICATION_ID,
+        PROFILE_PAGE_IDS,
     };
 
     #[test]
@@ -106,6 +117,15 @@ mod structural_tests {
         assert_eq!(
             settings_page_ids(),
             &["general", "profiles", "window-groups", "encodings"]
+        );
+    }
+
+    #[test]
+    fn saved_connection_missing_profile_uses_current_profile() {
+        let profiles = ProfileStore::defaults();
+        assert_eq!(
+            connection_profile_or_fallback(&profiles, "removed profile"),
+            profiles.selected_name()
         );
     }
 
@@ -123,6 +143,57 @@ mod structural_tests {
         assert_eq!(adjust_font_scale(1.1, -0.1), 1.0);
         assert_eq!(adjust_font_scale(0.5, -0.1), 0.5);
         assert_eq!(adjust_font_scale(2.0, 0.1), 2.0);
+    }
+
+    #[test]
+    fn inspector_overrides_apply_and_reset_without_changing_profiles() {
+        let profiles = ProfileStore::defaults();
+        let profile_snapshot = profiles.profiles().to_vec();
+        let mut sessions = SessionManager::empty();
+        let id = sessions.open_tab("Homebrew", None);
+        let mut overrides = std::collections::HashMap::new();
+        let background = gtk::gdk::RGBA::new(0.1, 0.2, 0.3, 1.0);
+
+        let applied =
+            set_inspector_overrides(&mut overrides, id, "  Build output\n", Some(background));
+        assert_eq!(applied.title.as_deref(), Some("Build output"));
+        assert!(applied.background.is_some());
+        assert_eq!(profiles.profiles(), profile_snapshot.as_slice());
+
+        clear_inspector_overrides(&mut overrides, id);
+        assert!(!overrides.contains_key(&id.get()));
+        assert_eq!(profiles.profiles(), profile_snapshot.as_slice());
+    }
+
+    #[test]
+    fn inspector_overrides_are_scoped_to_the_closed_tab() {
+        let mut sessions = SessionManager::empty();
+        let inspected = sessions.open_tab("Homebrew", None);
+        let sibling = sessions.open_tab("Homebrew", None);
+        let mut overrides = std::collections::HashMap::new();
+        set_inspector_overrides(&mut overrides, inspected, "Inspected", None);
+        set_inspector_overrides(&mut overrides, sibling, "Sibling", None);
+
+        clear_inspector_overrides(&mut overrides, inspected);
+        assert!(!overrides.contains_key(&inspected.get()));
+        assert_eq!(
+            overrides
+                .get(&sibling.get())
+                .and_then(|values| values.title.as_deref()),
+            Some("Sibling")
+        );
+    }
+
+    #[test]
+    fn inspector_title_override_is_bounded_and_control_free() {
+        assert_eq!(inspector_title_override(" \n "), None);
+        assert_eq!(inspector_title_override("A\u{1b}B"), Some("AB".into()));
+        assert_eq!(
+            inspector_title_override(&"x".repeat(300))
+                .as_deref()
+                .map(str::len),
+            Some(256)
+        );
     }
 
     #[test]
@@ -164,6 +235,24 @@ mod structural_tests {
     }
 
     #[test]
+    fn view_menu_exposes_split_scrollback_toggle() {
+        let menu = terminal_menu_model(&ProfileStore::defaults());
+        let view = menu_submenu_named(&menu, "View").unwrap();
+        assert_eq!(
+            menu_item_action(&view, "Toggle Split Scrollback"),
+            Some("win.toggle-split-scrollback".into())
+        );
+    }
+
+    #[test]
+    fn split_snapshot_is_bounded_for_large_scrollback() {
+        let (first, last, rows) = snapshot_row_bounds(900_000, 80);
+        assert_eq!(last, 900_000);
+        assert!(rows <= 10_000);
+        assert_eq!(last - first + 1, rows as libc::c_long);
+    }
+
+    #[test]
     fn terminal_links_allow_only_browser_and_mail_uris() {
         for uri in [
             "https://example.com/docs?q=core-terminal",
@@ -186,33 +275,13 @@ mod structural_tests {
     }
 
     #[test]
-    fn terminal_context_menu_targets_safe_link_actions() {
-        let menu = terminal_context_menu(Some("https://example.com/core-terminal"));
-        assert_eq!(
-            menu_item_action_and_target(&menu, "Open Link"),
-            Some((
-                "win.open-link".into(),
-                "https://example.com/core-terminal".into()
-            ))
-        );
-        assert_eq!(
-            menu_item_action_and_target(&menu, "Copy Link Address"),
-            Some((
-                "win.copy-link-address".into(),
-                "https://example.com/core-terminal".into()
-            ))
-        );
-        let unsafe_menu = terminal_context_menu(Some("file:///home/user/.ssh/id_ed25519"));
-        assert!(menu_item_action(&unsafe_menu, "Open Link").is_none());
-        assert!(menu_item_action(&unsafe_menu, "Copy Link Address").is_none());
-    }
-
-    #[test]
     fn menubar_exposes_profile_and_window_group_shortcuts() {
         let mut profiles = ProfileStore::defaults();
         profiles
             .add_window_group(WindowGroup {
                 name: "Development".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: "Homebrew".into(),
                     working_directory: None,
@@ -243,6 +312,8 @@ mod structural_tests {
         profiles
             .add_window_group(WindowGroup {
                 name: "Development".into(),
+                windows: Vec::new(),
+                active_window: 0,
                 entries: vec![WindowGroupEntry {
                     profile: "Homebrew".into(),
                     working_directory: None,
@@ -266,6 +337,49 @@ mod structural_tests {
         assert_eq!(shell_escape_for_paste("hello world"), "'hello world'");
         assert_eq!(shell_escape_for_paste("a'b"), "'a'\\''b'");
         assert_eq!(shell_escape_for_paste(""), "''");
+    }
+
+    #[test]
+    fn dropped_paths_are_shell_quoted_separated_and_never_end_in_a_newline() {
+        let text = format_dropped_paths(&[
+            PathBuf::from("/tmp/with spaces"),
+            PathBuf::from("/tmp/it's-unicode-😀"),
+            PathBuf::from("/tmp/line\nbreak"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            text,
+            "'/tmp/with spaces' '/tmp/it'\\''s-unicode-😀' '/tmp/line\nbreak' "
+        );
+        assert!(text.ends_with(' '));
+        assert!(!text.ends_with('\n'));
+    }
+
+    #[test]
+    fn native_file_drop_acceptance_rejects_remote_and_mixed_payloads() {
+        let local = gio::File::for_path("/tmp/drop target");
+        let other_local = gio::File::for_path("/tmp/other");
+        let encoded_local = gio::File::for_uri("file:///tmp/space%20%E2%98%83");
+        let remote = gio::File::for_uri("https://example.invalid/not-a-file");
+
+        assert_eq!(
+            dropped_file_paths(&[local.clone(), other_local]),
+            Some(vec![
+                PathBuf::from("/tmp/drop target"),
+                PathBuf::from("/tmp/other"),
+            ])
+        );
+        assert_eq!(dropped_file_paths(&[remote]), None);
+        assert_eq!(
+            dropped_file_paths(&[encoded_local]),
+            Some(vec![PathBuf::from("/tmp/space ☃")])
+        );
+        assert_eq!(
+            dropped_file_paths(&[local, gio::File::for_uri("sftp://host/tmp/x")]),
+            None
+        );
+        assert_eq!(dropped_file_paths(&[]), None);
     }
 
     #[test]
@@ -334,6 +448,8 @@ mod structural_tests {
             window_groups: vec![
                 WindowGroup {
                     name: " Development ".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: "Homebrew".into(),
                         working_directory: Some(" /tmp/original ".into()),
@@ -343,6 +459,8 @@ mod structural_tests {
                 },
                 WindowGroup {
                     name: "Development".into(),
+                    windows: Vec::new(),
+                    active_window: 0,
                     entries: vec![WindowGroupEntry {
                         profile: "Homebrew".into(),
                         working_directory: Some("/tmp/later-duplicate".into()),
@@ -532,6 +650,96 @@ mod structural_tests {
     }
 
     #[test]
+    fn restored_launch_spec_cannot_replay_a_command() {
+        let spec = super::TabLaunchSpec::from_snapshot(crate::session_restore::TabSnapshot {
+            profile: "Missing profile".into(),
+            working_directory: None,
+            transcript: "display only".into(),
+        });
+        assert!(spec.restore);
+        assert!(spec.command.is_none());
+        assert_eq!(spec.restored_text, "display only");
+        assert!(spec
+            .working_directory
+            .as_deref()
+            .is_some_and(|p| std::path::Path::new(p).is_absolute()));
+    }
+    #[test]
+    fn group_launch_suppresses_global_and_profile_commands() {
+        let settings = Settings {
+            use_custom_command: true,
+            custom_command: "global-sentinel".into(),
+            run_command_inside_shell: false,
+            ..Settings::default()
+        };
+        let mut profile = TerminalProfile::homebrew();
+        profile.shell_command = "profile-sentinel".into();
+        profile.run_inside_shell = false;
+        let with_profile = spawn_options_for_tab(&settings, Some(&profile), None, true);
+        let without_profile = spawn_options_for_tab(&settings, None, None, true);
+        assert_eq!(with_profile.custom_command, None);
+        assert!(with_profile.run_command_inside_shell);
+        assert_eq!(without_profile.custom_command, None);
+        assert!(without_profile.run_command_inside_shell);
+    }
+    #[test]
+    fn normal_new_tab_keeps_automatic_command_behavior() {
+        let settings = Settings {
+            use_custom_command: true,
+            custom_command: "global-sentinel".into(),
+            run_command_inside_shell: false,
+            ..Settings::default()
+        };
+        let mut profile = TerminalProfile::homebrew();
+        profile.shell_command = "profile-sentinel".into();
+        profile.run_inside_shell = false;
+        assert_eq!(
+            spawn_options_for_tab(&settings, None, None, false).custom_command,
+            Some("global-sentinel".into())
+        );
+        let profile_options = spawn_options_for_tab(&settings, Some(&profile), None, false);
+        assert_eq!(
+            profile_options.custom_command,
+            Some("profile-sentinel".into())
+        );
+        assert!(!profile_options.run_command_inside_shell);
+    }
+    #[test]
+    fn restored_text_is_display_only_and_commands_are_cleared_last() {
+        let source = include_str!("ui.rs");
+        let start = source.rfind("fn open_tab_with_spec(").unwrap();
+        let end = source.rfind("fn show_child_exit_prompt(").unwrap();
+        let body = source[start..end].split_whitespace().collect::<String>();
+        let merged = body.find("ifletSome(command)=command.filter").unwrap();
+        let guarded = body.find("ifrestore{").unwrap();
+        assert!(merged < guarded);
+        assert_eq!(
+            body.rfind("spawn_options.custom_command="),
+            body.find("spawn_options.custom_command=None;")
+        );
+        assert!(body[guarded..].contains("filter(|p|p.restore_rows)"));
+        assert!(
+            body.find("terminal.feed(&restore::display_bytes").unwrap()
+                < body.find("core::spawn_terminal(").unwrap()
+        );
+        assert!(!body.contains("terminal.feed_child("));
+        assert!(body.contains("ifrestore&&!requested_profile_exists{restored_text.clear();}"));
+    }
+    #[test]
+    fn restore_controls_are_read_and_loaded() {
+        let source = include_str!("ui.rs");
+        let a = source.rfind("fn read_profile_widgets(").unwrap();
+        let b = source.rfind("fn load_profile_widgets(").unwrap();
+        let reader = source[a..b].split_whitespace().collect::<String>();
+        assert!(reader.contains("profile.restore_rows=value"));
+        assert!(reader.contains("profile.restore_rows_limit=valueasu32"));
+        let c = source
+            .rfind("fn sync_profile_control_sensitivity(")
+            .unwrap();
+        let loader = source[b..c].split_whitespace().collect::<String>();
+        assert!(loader.contains("(\"profile-restore-rows\",profile.restore_rows)"));
+    }
+    #[test]
     fn profile_reader_preserves_permanently_unavailable_fields() {
         let source = include_str!("ui.rs");
         let start = source
@@ -552,8 +760,6 @@ mod structural_tests {
             "\"profile-title-show-tty\"",
             "\"profile-title-show-ctrl-key\"",
             "\"profile-smooth-resize\"",
-            "\"profile-restore-rows\"",
-            "\"profile-restore-rows-limit\"",
             "\"profile-restore-bookmark\"",
             "\"profile-alt-scroll\"",
             "\"profile-keypad\"",
@@ -633,7 +839,6 @@ mod structural_tests {
             "\"profile-tab-show-ctrl-key\"",
             "\"profile-title-show-tty\"",
             "\"profile-title-show-ctrl-key\"",
-            "\"profile-restore-rows\"",
         ] {
             assert!(
                 !loader.contains(name),
@@ -711,6 +916,7 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     );
     shell.append(Some("New Tab"), Some("win.new-tab"));
     shell.append(Some("New Command…"), Some("win.new-command"));
+    shell.append(Some("Saved SSH/SFTP Connections…"), Some("win.connections"));
     let new_tab_profiles = gio::Menu::new();
     for name in profiles.names() {
         append_string_target(
@@ -744,6 +950,10 @@ fn terminal_menu_model(profiles: &ProfileStore) -> gio::Menu {
     view.append(Some("Zoom In"), Some("win.zoom-in"));
     view.append(Some("Zoom Out"), Some("win.zoom-out"));
     view.append(Some("Actual Size"), Some("win.zoom-reset"));
+    view.append(
+        Some("Toggle Split Scrollback"),
+        Some("win.toggle-split-scrollback"),
+    );
     view.append(Some("Show Tab Bar"), Some("win.show-tab-bar"));
     view.append(Some("Toggle Full Screen"), Some("win.toggle-fullscreen"));
     let window = gio::Menu::new();
@@ -880,47 +1090,208 @@ fn is_supported_terminal_link(uri: &str) -> bool {
         )
 }
 
-fn terminal_context_menu(link: Option<&str>) -> gio::Menu {
-    let menu = gio::Menu::new();
-    if let Some(link) = link.filter(|link| is_supported_terminal_link(link)) {
-        let open_item = gio::MenuItem::new(Some("Open Link"), None);
-        open_item.set_action_and_target_value(Some("win.open-link"), Some(&link.to_variant()));
-        menu.append_item(&open_item);
-        let copy_item = gio::MenuItem::new(Some("Copy Link Address"), None);
-        copy_item
-            .set_action_and_target_value(Some("win.copy-link-address"), Some(&link.to_variant()));
-        menu.append_item(&copy_item);
-    }
-    menu.append(Some("Copy"), Some("win.copy"));
-    menu.append(Some("Copy as HTML"), Some("win.copy-html"));
-    menu.append(Some("Paste"), Some("win.paste"));
-    menu.append(Some("Paste Selection"), Some("win.paste-selection"));
-    menu.append(Some("Paste Escaped"), Some("win.paste-escaped"));
-    menu.append(Some("Select All"), Some("win.select-all"));
-    menu.append(Some("Find"), Some("win.search"));
-    menu.append(Some("Clear Scrollback"), Some("win.clear-scrollback"));
-    menu.append(Some("Export Text…"), Some("win.export-text"));
-    menu.append(Some("New Tab"), Some("win.new-tab"));
-    menu.append(Some("Close Tab"), Some("win.close-tab"));
-    menu
+fn install_context_actions(terminal: &vte4::Terminal, state: &Rc<RefCell<UiState>>, id: SessionId) {
+    let directory_state = Rc::downgrade(state);
+    let new_state = Rc::downgrade(state);
+    let inspector_state = Rc::downgrade(state);
+    let paste_state = Rc::downgrade(state);
+    let paste_terminal = terminal.downgrade();
+    crate::context_menu::install(
+        terminal,
+        crate::context_menu::ContextMenuHooks {
+            directory: Box::new(move || {
+                let state = directory_state.upgrade()?;
+                let state = state.borrow();
+                state
+                    .sessions
+                    .tabs()
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .and_then(|tab| tab.working_directory.clone())
+            }),
+            new_session: Box::new(move |directory, argv, new_window| {
+                let Some(state) = new_state.upgrade() else {
+                    return;
+                };
+                let (app, profile) = {
+                    let state = state.borrow();
+                    (
+                        state.window.application(),
+                        resolve_new_tab_profile(&state.settings, &state.sessions, &state.profiles),
+                    )
+                };
+                if new_window {
+                    if let Some(app) = app {
+                        build_window_with_directory(&app, "Core Terminal", true, directory);
+                    }
+                } else {
+                    let spec = if let Some(argv) = argv {
+                        let command = argv
+                            .iter()
+                            .map(|arg| glib::shell_quote(arg).to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        TabLaunchSpec::with_command(profile, directory, command, false)
+                    } else {
+                        TabLaunchSpec::new(profile, directory)
+                    };
+                    open_tab_with_spec(&state, spec);
+                }
+            }),
+            inspector: Box::new(move || {
+                if let Some(state) = inspector_state.upgrade() {
+                    show_terminal_inspector(&state, id);
+                }
+            }),
+            paste: Box::new(move || {
+                let (Some(state), Some(terminal)) =
+                    (paste_state.upgrade(), paste_terminal.upgrade())
+                else {
+                    return;
+                };
+                let as_cr = {
+                    let state = state.borrow();
+                    state
+                        .sessions
+                        .tabs()
+                        .iter()
+                        .find(|tab| tab.id == id)
+                        .and_then(|tab| state.profiles.profile(&tab.profile_name))
+                        .is_some_and(|profile| profile.paste_newlines_as_cr)
+                };
+                if as_cr {
+                    paste_clipboard_with_carriage_returns(&terminal);
+                } else {
+                    terminal.paste_clipboard();
+                }
+            }),
+        },
+    );
 }
 
-fn install_terminal_context_menu(terminal: &vte4::Terminal) {
-    let popover = gtk::PopoverMenu::from_model(Some(&gio::Menu::new()));
-    popover.set_widget_name("terminal-context-menu");
-    popover.set_parent(terminal);
-    let click = gtk::GestureClick::builder().button(3).build();
-    let terminal_for_click = terminal.clone();
-    click.connect_pressed(move |_, _, x, y| {
-        let link = terminal_for_click
-            .check_hyperlink_at(x, y)
-            .map(|link| link.to_string());
-        let menu = terminal_context_menu(link.as_deref());
-        popover.set_menu_model(Some(&menu));
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        popover.popup();
-    });
-    terminal.add_controller(click);
+#[allow(deprecated)]
+fn show_terminal_inspector(state: &Rc<RefCell<UiState>>, id: SessionId) {
+    let (parent, terminal) = {
+        let state = state.borrow();
+        let Some(terminal) = state.terminals.get(&id.get()).cloned() else {
+            return;
+        };
+        (state.window.clone(), terminal)
+    };
+    let snapshot_state = Rc::downgrade(state);
+    let profile_state = Rc::downgrade(state);
+    let reset_state = Rc::downgrade(state);
+    let overrides_state = Rc::downgrade(state);
+    let reset_profile_state = Rc::downgrade(state);
+    let inspector = crate::inspector::build_inspector(
+        &parent,
+        &terminal,
+        move || {
+            let state = snapshot_state.upgrade()?;
+            let state = state.borrow();
+            let tab = state.sessions.tabs().iter().find(|tab| tab.id == id)?;
+            let terminal = state.terminals.get(&id.get())?;
+            Some(crate::inspector::InspectorSnapshot {
+                profile_names: state.profiles.names().map(str::to_owned).collect(),
+                profile_name: tab.profile_name.clone(),
+                title: terminal
+                    .window_title()
+                    .map(|title| title.to_string())
+                    .unwrap_or_default(),
+                working_directory: tab.working_directory.clone(),
+                process: state
+                    .child_process_identities
+                    .get(&id.get())
+                    .map(|child| core::running_process_identity(Some(terminal), child)),
+                pending: state.pending_spawns.contains(&id.get()),
+                title_override: state
+                    .inspector_overrides
+                    .get(&id.get())
+                    .and_then(|overrides| overrides.title.clone()),
+                background_override: state
+                    .inspector_overrides
+                    .get(&id.get())
+                    .and_then(|overrides| overrides.background),
+            })
+        },
+        move |profile_name| {
+            let Some(state) = profile_state.upgrade() else {
+                return false;
+            };
+            let mut state_mut = state.borrow_mut();
+            let Some(profile) = state_mut.profiles.profile(profile_name).cloned() else {
+                return false;
+            };
+            let Some(terminal) = state_mut.terminals.get(&id.get()).cloned() else {
+                return false;
+            };
+            state_mut.sessions.set_profile(id, &profile.name);
+            clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
+            apply_profile(&terminal, &profile, &state_mut.settings);
+            drop(state_mut);
+            sync_active_profile_ui(&state);
+            update_tab_title(&state, id, &terminal);
+            true
+        },
+        move || {
+            let Some(state) = reset_state.upgrade() else {
+                return false;
+            };
+            let terminal = state.borrow().terminals.get(&id.get()).cloned();
+            let Some(terminal) = terminal else {
+                return false;
+            };
+            terminal.reset(false, false);
+            true
+        },
+        move |title, background| {
+            let Some(state) = overrides_state.upgrade() else {
+                return false;
+            };
+            let mut state_mut = state.borrow_mut();
+            let Some(profile) = state_mut
+                .sessions
+                .tab(id)
+                .and_then(|tab| state_mut.profiles.profile(&tab.profile_name))
+                .cloned()
+            else {
+                return false;
+            };
+            let Some(terminal) = state_mut.terminals.get(&id.get()).cloned() else {
+                return false;
+            };
+            let overrides =
+                set_inspector_overrides(&mut state_mut.inspector_overrides, id, &title, background);
+            apply_profile(&terminal, &profile, &state_mut.settings);
+            apply_inspector_background(&terminal, overrides.background);
+            drop(state_mut);
+            update_tab_title(&state, id, &terminal);
+            true
+        },
+        move || {
+            let Some(state) = reset_profile_state.upgrade() else {
+                return false;
+            };
+            let mut state_mut = state.borrow_mut();
+            let Some(profile) = state_mut
+                .sessions
+                .tab(id)
+                .and_then(|tab| state_mut.profiles.profile(&tab.profile_name))
+                .cloned()
+            else {
+                return false;
+            };
+            let Some(terminal) = state_mut.terminals.get(&id.get()).cloned() else {
+                return false;
+            };
+            clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
+            apply_profile(&terminal, &profile, &state_mut.settings);
+            drop(state_mut);
+            update_tab_title(&state, id, &terminal);
+            true
+        },
+    );
+    inspector.present();
 }
 
 pub fn profile_selector(store: &ProfileStore, active_name: &str) -> gtk::DropDown {
@@ -1478,6 +1849,7 @@ where
             Settings {
                 schema_version: CURRENT_SCHEMA_VERSION,
                 startup_profile,
+                restore_session: controls.restore_session.is_active(),
                 startup_window_group: if controls.use_startup_group.is_active() {
                     dropdown_text(&controls.startup_window_group)
                         .filter(|name| name != "No groups saved")
@@ -1558,6 +1930,7 @@ struct SettingsControls {
     cancel_button: gtk::Button,
     startup_profile: gtk::DropDown,
     use_startup_group: gtk::CheckButton,
+    restore_session: gtk::CheckButton,
     startup_window_group: gtk::DropDown,
     new_window_profile: gtk::DropDown,
     new_tab_profile: gtk::DropDown,
@@ -1783,6 +2156,15 @@ impl SettingsControls {
             settings.new_window_same_directory,
         );
         general_grid.attach(&new_window_same_directory, 1, 10, 1, 1);
+        let restore_session = named_check(
+            "Restore windows and tabs when Core Terminal starts",
+            settings.restore_session,
+            "restore-session",
+        );
+        general_grid.attach(&restore_session, 1, 11, 1, 1);
+        let restore_hint=hint_label("Starts fresh shells in saved folders. Commands and programs are not resumed. Optional profile text may contain sensitive information. Saved sessions expire after seven days. Turning this off deletes the snapshot.");
+        general_grid.attach(&restore_hint, 1, 12, 1, 1);
+
         general.append(&general_grid);
         top_stack.add_titled(&scroll_page(&general), Some("general"), "General");
 
@@ -2235,20 +2617,27 @@ impl SettingsControls {
             bounded_scrollback.set_sensitive(!button.is_active());
         });
         window_page.0.append(&unlimited_scrollback);
-        window_page.0.append(&unavailable_check(
-            "Restore text after logout (live process state cannot be restored)",
+        let restore_rows = named_check(
+            "Restore recent text in fresh shells",
+            selected_defaults.restore_rows,
             "profile-restore-rows",
-        ));
+        );
+        restore_rows.set_tooltip_text(Some("Requires session restoration in General. Saved text may contain sensitive information. It is display-only; commands and programs are never resumed."));
+        window_page.0.append(&restore_rows);
         window_page.0.append(&unavailable_check(
             "Show live terminal contents in the dock (not portable across Linux docks)",
             "profile-minimized-dock-contents",
         ));
-        let restore_limit = gtk::SpinButton::with_range(1.0, 1_000_000.0, 100.0);
+        let restore_limit = gtk::SpinButton::with_range(100.0, 1_000_000.0, 100.0);
         restore_limit.set_widget_name("profile-restore-rows-limit");
         restore_limit.set_value(selected_defaults.restore_rows_limit as f64);
-        restore_limit.set_sensitive(false);
+        restore_limit.set_sensitive(selected_defaults.restore_rows);
+        let restore_limit_for_toggle = restore_limit.clone();
+        restore_rows.connect_toggled(move |button| {
+            restore_limit_for_toggle.set_sensitive(button.is_active())
+        });
         restore_limit.set_tooltip_text(Some(
-            "Live terminal text cannot be restored after logout on this platform.",
+            "At most 10,000 rows and 256 KiB per tab are saved; the session is also bounded.",
         ));
         window_page.0.append(&field_label("Restore rows limit"));
         window_page.0.append(&restore_limit);
@@ -2259,7 +2648,7 @@ impl SettingsControls {
         restore_bookmark.set_hexpand(true);
         restore_bookmark.set_sensitive(false);
         restore_bookmark.set_tooltip_text(Some(
-            "Live terminal text cannot be restored after logout on this platform.",
+            "Bookmark restoration is unavailable. Imported metadata is preserved.",
         ));
         window_page.0.append(&field_label("Restore bookmark"));
         window_page.0.append(&restore_bookmark);
@@ -2885,7 +3274,7 @@ impl SettingsControls {
         entry_heading.set_halign(gtk::Align::Start);
         window_groups.append(&entry_heading);
         window_groups.append(&hint_label(
-            "Each row launches as one tab, in the order shown. Select a row to edit its profile, directory, and terminal size above.",
+            "Rows edit the first saved window. Capture open windows to save a reusable multiwindow layout, including each window's active tab.",
         ));
         let group_entry_list = gtk::ListBox::new();
         group_entry_list.set_widget_name("window-group-entries");
@@ -2939,7 +3328,9 @@ impl SettingsControls {
         remove_group.set_widget_name("window-group-remove");
         let launch_group = gtk::Button::with_label("Launch selected group");
         launch_group.set_widget_name("window-group-launch");
-        for (index, button) in [&add_group, &remove_group, &launch_group]
+        let capture_group = gtk::Button::with_label("Capture open windows");
+        capture_group.set_widget_name("window-group-capture");
+        for (index, button) in [&add_group, &remove_group, &launch_group, &capture_group]
             .into_iter()
             .enumerate()
         {
@@ -2985,7 +3376,23 @@ impl SettingsControls {
                 }
                 let group = WindowGroup {
                     name: new_name.clone(),
-                    entries: edited_entries,
+                    entries: Vec::new(),
+                    windows: vec![
+                        WindowGroupWindow {
+                            active_tab: 1,
+                            entries: edited_entries,
+                        },
+                        WindowGroupWindow {
+                            active_tab: 0,
+                            entries: vec![WindowGroupEntry {
+                                profile: "Acceptance Profile".into(),
+                                working_directory: Some("/tmp/core-terminal-third".into()),
+                                columns: 120,
+                                rows: 40,
+                            }],
+                        },
+                    ],
+                    active_window: 1,
                 };
                 let result = store.borrow_mut().rename_window_group(&old_name, group);
                 result.map_err(|error| error.to_string())?;
@@ -3185,7 +3592,7 @@ impl SettingsControls {
             *selected_group_for_select.borrow_mut() = Some(name);
             name_for_select.set_text(&group.name);
             *selected_entry_for_group_select.borrow_mut() = None;
-            *entries_for_group_select.borrow_mut() = group.entries;
+            *entries_for_group_select.borrow_mut() = group.first_window_entries().to_vec();
             let entries = entries_for_group_select.borrow().clone();
             rebuild_window_group_entry_list(&entry_list_for_group_select, &entries, Some(0));
             status_for_group_select.set_text(
@@ -3223,12 +3630,17 @@ impl SettingsControls {
             let profile = profile_selection_for_add.borrow().clone();
             let group = WindowGroup {
                 name: name.clone(),
-                entries: vec![WindowGroupEntry {
-                    profile,
-                    working_directory: None,
-                    columns: 80,
-                    rows: 24,
+                entries: Vec::new(),
+                windows: vec![WindowGroupWindow {
+                    active_tab: 0,
+                    entries: vec![WindowGroupEntry {
+                        profile,
+                        working_directory: None,
+                        columns: 80,
+                        rows: 24,
+                    }],
                 }],
+                active_window: 0,
             };
             if group_store_for_add
                 .borrow_mut()
@@ -3320,6 +3732,41 @@ impl SettingsControls {
                 launch_callback(group);
             }
         });
+        let capture_store = group_store.clone();
+        let capture_selection = selected_group.clone();
+        let capture_entries = group_entries.clone();
+        let capture_selected_entry = selected_group_entry.clone();
+        let capture_list = group_entry_list.clone();
+        let commit_for_capture = commit_window_group.clone();
+        let status_for_capture = group_status.clone();
+        capture_group.connect_clicked(move |_| {
+            if let Err(error) = commit_for_capture() {
+                status_for_capture.set_text(&error);
+                return;
+            }
+            let Some(name) = capture_selection.borrow().clone() else {
+                status_for_capture.set_text("Select a saved group before capturing windows.");
+                return;
+            };
+            let Some(group) = capture_window_group(name.clone()) else {
+                status_for_capture.set_text("No open terminal windows could be captured.");
+                return;
+            };
+            if let Err(error) = capture_store.borrow_mut().update_window_group(group.clone()) {
+                status_for_capture.set_text(&error.to_string());
+                return;
+            }
+            *capture_entries.borrow_mut() = group.first_window_entries().to_vec();
+            *capture_selected_entry.borrow_mut() = None;
+            rebuild_window_group_entry_list(
+                &capture_list,
+                &capture_entries.borrow(),
+                Some(0),
+            );
+            status_for_capture.set_text(
+                "Captured all open terminal windows. Launch recreates their tabs and active window without replaying commands.",
+            );
+        });
         let groups_scroll = gtk::ScrolledWindow::new();
         groups_scroll.set_widget_name("window-groups-scroll");
         groups_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -3328,7 +3775,7 @@ impl SettingsControls {
         window_groups.append(&groups_scroll);
         window_groups.append(&group_actions);
         window_groups.append(&group_status);
-        window_groups.append(&hint_label("Core Terminal stores each group's profile, directory, and grid geometry. Launch opens one tab per entry; the Linux compositor owns final window placement and grouping."));
+        window_groups.append(&hint_label("Core Terminal stores each group's windows, profile, directory, grid geometry, and active tabs. Launch recreates separate top-level windows; commands are never saved or replayed."));
         top_stack.add_titled(
             &scroll_page(&window_groups),
             Some("window-groups"),
@@ -3442,6 +3889,7 @@ impl SettingsControls {
             cancel_button,
             startup_profile: startup,
             use_startup_group,
+            restore_session,
             startup_window_group,
             new_window_profile,
             new_tab_profile,
@@ -3744,6 +4192,13 @@ fn read_profile_widgets(
     if let Some(value) = profile_spin(stack, "profile-rows") {
         profile.rows = value as u32;
     }
+    if let Some(value) = profile_check(stack, "profile-restore-rows") {
+        profile.restore_rows = value;
+    }
+    if let Some(value) = profile_spin(stack, "profile-restore-rows-limit") {
+        profile.restore_rows_limit = value as u32;
+    }
+
     // `profile-scrollback` is the canonical visible control. The older
     // Window-page widget remains a disabled compatibility mirror and must not
     // be allowed to overwrite a lower value selected on the Text page.
@@ -3996,6 +4451,7 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
             profile.title_show_dimensions,
         ),
         ("profile-unlimited-scrollback", profile.scrollback_unlimited),
+        ("profile-restore-rows", profile.restore_rows),
         ("profile-run-inside-shell", profile.run_inside_shell),
         ("profile-option-meta", profile.option_as_meta),
         ("profile-delete-control-h", profile.delete_sends_control_h),
@@ -4025,6 +4481,10 @@ fn load_profile_widgets(stack: &gtk::Stack, profile: &TerminalProfile) {
 }
 
 fn sync_profile_control_sensitivity(stack: &gtk::Stack, profile: &TerminalProfile) {
+    if let Some(widget) = profile_widget(stack, "profile-restore-rows-limit") {
+        widget.set_sensitive(profile.restore_rows);
+    }
+
     if let Some(widget) = profile_widget(stack, "profile-run-inside-shell")
         .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok())
     {
@@ -4313,6 +4773,327 @@ fn profile_page_with_checks(
     (page, checks)
 }
 
+#[derive(Default)]
+struct SessionRestoreRuntime {
+    states: Vec<std::rc::Weak<RefCell<UiState>>>,
+    enabled: Option<bool>,
+    timer_started: bool,
+    last_saved: Option<restore::Snapshot>,
+}
+thread_local! {
+static SESSION_RESTORE_RUNTIME:RefCell<SessionRestoreRuntime>=RefCell::new(SessionRestoreRuntime::default());
+}
+static SESSION_RESTORE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+fn session_ui_states() -> Vec<Rc<RefCell<UiState>>> {
+    SESSION_RESTORE_RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        runtime.states.retain(|state| state.strong_count() > 0);
+        runtime
+            .states
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect()
+    })
+}
+fn register_session_state(state: &Rc<RefCell<UiState>>) {
+    let configured = state.borrow().settings.restore_session;
+    let (enabled, start) = SESSION_RESTORE_RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let enabled = *runtime.enabled.get_or_insert(configured);
+        runtime.states.push(Rc::downgrade(state));
+        let start = !runtime.timer_started;
+        runtime.timer_started = true;
+        (enabled, start)
+    });
+    state.borrow_mut().settings.restore_session = enabled;
+    if start {
+        glib::timeout_add_local(Duration::from_secs(15), || {
+            persist_session_snapshot(None);
+            glib::ControlFlow::Continue
+        });
+    }
+}
+fn set_session_restore_enabled(enabled: bool) -> Result<(), restore::RestoreError> {
+    let clear = SESSION_RESTORE_RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let clear = runtime.enabled == Some(true) && !enabled;
+        runtime.enabled = Some(enabled);
+        if !enabled {
+            runtime.last_saved = None;
+        }
+        clear
+    });
+    // Release state borrows before GTK can emit widget signals.
+    let editors = session_ui_states()
+        .into_iter()
+        .filter_map(|state| {
+            let mut state = state.borrow_mut();
+            state.settings.restore_session = enabled;
+            state
+                .settings_window
+                .as_ref()
+                .and_then(glib::WeakRef::upgrade)
+        })
+        .collect::<Vec<_>>();
+    for editor in editors {
+        if let Some(button) =
+            find_widget_by_name(&editor.upcast::<gtk::Widget>(), "restore-session")
+                .and_downcast::<gtk::CheckButton>()
+        {
+            button.set_active(enabled);
+        }
+    }
+    if clear {
+        restore::clear_user()?;
+    }
+    Ok(())
+}
+fn capture_restore_text(terminal: &vte4::Terminal, requested: u32) -> String {
+    let columns = usize::try_from(terminal.column_count()).unwrap_or(1).max(1);
+    let byte_rows = (restore::MAX_TEXT_BYTES / columns.saturating_mul(4).max(1)).max(1);
+    let lines = (requested as usize)
+        .min(restore::MAX_TEXT_LINES)
+        .min(byte_rows);
+    if lines == 0 {
+        return String::new();
+    }
+    let (_, row) = terminal.cursor_position();
+    let end = row.max(0);
+    let start = end
+        .saturating_sub(lines.saturating_sub(1) as libc::c_long)
+        .max(0);
+    let (text, _) = terminal.text_range_format(
+        vte4::Format::Text,
+        start,
+        0,
+        end,
+        terminal.column_count().max(1),
+    );
+    text.map(|text| {
+        restore::sanitize_text(text.trim_end_matches('\n'), restore::MAX_TEXT_BYTES, lines)
+    })
+    .unwrap_or_default()
+}
+#[allow(deprecated)]
+fn snapshot_working_directory(state: &UiState, tab: &core::TerminalTab) -> Option<String> {
+    // Never use a Flatpak proxy cwd as the host shell cwd.
+    let native = state
+        .child_process_identities
+        .get(&tab.id.get())
+        .filter(|_| !core::running_in_flatpak())
+        .and_then(|identity| {
+            if core::child_process_identity(identity.pid()).as_ref() != Some(identity) {
+                return None;
+            }
+            let directory = std::fs::read_link(format!("/proc/{}/cwd", identity.pid().0)).ok()?;
+            if core::child_process_identity(identity.pid()).as_ref() != Some(identity) {
+                return None;
+            }
+            directory.to_str().map(str::to_owned)
+        });
+    let directory = native
+        .or_else(|| tab.working_directory.clone())
+        .or_else(|| {
+            state
+                .terminals
+                .get(&tab.id.get())
+                .and_then(|t| t.current_directory_uri())
+                .and_then(|uri| gio::File::for_uri(&uri).path())
+                .and_then(|p| p.to_str().map(str::to_owned))
+        });
+    restore::directory_or_home(directory.as_deref(), std::env::var("HOME").ok().as_deref())
+}
+fn persist_session_snapshot(closing: Option<&Rc<RefCell<UiState>>>) {
+    if !SESSION_RESTORE_RUNTIME.with(|r| r.borrow().enabled == Some(true)) {
+        return;
+    }
+    let states = session_ui_states();
+    // Defer rather than silently persist a partial window collection.
+    let Ok(borrowed) = states
+        .iter()
+        .map(|s| s.try_borrow())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return;
+    };
+    let live = borrowed
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.closing && !s.sessions.is_empty())
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    let exclude_closing = live.len() > 1;
+    let profiles = load_user_profiles();
+    let mut windows = Vec::new();
+    let mut active_window = SESSION_RESTORE_RUNTIME.with(|r| {
+        r.borrow()
+            .last_saved
+            .as_ref()
+            .map(|s| s.active_window)
+            .unwrap_or(0)
+    });
+    let mut remaining = restore::MAX_TABS;
+    let mut directory_updates = Vec::new();
+    for index in live {
+        if exclude_closing && closing.is_some_and(|s| Rc::ptr_eq(s, &states[index])) {
+            continue;
+        }
+        if windows.len() == restore::MAX_WINDOWS || remaining == 0 {
+            break;
+        }
+        let state = &borrowed[index];
+        let tabs = state
+            .sessions
+            .tabs()
+            .iter()
+            .take(remaining)
+            .map(|tab| {
+                let transcript = profiles
+                    .profile(&tab.profile_name)
+                    .filter(|p| p.restore_rows)
+                    .and_then(|p| {
+                        state
+                            .terminals
+                            .get(&tab.id.get())
+                            .map(|t| capture_restore_text(t, p.restore_rows_limit))
+                    })
+                    .unwrap_or_default();
+                let working_directory = snapshot_working_directory(state, tab);
+                if let Some(directory) = &working_directory {
+                    directory_updates.push((index, tab.id, directory.clone()));
+                }
+                restore::TabSnapshot {
+                    profile: tab.profile_name.clone(),
+                    working_directory,
+                    transcript,
+                }
+            })
+            .collect::<Vec<_>>();
+        remaining -= tabs.len();
+        let active_tab = state
+            .sessions
+            .active()
+            .and_then(|a| state.sessions.tabs().iter().position(|t| t.id == a.id))
+            .unwrap_or(0)
+            .min(tabs.len().saturating_sub(1));
+        if state.window.is_active() {
+            active_window = windows.len();
+        }
+        windows.push(restore::WindowSnapshot {
+            active_tab,
+            tabs,
+            width: if state.window.width() >= 320 {
+                state.window.width()
+            } else {
+                state.settings.window_width
+            },
+            height: if state.window.height() >= 240 {
+                state.window.height()
+            } else {
+                state.settings.window_height
+            },
+            maximized: state.window.is_maximized(),
+        });
+    }
+    drop(borrowed);
+    for (index, id, directory) in directory_updates {
+        if let Ok(mut state) = states[index].try_borrow_mut() {
+            if !state.closing && state.sessions.tab(id).is_some() {
+                state.sessions.set_working_directory(id, Some(&directory));
+            }
+        }
+    }
+    // Keep the last useful snapshot after the final window is destroyed.
+    if windows.is_empty() {
+        return;
+    }
+    let snapshot = match restore::Snapshot::new(windows, active_window).normalized() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Core Terminal: cannot prepare session restore: {e}");
+            return;
+        }
+    };
+    let changed = closing.is_some()
+        || SESSION_RESTORE_RUNTIME.with(|r| {
+            r.borrow().last_saved.as_ref().is_none_or(|old| {
+                old.windows != snapshot.windows
+                    || old.active_window != snapshot.active_window
+                    || restore::now_secs().saturating_sub(old.saved_at) >= 3600
+            })
+        });
+    if !changed {
+        return;
+    }
+    match restore::save_user(&snapshot) {
+        Ok(()) => SESSION_RESTORE_RUNTIME.with(|r| r.borrow_mut().last_saved = Some(snapshot)),
+        Err(e) => eprintln!("Core Terminal: cannot save session restore: {e}"),
+    }
+}
+fn activate_with_session_restore(app: &gtk::Application, display_name: &str) {
+    if !SESSION_RESTORE_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        let enabled = Settings::load_user().restore_session;
+        SESSION_RESTORE_RUNTIME.with(|r| r.borrow_mut().enabled = Some(enabled));
+        if enabled {
+            match restore::load_user() {
+                Ok(snapshot) if !snapshot.windows.is_empty() => {
+                    let active = snapshot.active_window.min(snapshot.windows.len() - 1);
+                    SESSION_RESTORE_RUNTIME
+                        .with(|r| r.borrow_mut().last_saved = Some(snapshot.clone()));
+                    let mut active_window = None;
+                    for (index, saved) in snapshot.windows.into_iter().enumerate() {
+                        let window = build_session_window(
+                            app,
+                            display_name,
+                            false,
+                            None,
+                            None,
+                            Some(saved),
+                            None,
+                            None,
+                        );
+                        if index == active {
+                            active_window = Some(window);
+                        }
+                    }
+                    if let Some(window) = active_window {
+                        window.present();
+                    }
+                    return;
+                }
+                Err(restore::RestoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("Core Terminal: session restore ignored: {e}"),
+                _ => {}
+            }
+            // Missing or invalid resume data must not run configured commands either.
+            let settings = Settings::load_user();
+            let profiles = load_user_profiles();
+            let profile = resolve_window_profile(&settings, &profiles, false);
+            let fallback = restore::WindowSnapshot {
+                width: settings.window_width,
+                height: settings.window_height,
+                tabs: vec![restore::TabSnapshot {
+                    profile,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            build_session_window(
+                app,
+                display_name,
+                false,
+                None,
+                None,
+                Some(fallback),
+                None,
+                None,
+            );
+            return;
+        }
+    }
+    build_window(app, display_name, false);
+}
+
 struct UiState {
     profiles: ProfileStore,
     settings: Settings,
@@ -4326,6 +5107,8 @@ struct UiState {
     tab_bar: gtk::Box,
     profile_dropdown: gtk::DropDown,
     terminals: HashMap<u64, vte4::Terminal>,
+    scrollback_snapshots: HashMap<u64, ScrollbackSnapshot>,
+    inspector_overrides: HashMap<u64, InspectorOverrides>,
     pending_spawns: HashSet<u64>,
     exited_before_spawn_callbacks: HashSet<u64>,
     child_process_identities: HashMap<u64, core::ChildProcessIdentity>,
@@ -4335,6 +5118,51 @@ struct UiState {
     active_close_request: Option<CloseRequest>,
     pending_close_request: Option<CloseRequest>,
     window_close_authorization: Option<core::ClosePlan>,
+}
+
+/// Widgets owned by one tab's optional, read-only scrollback review pane.
+/// No VTE or PTY is created for this view.
+#[derive(Clone)]
+struct ScrollbackSnapshot {
+    split: gtk::Paned,
+    panel: gtk::Box,
+    text: gtk::TextView,
+}
+
+/// Runtime-only customizations owned by one terminal tab. These are never
+/// copied into a profile store or settings document.
+#[derive(Clone, Debug, Default)]
+struct InspectorOverrides {
+    title: Option<String>,
+    background: Option<gtk::gdk::RGBA>,
+}
+
+fn inspector_title_override(value: &str) -> Option<String> {
+    let title: String = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect();
+    (!title.is_empty()).then_some(title)
+}
+
+fn set_inspector_overrides(
+    overrides: &mut HashMap<u64, InspectorOverrides>,
+    id: SessionId,
+    title: &str,
+    background: Option<gtk::gdk::RGBA>,
+) -> InspectorOverrides {
+    let override_values = InspectorOverrides {
+        title: inspector_title_override(title),
+        background,
+    };
+    overrides.insert(id.get(), override_values.clone());
+    override_values
+}
+
+fn clear_inspector_overrides(overrides: &mut HashMap<u64, InspectorOverrides>, id: SessionId) {
+    overrides.remove(&id.get());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4374,7 +5202,11 @@ struct TabLaunchSpec {
     working_directory: Option<String>,
     size: Option<(u32, u32)>,
     command: Option<String>,
+    explicit_argv: Option<Vec<String>>,
     run_command_inside_shell: bool,
+    suppress_profile_command: bool,
+    restore: bool,
+    restored_text: String,
 }
 
 impl TabLaunchSpec {
@@ -4384,7 +5216,11 @@ impl TabLaunchSpec {
             working_directory,
             size: None,
             command: None,
+            explicit_argv: None,
             run_command_inside_shell: true,
+            suppress_profile_command: false,
+            restore: false,
+            restored_text: String::new(),
         }
     }
 
@@ -4399,7 +5235,11 @@ impl TabLaunchSpec {
             working_directory,
             size: None,
             command: Some(command.into()),
+            explicit_argv: None,
             run_command_inside_shell,
+            suppress_profile_command: false,
+            restore: false,
+            restored_text: String::new(),
         }
     }
 
@@ -4409,9 +5249,57 @@ impl TabLaunchSpec {
             working_directory: entry.working_directory,
             size: Some((entry.columns, entry.rows)),
             command: None,
+            explicit_argv: None,
             run_command_inside_shell: true,
+            // A reusable group stores layout, not process state. In
+            // particular, opening it must not replay a profile's custom
+            // command from whichever session happened to define the group.
+            suppress_profile_command: true,
+            restore: false,
+            restored_text: String::new(),
         }
     }
+    fn from_snapshot(tab: restore::TabSnapshot) -> Self {
+        let directory = restore::directory_or_home(
+            tab.working_directory.as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        );
+        Self {
+            restore: true,
+            restored_text: tab.transcript,
+            ..Self::new(tab.profile, directory)
+        }
+    }
+}
+
+fn spawn_options_for_tab(
+    settings: &Settings,
+    profile: Option<&TerminalProfile>,
+    working_directory: Option<&str>,
+    suppress_profile_command: bool,
+) -> core::SpawnOptions {
+    let mut spawn_options = core::SpawnOptions::from_settings(settings, working_directory);
+    if suppress_profile_command {
+        // Saved groups represent layout only. They must start fresh login
+        // shells instead of inheriting either global or profile commands.
+        spawn_options.custom_command = None;
+        spawn_options.run_command_inside_shell = true;
+    }
+    if let Some(profile) = profile {
+        let profile_options = core::SpawnOptions::from_profile(profile, working_directory);
+        spawn_options.terminal_type = profile_options.terminal_type;
+        if !profile.shell.trim().is_empty() {
+            spawn_options.shell = profile_options.shell;
+        }
+        if !suppress_profile_command && !profile.shell_command.trim().is_empty() {
+            spawn_options.custom_command = profile_options.custom_command;
+            spawn_options.run_command_inside_shell = profile_options.run_command_inside_shell;
+        }
+        if profile.set_locale_environment {
+            spawn_options.locale = profile_options.locale;
+        }
+    }
+    spawn_options
 }
 
 fn resolve_window_profile(
@@ -4464,6 +5352,13 @@ fn resolve_new_tab_profile(
         .to_owned()
 }
 
+fn connection_profile_or_fallback(profiles: &ProfileStore, requested: &str) -> String {
+    profiles
+        .profile(requested)
+        .map(|_| requested.to_owned())
+        .unwrap_or_else(|| profiles.selected_name().to_owned())
+}
+
 /// Start the GTK application.  The application keeps terminal/session state
 /// in one small reference-counted model; VTE remains responsible for PTYs,
 /// rendering, selection, scrollback and terminal protocol handling.
@@ -4472,12 +5367,13 @@ pub fn run(application_id: &str, display_name: &str) {
         .application_id(application_id)
         .build();
     app.connect_startup(|app| {
+        crate::appearance::follow_system_appearance(app);
         let profiles = load_user_profiles();
         let _ = application_menu_model(app, &profiles);
     });
     let display_name = display_name.to_owned();
     let activate_name = display_name.clone();
-    app.connect_activate(move |app| build_window(app, &activate_name, false));
+    app.connect_activate(move |app| activate_with_session_restore(app, &activate_name));
     // New-window is installed on each window so it can honor that window's
     // current directory policy. The application-level accelerator resolves
     // the action on the active window.
@@ -4511,6 +5407,28 @@ fn build_window_with_profile_and_directory(
     pending_working_directory: Option<String>,
     requested_profile_override: Option<String>,
 ) {
+    build_session_window(
+        app,
+        display_name,
+        new_window,
+        pending_working_directory,
+        requested_profile_override,
+        None,
+        None,
+        None,
+    );
+}
+#[allow(clippy::too_many_arguments)]
+fn build_session_window(
+    app: &gtk::Application,
+    display_name: &str,
+    new_window: bool,
+    pending_working_directory: Option<String>,
+    requested_profile_override: Option<String>,
+    restored: Option<restore::WindowSnapshot>,
+    saved_group_window: Option<WindowGroupWindow>,
+    initial_tab: Option<TabLaunchSpec>,
+) -> gtk::ApplicationWindow {
     gtk::Window::set_default_icon_name(APPLICATION_ID);
     let mut profiles = load_user_profiles();
     let mut settings = Settings::load_user();
@@ -4534,8 +5452,18 @@ fn build_window_with_profile_and_directory(
         .application(app)
         .title(display_name)
         .icon_name(APPLICATION_ID)
-        .default_width(settings.window_width)
-        .default_height(settings.window_height)
+        .default_width(
+            restored
+                .as_ref()
+                .map(|s| s.width)
+                .unwrap_or(settings.window_width),
+        )
+        .default_height(
+            restored
+                .as_ref()
+                .map(|s| s.height)
+                .unwrap_or(settings.window_height),
+        )
         .build();
     if let Some(display) = gtk::gdk::Display::default() {
         install_style(&display);
@@ -4574,6 +5502,8 @@ fn build_window_with_profile_and_directory(
         tab_bar: tab_bar.clone(),
         profile_dropdown: profile_dropdown.clone(),
         terminals: HashMap::new(),
+        scrollback_snapshots: HashMap::new(),
+        inspector_overrides: HashMap::new(),
         pending_spawns: HashSet::new(),
         exited_before_spawn_callbacks: HashSet::new(),
         child_process_identities: HashMap::new(),
@@ -4584,6 +5514,10 @@ fn build_window_with_profile_and_directory(
         pending_close_request: None,
         window_close_authorization: None,
     }));
+    register_session_state(&state);
+    if restored.as_ref().is_some_and(|s| s.maximized) {
+        window.maximize();
+    }
 
     let header = build_header_bar();
     header.set_widget_name("terminal-titlebar");
@@ -4672,8 +5606,26 @@ fn build_window_with_profile_and_directory(
         let state = state.borrow();
         startup_window_group(&state.profiles, &state.settings.startup_window_group)
     };
-    if let Some(group) = startup_group {
+    if let Some(restored) = restored {
+        let active = restored
+            .active_tab
+            .min(restored.tabs.len().saturating_sub(1));
+        for tab in restored.tabs {
+            open_tab_with_spec(&state, TabLaunchSpec::from_snapshot(tab));
+        }
+        switch_tab_index(&state, active);
+    } else if let Some(group_window) = saved_group_window {
+        let active = group_window
+            .active_tab
+            .min(group_window.entries.len().saturating_sub(1));
+        for entry in group_window.entries {
+            open_tab_with_spec(&state, TabLaunchSpec::from_window_group_entry(entry));
+        }
+        switch_tab_index(&state, active);
+    } else if let Some(group) = startup_group {
         launch_window_group(&state, group);
+    } else if let Some(spec) = initial_tab {
+        open_tab_with_spec(&state, spec);
     } else {
         open_tab_with_spec(
             &state,
@@ -4710,6 +5662,7 @@ fn build_window_with_profile_and_directory(
     });
     window.present();
     schedule_acceptance_harness(app, &state);
+    window
 }
 
 /// Drive the same window/session helpers used by buttons and accelerators.
@@ -4780,7 +5733,10 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
         let stat = std::str::from_utf8(&stat).ok()?;
         let fields = stat.rsplit_once(") ")?.1;
         let mut fields = fields.split_whitespace();
-        let _state = fields.next()?;
+        let state = fields.next()?;
+        if !acceptance_state_is_live(state) {
+            return None;
+        }
         let _parent = fields.next()?;
         let process_group = fields.next()?.parse().ok()?;
         let session = fields.next()?.parse().ok()?;
@@ -5659,20 +6615,25 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             if state.profiles.window_group("Acceptance Group").is_none() {
                 let _ = state.profiles.add_window_group(WindowGroup {
                     name: "Acceptance Group".into(),
-                    entries: vec![
-                        WindowGroupEntry {
-                            profile: "Homebrew".into(),
-                            working_directory: Some("/tmp".into()),
-                            columns: 80,
-                            rows: 24,
-                        },
-                        WindowGroupEntry {
-                            profile: "Acceptance Profile".into(),
-                            working_directory: None,
-                            columns: 100,
-                            rows: 30,
-                        },
-                    ],
+                    entries: Vec::new(),
+                    windows: vec![WindowGroupWindow {
+                        active_tab: 0,
+                        entries: vec![
+                            WindowGroupEntry {
+                                profile: "Homebrew".into(),
+                                working_directory: Some("/tmp".into()),
+                                columns: 80,
+                                rows: 24,
+                            },
+                            WindowGroupEntry {
+                                profile: "Acceptance Profile".into(),
+                                working_directory: None,
+                                columns: 100,
+                                rows: 30,
+                            },
+                        ],
+                    }],
+                    active_window: 0,
                 });
             }
             if let Some(model) = state
@@ -6479,7 +7440,6 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                 "profile-tab-show-ctrl-key",
                 "profile-title-show-tty",
                 "profile-title-show-ctrl-key",
-                "profile-restore-rows",
             ]
             .into_iter()
             .all(|name| {
@@ -6642,8 +7602,10 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
             .as_ref()
             .and_then(|store| store.window_group("Acceptance Group"))
             .is_some_and(|group| {
-                group.entries.len() == 3
-                    && group.entries[1].working_directory.as_deref()
+                group.windows.len() == 2
+                    && group.active_window == 1
+                    && group.windows[0].active_tab == 1
+                    && group.windows[1].entries[0].working_directory.as_deref()
                         == Some("/tmp/core-terminal-third")
             });
         let standard_mappings_present = root
@@ -6667,32 +7629,91 @@ fn schedule_acceptance_harness(app: &gtk::Application, state: &Rc<RefCell<UiStat
                     && terminal.cjk_ambiguous_width() == 2
                     && !terminal.is_mouse_autohide()
             });
-        let (group_to_launch, sessions_before_group) = state
+        let group_to_launch = state
             .try_borrow_mut()
             .map(|mut state| {
                 // Deliberately conflict with the group's profiles: explicit
                 // group entries must win over normal new-tab policy.
                 state.settings.new_tab_profile = "Ocean".into();
-                (
-                    state.profiles.window_group("Acceptance Group").cloned(),
-                    state.sessions.tabs().len(),
-                )
-            })
-            .unwrap_or((None, 0));
-        let group_launch_explicit = group_to_launch.is_some_and(|group| {
-            let expected = group.entries.clone();
-            launch_window_group(&state, group);
-            state.try_borrow().is_ok_and(|state| {
-                let launched = state.sessions.tabs().get(sessions_before_group..);
-                launched.is_some_and(|launched| {
-                    launched.len() == expected.len()
-                        && launched.iter().zip(&expected).all(|(tab, entry)| {
-                            tab.profile_name == entry.profile
-                                && tab.working_directory == entry.working_directory
-                        })
+                // Saved groups create fresh top-level windows, which load the
+                // persisted profile document just like a normal new window.
+                // Keep the acceptance fixture on that real code path.
+                let _ = save_user_profiles(&state.profiles);
+                Some(WindowGroup {
+                    name: "Acceptance launch probe".into(),
+                    entries: Vec::new(),
+                    windows: vec![
+                        WindowGroupWindow {
+                            active_tab: 1,
+                            entries: vec![
+                                WindowGroupEntry {
+                                    profile: "Homebrew".into(),
+                                    working_directory: Some("/tmp".into()),
+                                    columns: 80,
+                                    rows: 24,
+                                },
+                                WindowGroupEntry {
+                                    profile: "Acceptance Profile".into(),
+                                    working_directory: None,
+                                    columns: 100,
+                                    rows: 30,
+                                },
+                            ],
+                        },
+                        WindowGroupWindow {
+                            active_tab: 0,
+                            entries: vec![WindowGroupEntry {
+                                profile: "Acceptance Profile".into(),
+                                working_directory: Some("/tmp/core-terminal-third".into()),
+                                columns: 120,
+                                rows: 40,
+                            }],
+                        },
+                    ],
+                    active_window: 1,
                 })
             })
+            .unwrap_or(None);
+        let group_launch_explicit = group_to_launch.is_some_and(|group| {
+            let expected = group.windows.clone();
+            let launched = launch_window_group(&state, group);
+            let state_count_matches =
+                wait_for_condition(Duration::from_secs(4), || launched.len() == expected.len());
+            let group_matches = state_count_matches
+                && launched
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(launched, expected_window)| {
+                        let launched = launched.borrow();
+                        let active = launched.sessions.active().map(|tab| tab.id);
+                        let expected_active = expected_window
+                            .entries
+                            .get(expected_window.active_tab)
+                            .map(|entry| &entry.profile);
+                        launched.sessions.tabs().len() == expected_window.entries.len()
+                            && launched
+                                .sessions
+                                .tabs()
+                                .iter()
+                                .zip(&expected_window.entries)
+                                .all(|(tab, entry)| {
+                                    tab.profile_name == entry.profile
+                                        && tab.working_directory == entry.working_directory
+                                })
+                            && expected_active.is_some_and(|profile| {
+                                active.is_some_and(|id| {
+                                    launched
+                                        .sessions
+                                        .tab(id)
+                                        .is_some_and(|tab| tab.profile_name == *profile)
+                                })
+                            })
+                    });
+            group_matches
         });
+        // The group deliberately launches into separate windows. Exercise
+        // active-profile synchronization on a real sibling in this window.
+        open_tab_with_spec(&state, TabLaunchSpec::new("Homebrew", None));
         let active_profile_synced_after_close = state
             .try_borrow()
             .ok()
@@ -6973,6 +7994,11 @@ fn install_window_actions(
     new_command.connect_activate(move |_, _| show_new_command(&action_state));
     window.add_action(&new_command);
 
+    let connections = gio::SimpleAction::new("connections", None);
+    let action_state = state.clone();
+    connections.connect_activate(move |_, _| show_connections(&action_state));
+    window.add_action(&connections);
+
     let new_window_with_profile = gio::SimpleAction::new("new-window-with-profile", None);
     let action_state = state.clone();
     let action_app = app.clone();
@@ -7193,6 +8219,13 @@ fn install_window_actions(
         }
     });
     window.add_action(&clear_scrollback);
+
+    let split_scrollback_action = gio::SimpleAction::new("toggle-split-scrollback", None);
+    let action_state = state.clone();
+    split_scrollback_action.connect_activate(move |_, _| {
+        toggle_split_scrollback(&action_state);
+    });
+    window.add_action(&split_scrollback_action);
 
     let reset_terminal = gio::SimpleAction::new("reset-terminal", None);
     let action_state = state.clone();
@@ -7430,6 +8463,7 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
     }
     let save_state = state.clone();
     let launch_state = state.clone();
+    let save_parent = parent.clone();
     let window = show_settings(
         &parent,
         &settings,
@@ -7479,8 +8513,13 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
             {
                 state.profile_dropdown.set_selected(index as u32);
             }
-            let _ = state.settings.save_user();
-            save_user_profiles(&state.profiles);
+            let settings_error = state.settings.save_user().err().map(|e| e.to_string());
+            let settings_saved = settings_error.is_none();
+            if !settings_saved {
+                state.settings.restore_session = old_settings.restore_session;
+                new_settings.restore_session = old_settings.restore_session;
+            }
+            let profiles_saved = save_user_profiles(&state.profiles);
             let terminals = state
                 .sessions
                 .tabs()
@@ -7500,13 +8539,31 @@ fn show_settings_for_state(state: &Rc<RefCell<UiState>>) -> gtk::Window {
                 })
                 .collect::<Vec<_>>();
             drop(state);
+            if let Some(error) = settings_error {
+                show_settings_error(&save_parent, "Settings could not be saved", error);
+            }
+            if !profiles_saved {
+                show_settings_error(&save_parent,"Profiles could not be saved","Profile changes were not persisted. Check configuration-directory access and try again.");
+            }
+            if settings_saved {
+                if let Err(error) = set_session_restore_enabled(new_settings.restore_session) {
+                    show_settings_error(
+                        &save_parent,
+                        "Saved session could not be deleted",
+                        error.to_string(),
+                    );
+                }
+                persist_session_snapshot(None);
+            }
             refresh_terminal_menu(&save_state);
             for (id, terminal, profile) in terminals {
                 reapply_profile_without_resize(&terminal, &profile, &new_settings);
                 update_tab_title(&save_state, id, &terminal);
             }
         },
-        move |group| launch_window_group(&launch_state, group),
+        move |group| {
+            launch_window_group(&launch_state, group);
+        },
     );
     state.borrow_mut().settings_window = Some(window.downgrade());
 
@@ -7540,15 +8597,399 @@ fn clear_settings_window_if_current(
     }
 }
 
-/// Launch every entry in a saved group through the explicit tab/PTY path.
+/// Editor and explicit launcher for saved SSH/SFTP metadata. It never opens a
+/// connection by itself: the user must press Launch for one selected record.
+#[allow(deprecated)]
+fn show_connections(state: &Rc<RefCell<UiState>>) {
+    let parent = state.borrow().window.clone();
+    let window = gtk::Window::builder()
+        .title("Saved SSH/SFTP Connections")
+        .transient_for(&parent)
+        .destroy_with_parent(true)
+        .modal(false)
+        .default_width(700)
+        .default_height(480)
+        .build();
+    enforce_non_modal(&window);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.set_margin_start(18);
+    root.set_margin_end(18);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    let hint = gtk::Label::new(Some("Core Terminal stores no passwords, keys, or tokens. OpenSSH handles host-key and authentication prompts in the new terminal."));
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    root.append(&hint);
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.set_vexpand(true);
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_child(Some(&list));
+    scroll.set_vexpand(true);
+    root.append(&scroll);
+    let form = gtk::Grid::builder()
+        .column_spacing(8)
+        .row_spacing(8)
+        .build();
+    let label = gtk::Entry::new();
+    let host = gtk::Entry::new();
+    let user = gtk::Entry::new();
+    let port = gtk::Entry::new();
+    let profile = gtk::Entry::new();
+    port.set_text("22");
+    profile.set_placeholder_text(Some("Current profile fallback"));
+    let protocols = gtk::StringList::new(&["SSH", "SFTP"]);
+    let protocol = gtk::DropDown::new(Some(protocols), None::<&gtk::Expression>);
+    for (row, title, widget) in [
+        (0, "Label", label.clone().upcast::<gtk::Widget>()),
+        (1, "Host", host.clone().upcast()),
+        (2, "User", user.clone().upcast()),
+        (3, "Port", port.clone().upcast()),
+        (4, "Protocol", protocol.clone().upcast()),
+        (5, "Profile", profile.clone().upcast()),
+    ] {
+        let caption = gtk::Label::new(Some(title));
+        caption.set_xalign(0.0);
+        form.attach(&caption, 0, row, 1, 1);
+        form.attach(&widget, 1, row, 1, 1);
+    }
+    root.append(&form);
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.add_css_class("error");
+    root.append(&status);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    let aliases = gtk::Button::with_label("Read SSH aliases");
+    let save = gtk::Button::with_label("Save");
+    let delete = gtk::Button::with_label("Delete");
+    let launch = gtk::Button::with_label("Launch new terminal");
+    actions.append(&aliases);
+    actions.append(&delete);
+    actions.append(&save);
+    actions.append(&launch);
+    root.append(&actions);
+    window.set_child(Some(&root));
+
+    let store = Rc::new(RefCell::new(ConnectionStore::load_user()));
+    let selected = Rc::new(RefCell::new(None::<String>));
+    let refresh: Rc<dyn Fn()> = {
+        let list = list.clone();
+        let store = store.clone();
+        Rc::new(move || {
+            while let Some(row) = list.row_at_index(0) {
+                list.remove(&row);
+            }
+            for connection in &store.borrow().connections {
+                let protocol = match connection.protocol {
+                    Protocol::Ssh => "SSH",
+                    Protocol::Sftp => "SFTP",
+                };
+                let profile = if connection.profile.is_empty() {
+                    "current profile"
+                } else {
+                    &connection.profile
+                };
+                let summary = format!(
+                    "{} — {protocol} {}@{}:{} ({profile})",
+                    connection.label, connection.user, connection.host, connection.port
+                );
+                let row = gtk::ListBoxRow::new();
+                row.set_child(Some(&gtk::Label::new(Some(&summary))));
+                list.append(&row);
+            }
+        })
+    };
+    refresh();
+    let select_label = label.clone();
+    let select_host = host.clone();
+    let select_user = user.clone();
+    let select_port = port.clone();
+    let select_profile = profile.clone();
+    let select_protocol = protocol.clone();
+    let select_store = store.clone();
+    let select_selected = selected.clone();
+    list.connect_row_selected(move |_, row| {
+        let Some(row) = row else {
+            return;
+        };
+        let Some(connection) = select_store
+            .borrow()
+            .connections
+            .get(row.index() as usize)
+            .cloned()
+        else {
+            return;
+        };
+        *select_selected.borrow_mut() = Some(connection.label.clone());
+        select_label.set_text(&connection.label);
+        select_host.set_text(&connection.host);
+        select_user.set_text(&connection.user);
+        select_port.set_text(&connection.port.to_string());
+        select_profile.set_text(&connection.profile);
+        select_protocol.set_selected(if connection.protocol == Protocol::Ssh {
+            0
+        } else {
+            1
+        });
+    });
+    let alias_host = host.clone();
+    let alias_status = status.clone();
+    aliases.connect_clicked(move |_| {
+        let path = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ssh/config"));
+        match path
+            .and_then(|path| connections::read_ssh_host_aliases(path).ok())
+            .and_then(|aliases| aliases.into_iter().next())
+        {
+            Some(alias) => {
+                alias_host.set_text(&alias);
+                alias_status.set_text("Read a host alias; review and save it if desired.");
+            }
+            None => alias_status.set_text("No simple aliases were found in ~/.ssh/config."),
+        }
+    });
+    let save_store = store.clone();
+    let save_selected = selected.clone();
+    let save_refresh = refresh.clone();
+    let save_status = status.clone();
+    let save_label = label.clone();
+    let save_host = host.clone();
+    let save_user = user.clone();
+    let save_port = port.clone();
+    let save_protocol = protocol.clone();
+    let save_profile = profile.clone();
+    save.connect_clicked(move |_| {
+        let connection = SavedConnection {
+            label: save_label.text().to_string(),
+            host: save_host.text().to_string(),
+            user: save_user.text().to_string(),
+            port: save_port.text().parse().unwrap_or(0),
+            protocol: if save_protocol.selected() == 0 {
+                Protocol::Ssh
+            } else {
+                Protocol::Sftp
+            },
+            profile: save_profile.text().to_string(),
+        };
+        let old = save_selected.borrow().clone();
+        let result = {
+            let mut store = save_store.borrow_mut();
+            store.upsert(connection.clone(), old.as_deref())
+        };
+        let result = result.and_then(|_| save_store.borrow().save_user());
+        match result {
+            Ok(()) => {
+                *save_selected.borrow_mut() = Some(connection.label);
+                save_status.set_text("Saved.");
+                save_refresh();
+            }
+            Err(error) => save_status.set_text(&error.to_string()),
+        }
+    });
+    let delete_store = store.clone();
+    let delete_selected = selected.clone();
+    let delete_refresh = refresh.clone();
+    let delete_status = status.clone();
+    delete.connect_clicked(move |_| {
+        if let Some(label) = delete_selected.borrow_mut().take() {
+            delete_store.borrow_mut().delete(&label);
+            match delete_store.borrow().save_user() {
+                Ok(()) => {
+                    delete_status.set_text("Deleted.");
+                    delete_refresh();
+                }
+                Err(error) => delete_status.set_text(&error.to_string()),
+            }
+        }
+    });
+    let launch_state = state.clone();
+    let launch_store = store.clone();
+    let launch_selected = selected.clone();
+    let launch_status = status.clone();
+    let launch_window = window.clone();
+    launch.connect_clicked(move |_| {
+        let Some(label) = launch_selected.borrow().clone() else {
+            launch_status.set_text("Select a saved connection first.");
+            return;
+        };
+        let Some(connection) = launch_store
+            .borrow()
+            .connections
+            .iter()
+            .find(|c| c.label == label)
+            .cloned()
+        else {
+            return;
+        };
+        let executable = match connections::resolve_client(connection.protocol) {
+            Ok(path) => path,
+            Err(error) => {
+                launch_status.set_text(&error.to_string());
+                return;
+            }
+        };
+        let argv = match connection.argv(&executable) {
+            Ok(argv) => argv,
+            Err(error) => {
+                launch_status.set_text(&error.to_string());
+                return;
+            }
+        };
+        let (app, display_name, requested_profile, profiles) = {
+            let state = launch_state.borrow();
+            (
+                state.window.application(),
+                state
+                    .window
+                    .title()
+                    .unwrap_or_else(|| "Core Terminal".into()),
+                connection.profile.clone(),
+                state.profiles.clone(),
+            )
+        };
+        let Some(app) = app else {
+            return;
+        };
+        let profile = connection_profile_or_fallback(&profiles, &requested_profile);
+        let spec = TabLaunchSpec {
+            profile_name: profile,
+            working_directory: None,
+            size: None,
+            command: None,
+            explicit_argv: Some(argv),
+            run_command_inside_shell: false,
+            suppress_profile_command: false,
+            restore: false,
+            restored_text: String::new(),
+        };
+        build_session_window(
+            &app,
+            &display_name,
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(spec),
+        );
+        launch_window.close();
+    });
+    window.present();
+}
+
+/// Launch every saved top-level window through the explicit tab/PTY path.
 /// Group entries never mutate or depend on normal new-tab preferences.
-fn launch_window_group(state: &Rc<RefCell<UiState>>, group: WindowGroup) {
-    for entry in group.entries {
-        if state.borrow().profiles.profile(&entry.profile).is_none() {
+fn launch_window_group(
+    state: &Rc<RefCell<UiState>>,
+    group: WindowGroup,
+) -> Vec<Rc<RefCell<UiState>>> {
+    let (app, display_name) = {
+        let state = state.borrow();
+        (
+            state.window.application(),
+            state
+                .window
+                .title()
+                .unwrap_or_else(|| "Core Terminal".into()),
+        )
+    };
+    let Some(app) = app else {
+        return Vec::new();
+    };
+    let mut active = None;
+    let mut launched = Vec::with_capacity(group.windows.len());
+    for (index, group_window) in group.windows.into_iter().enumerate() {
+        let window = build_session_window(
+            &app,
+            &display_name,
+            true,
+            None,
+            None,
+            None,
+            Some(group_window),
+            None,
+        );
+        // `session_ui_states` is a weak, process-wide lifecycle registry.
+        // Associate this exact window with its state while the launch owns the
+        // result instead of inferring it later from registry insertion order.
+        if let Some(launched_state) = session_ui_states()
+            .into_iter()
+            .find(|candidate| candidate.borrow().window == window)
+        {
+            launched.push(launched_state);
+        }
+        if index == group.active_window {
+            active = Some(window);
+        }
+    }
+    if let Some(window) = active {
+        window.present();
+    }
+    launched
+}
+
+/// Capture the live top-level windows as a reusable named group. Only profile,
+/// directory, terminal grid, and selection state are stored; processes and
+/// commands are deliberately never replayed.
+fn capture_window_group(name: String) -> Option<WindowGroup> {
+    let mut windows = Vec::new();
+    let mut active_window = 0;
+    for state in session_ui_states() {
+        let state = state.try_borrow().ok()?;
+        if state.closing || state.sessions.is_empty() {
             continue;
         }
-        open_tab_with_spec(state, TabLaunchSpec::from_window_group_entry(entry));
+        let entries = state
+            .sessions
+            .tabs()
+            .iter()
+            .map(|tab| {
+                let (columns, rows) = state
+                    .terminals
+                    .get(&tab.id.get())
+                    .map(|terminal| {
+                        (
+                            terminal.column_count().max(1) as u32,
+                            terminal.row_count().max(1) as u32,
+                        )
+                    })
+                    .unwrap_or((80, 24));
+                WindowGroupEntry {
+                    profile: tab.profile_name.clone(),
+                    working_directory: snapshot_working_directory(&state, tab),
+                    columns,
+                    rows,
+                }
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            continue;
+        }
+        let active_tab = state
+            .sessions
+            .active()
+            .and_then(|active| {
+                state
+                    .sessions
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.id == active.id)
+            })
+            .unwrap_or(0);
+        if state.window.is_active() {
+            active_window = windows.len();
+        }
+        windows.push(WindowGroupWindow {
+            active_tab,
+            entries,
+        });
     }
+    (!windows.is_empty()).then_some(WindowGroup {
+        name,
+        entries: Vec::new(),
+        windows,
+        active_window,
+    })
 }
 
 /// Rebuild the profile and window-group submenus after settings mutate the
@@ -8126,11 +9567,19 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         working_directory,
         size,
         command,
+        explicit_argv,
         run_command_inside_shell,
+        suppress_profile_command,
+        restore,
+        mut restored_text,
     } = spec;
     let (id, terminal, spawn_options) = {
         let mut state_mut = state.borrow_mut();
-        let profile_name = if state_mut.profiles.profile(&requested_profile).is_some() {
+        let requested_profile_exists = state_mut.profiles.profile(&requested_profile).is_some();
+        if restore && !requested_profile_exists {
+            restored_text.clear();
+        }
+        let profile_name = if requested_profile_exists {
             requested_profile
         } else {
             resolve_new_tab_profile(
@@ -8156,33 +9605,44 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         // The profile grid supplies a useful natural size, but must never
         // turn its default columns and rows into a resize floor.
         terminal.set_size_request(1, 1);
-        install_terminal_context_menu(&terminal);
+
         // General settings provide the baseline. Profile-owned values take
         // precedence only when the profile actually specifies them, so the
         // global custom command and login shell remain useful for profiles
         // that leave those fields at their defaults.
-        let mut spawn_options =
-            core::SpawnOptions::from_settings(&state_mut.settings, working_directory.as_deref());
-        if let Some(profile) = &profile {
-            let profile_options =
-                core::SpawnOptions::from_profile(profile, working_directory.as_deref());
-            spawn_options.terminal_type = profile_options.terminal_type;
-            if !profile.shell.trim().is_empty() {
-                spawn_options.shell = profile_options.shell;
-            }
-            if !profile.shell_command.trim().is_empty() {
-                spawn_options.custom_command = profile_options.custom_command;
-                spawn_options.run_command_inside_shell = profile_options.run_command_inside_shell;
-            }
-            if profile.set_locale_environment {
-                spawn_options.locale = profile_options.locale;
-            }
-        }
+        let mut spawn_options = spawn_options_for_tab(
+            &state_mut.settings,
+            profile.as_ref(),
+            working_directory.as_deref(),
+            suppress_profile_command,
+        );
         if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
             spawn_options.custom_command = Some(command);
             spawn_options.run_command_inside_shell = run_command_inside_shell;
         }
-        let surface = terminal_surface(
+        if let Some(argv) = explicit_argv.filter(|argv| !argv.is_empty()) {
+            // A connection launcher supplies a complete, validated argv. Do
+            // not route it through shell parsing or profile command text.
+            spawn_options.explicit_argv = Some(argv);
+        }
+        // Restoration must override every global, profile and explicit command merge.
+        if restore {
+            spawn_options.custom_command = None;
+            spawn_options.run_command_inside_shell = true;
+            restored_text = profile
+                .as_ref()
+                .filter(|p| p.restore_rows)
+                .map(|p| {
+                    restore::sanitize_text(
+                        &restored_text,
+                        restore::MAX_TEXT_BYTES,
+                        (p.restore_rows_limit as usize).min(restore::MAX_TEXT_LINES),
+                    )
+                })
+                .unwrap_or_default();
+        }
+
+        let (surface, snapshot) = split_scrollback_surface(
             &terminal,
             profile
                 .as_ref()
@@ -8201,6 +9661,7 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
             .add_titled(&surface, Some(&page_name), "Terminal");
         state_mut.stack.set_visible_child_name(&page_name);
         state_mut.terminals.insert(id.get(), terminal.clone());
+        state_mut.scrollback_snapshots.insert(id.get(), snapshot);
         state_mut.pending_spawns.insert(id.get());
         if spawn_options.custom_command.is_none() {
             let login_shell = spawn_options
@@ -8213,6 +9674,8 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
         }
         (id, terminal, spawn_options)
     };
+    install_context_actions(&terminal, state, id);
+    install_terminal_file_drop(&terminal);
     sync_active_profile_ui(state);
     connect_terminal_shortcuts(&terminal, state.clone(), id);
     let title_state = state.clone();
@@ -8269,6 +9732,14 @@ fn open_tab_with_spec(state: &Rc<RefCell<UiState>>, spec: TabLaunchSpec) {
     // Connect all lifecycle observers before spawning. A direct command such
     // as `/bin/true` can exit before the next main-loop turn; registering the
     // child-exited handler only after spawn would lose that event.
+    if restore {
+        // Display-only bytes on a fresh UTF-8 terminal, before a PTY is attached.
+        if !restored_text.is_empty() {
+            terminal.feed(b"[Restored output, display only]\r\n");
+            terminal.feed(&restore::display_bytes(&restored_text));
+        }
+        terminal.feed(b"[Fresh shell starts here; commands were not resumed]\r\n");
+    }
     let spawn_state = state.clone();
     core::spawn_terminal(&terminal, &spawn_options, move |result| match result {
         Ok(pid) => {
@@ -8487,7 +9958,7 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
             .map(|name| name.to_string_lossy().into_owned())
             .or_else(|| Some(directory.to_owned()))
     });
-    let (profile, active) = {
+    let (profile, active, title_override) = {
         let state = state.borrow();
         let profile = state
             .sessions
@@ -8495,7 +9966,11 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
             .and_then(|tab| state.profiles.profile(&tab.profile_name))
             .cloned();
         let active = state.sessions.active().is_some_and(|tab| tab.id == id);
-        (profile, active)
+        let title_override = state
+            .inspector_overrides
+            .get(&id.get())
+            .and_then(|overrides| overrides.title.clone());
+        (profile, active, title_override)
     };
     let Some(profile) = profile else {
         return;
@@ -8555,7 +10030,9 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
                 .unwrap_or_else(|| directory_name.as_deref().unwrap_or("Terminal")),
         );
     }
-    let tab_title = tab_parts.join(" — ");
+    let tab_title = title_override
+        .clone()
+        .unwrap_or_else(|| tab_parts.join(" — "));
 
     let mut state = state.borrow_mut();
     state.sessions.set_title(id, &tab_title);
@@ -8565,7 +10042,9 @@ fn update_tab_title(state: &Rc<RefCell<UiState>>, id: SessionId, terminal: &vte4
         }
     }
     if active {
-        state.window.set_title(Some("Core Terminal"));
+        state
+            .window
+            .set_title(Some(title_override.as_deref().unwrap_or("Core Terminal")));
     }
 }
 
@@ -8612,8 +10091,157 @@ fn terminal_surface(
     overlay
 }
 
+/// Wrap the live terminal with an initially hidden review pane. The pane has
+/// no terminal widget: it can only display a copy of already-rendered VTE
+/// text, so opening or refreshing it cannot send bytes to the shell.
+fn split_scrollback_surface(
+    terminal: &vte4::Terminal,
+    profile_image: Option<&str>,
+    image_mode: Option<BackgroundImageMode>,
+    background_alpha: f64,
+) -> (gtk::Paned, ScrollbackSnapshot) {
+    let live_surface = terminal_surface(terminal, profile_image, image_mode, background_alpha);
+    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    split.set_widget_name("terminal-split-scrollback");
+    split.set_hexpand(true);
+    split.set_vexpand(true);
+    split.set_resize_start_child(true);
+    split.set_shrink_start_child(true);
+    split.set_start_child(Some(&live_surface));
+
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    panel.set_widget_name("scrollback-snapshot-pane");
+    panel.set_hexpand(true);
+    panel.set_vexpand(true);
+    panel.set_margin_start(8);
+    panel.set_margin_end(8);
+    panel.set_margin_top(8);
+    panel.set_margin_bottom(8);
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let label = gtk::Label::new(Some("Scrollback snapshot (read-only)"));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_tooltip_text(Some(
+        "A bounded copy of prior output. Refresh to capture the latest output; this is not a second shell.",
+    ));
+    let refresh = gtk::Button::with_label("Refresh");
+    refresh.set_widget_name("scrollback-snapshot-refresh");
+    refresh.set_tooltip_text(Some(
+        "Capture a new read-only snapshot from this terminal's scrollback",
+    ));
+    let close = gtk::Button::with_label("Close");
+    close.set_widget_name("scrollback-snapshot-close");
+    close.set_tooltip_text(Some("Close split scrollback"));
+    header.append(&label);
+    header.append(&refresh);
+    header.append(&close);
+    panel.append(&header);
+
+    let note =
+        hint_label("Shows the latest 10,000 rows at most. It does not update until refreshed.");
+    panel.append(&note);
+    let text = gtk::TextView::new();
+    text.set_widget_name("scrollback-snapshot-text");
+    text.set_editable(false);
+    text.set_monospace(true);
+    text.set_wrap_mode(gtk::WrapMode::None);
+    text.set_cursor_visible(true);
+    text.set_hexpand(true);
+    text.set_vexpand(true);
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_widget_name("scrollback-snapshot-scroller");
+    scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&text));
+    panel.append(&scroller);
+
+    let snapshot = ScrollbackSnapshot {
+        split: split.clone(),
+        panel: panel.clone(),
+        text: text.clone(),
+    };
+    let refresh_terminal = terminal.clone();
+    let refresh_text = text.clone();
+    refresh.connect_clicked(move |_| refresh_scrollback_snapshot(&refresh_text, &refresh_terminal));
+    let close_split = split.clone();
+    close.connect_clicked(move |_| close_split.set_end_child(None::<&gtk::Widget>));
+    (split, snapshot)
+}
+
+fn snapshot_scrollback_text(terminal: &vte4::Terminal) -> String {
+    let columns = terminal.column_count().max(1);
+    let visible_rows = terminal.row_count().max(1);
+    let last_row = terminal
+        .vadjustment()
+        .map(|adjustment| {
+            ((adjustment.upper() - adjustment.page_size()).max(0.0) as libc::c_long)
+                .saturating_add(visible_rows.saturating_sub(1))
+        })
+        .unwrap_or_else(|| visible_rows.saturating_sub(1));
+    let (first_row, last_row, rows) = snapshot_row_bounds(last_row, columns);
+    terminal
+        .text_range_format(vte4::Format::Text, first_row, 0, last_row, columns)
+        .0
+        .map(|text| restore::sanitize_text(&text, SNAPSHOT_MAX_BYTES, rows))
+        .unwrap_or_default()
+}
+
+fn snapshot_row_bounds(
+    last_row: libc::c_long,
+    columns: libc::c_long,
+) -> (libc::c_long, libc::c_long, usize) {
+    let byte_rows =
+        (SNAPSHOT_MAX_BYTES / (columns.max(1) as usize).saturating_mul(4).max(1)).max(1);
+    let rows = SNAPSHOT_MAX_ROWS.min(byte_rows);
+    let first_row = last_row
+        .saturating_sub(rows.saturating_sub(1) as libc::c_long)
+        .max(0);
+    let captured_rows = (last_row.saturating_sub(first_row) as usize).saturating_add(1);
+    (first_row, last_row, captured_rows)
+}
+
+fn refresh_scrollback_snapshot(text: &gtk::TextView, terminal: &vte4::Terminal) {
+    text.buffer().set_text(&snapshot_scrollback_text(terminal));
+}
+
+fn toggle_split_scrollback(state: &Rc<RefCell<UiState>>) {
+    let (terminal, snapshot) = {
+        let state = state.borrow();
+        let Some(id) = state.sessions.active().map(|tab| tab.id.get()) else {
+            return;
+        };
+        let Some(terminal) = state.terminals.get(&id).cloned() else {
+            return;
+        };
+        let Some(snapshot) = state.scrollback_snapshots.get(&id).cloned() else {
+            return;
+        };
+        (terminal, snapshot)
+    };
+    if snapshot.split.end_child().is_some() {
+        snapshot.split.set_end_child(None::<&gtk::Widget>);
+    } else {
+        refresh_scrollback_snapshot(&snapshot.text, &terminal);
+        snapshot.split.set_end_child(Some(&snapshot.panel));
+        snapshot
+            .split
+            .set_position((snapshot.split.width() / 2).max(1));
+        // Preserve command entry continuity: opening the review pane never
+        // steals focus from the live prompt.
+        terminal.grab_focus();
+    }
+}
+
 fn apply_profile(terminal: &vte4::Terminal, profile: &TerminalProfile, settings: &Settings) {
     apply_profile_properties(terminal, profile, settings, true);
+}
+
+fn apply_inspector_background(terminal: &vte4::Terminal, background: Option<gtk::gdk::RGBA>) {
+    if let Some(background) = background {
+        terminal.set_color_background(&background);
+    }
 }
 
 fn reapply_profile_without_resize(
@@ -8915,6 +10543,74 @@ fn paste_escaped_clipboard(terminal: &vte4::Terminal) {
         };
         terminal.feed_child(shell_escape_for_paste(text.as_str()).as_bytes());
     });
+}
+
+/// Accept native files from a GTK file-list drop. This deliberately only
+/// handles local `file:` objects: reading remote URIs here would turn a drag
+/// operation into unexpected network I/O, and their URI text is not a shell
+/// path. Reject the complete list if any item is unsuitable so a mixed drag
+/// cannot silently omit an argument.
+fn dropped_file_paths(files: &[gio::File]) -> Option<Vec<PathBuf>> {
+    (!files.is_empty())
+        .then(|| {
+            files
+                .iter()
+                .map(|file| {
+                    (file.is_native() && file.has_uri_scheme("file"))
+                        .then(|| file.path())
+                        .flatten()
+                        .filter(|path| path.is_absolute())
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten()
+}
+
+/// Format a native path list as POSIX-style shell words. A final space makes
+/// it easy to continue composing a command, but is never an Enter/newline.
+/// Embedded newlines remain inside single quotes, so they cannot terminate a
+/// quoted shell word; VTE's `paste_text` also uses its bracketed-paste path
+/// whenever the foreground program supports it.
+fn format_dropped_paths(paths: &[PathBuf]) -> Option<String> {
+    (!paths.is_empty())
+        .then(|| {
+            paths
+                .iter()
+                .map(|path| {
+                    path.is_absolute()
+                        .then(|| path.to_str())
+                        .flatten()
+                        .map(shell_escape_for_paste)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten()
+        .map(|paths| format!("{} ", paths.join(" ")))
+}
+
+/// Install a native GTK4 `GdkFileList` target for file-manager drops. We use
+/// VTE's paste API instead of `feed_child`: it preserves VTE safe/bracketed
+/// paste behaviour and never appends an execution-triggering line ending.
+fn install_terminal_file_drop(terminal: &vte4::Terminal) {
+    let target = gtk::DropTarget::new(
+        gtk::gdk::FileList::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    let drop_terminal = terminal.clone();
+    target.connect_drop(move |_, value, _, _| {
+        let Ok(files) = value.get::<gtk::gdk::FileList>() else {
+            return false;
+        };
+        let Some(paths) = dropped_file_paths(&files.files()) else {
+            return false;
+        };
+        let Some(text) = format_dropped_paths(&paths) else {
+            return false;
+        };
+        drop_terminal.paste_text(&text);
+        true
+    });
+    terminal.add_controller(target);
 }
 
 fn shell_escape_for_paste(text: &str) -> String {
@@ -9238,6 +10934,7 @@ fn confirm_close(state: &Rc<RefCell<UiState>>, request: CloseRequest, confirmed:
 }
 
 fn finish_window_close(state: &Rc<RefCell<UiState>>) {
+    persist_session_snapshot(Some(state));
     let child_identities = {
         let mut state = state.borrow_mut();
         state.closing = true;
@@ -9259,6 +10956,7 @@ fn finish_window_close(state: &Rc<RefCell<UiState>>) {
             .collect::<Vec<_>>();
         state.sessions = SessionManager::empty();
         state.terminals.clear();
+        state.scrollback_snapshots.clear();
         state.pending_spawns.clear();
         state.child_process_identities.clear();
         state.login_shell_identities.clear();
@@ -9270,11 +10968,20 @@ fn finish_window_close(state: &Rc<RefCell<UiState>>) {
 }
 
 fn force_close_tab(state: &Rc<RefCell<UiState>>, id: SessionId) {
+    if state
+        .try_borrow()
+        .is_ok_and(|s| s.sessions.tabs().len() == 1 && s.sessions.tab(id).is_some())
+    {
+        persist_session_snapshot(Some(state));
+    }
+
     let Ok(mut state_mut) = state.try_borrow_mut() else {
         return;
     };
     if let Some(tab) = state_mut.sessions.close_tab(id) {
         state_mut.pending_spawns.remove(&id.get());
+        state_mut.scrollback_snapshots.remove(&id.get());
+        clear_inspector_overrides(&mut state_mut.inspector_overrides, id);
         let child_identity = state_mut.child_process_identities.remove(&id.get());
         state_mut.login_shell_identities.remove(&id.get());
         if tab.child_pid.is_some() {
@@ -9308,4 +11015,21 @@ fn stack_page_child(stack: &gtk::Stack, terminal: &vte4::Terminal) -> Option<gtk
         child = parent;
     }
     None
+}
+
+// Orphan zombies may persist under container PID 1 after successful termination.
+#[cfg(target_os = "linux")]
+fn acceptance_state_is_live(state: &str) -> bool {
+    !matches!(state, "Z" | "X" | "x")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn acceptance_process_liveness_excludes_terminated_states() {
+    for state in ["Z", "X", "x"] {
+        assert!(!acceptance_state_is_live(state));
+    }
+    for state in ["R", "S", "D", "T", "t", "I", "?"] {
+        assert!(acceptance_state_is_live(state));
+    }
 }
